@@ -1,0 +1,309 @@
+package com.vr.takeback.domain.engine
+
+import com.vr.takeback.domain.model.*
+import java.time.DayOfWeek
+import java.time.LocalTime
+
+/**
+ * Immutable snapshot of system environment at the moment of evaluation.
+ */
+data class SystemContextSnapshot(
+    val timestampMillis: Long,
+    val localTime: LocalTime,
+    val dayOfWeek: DayOfWeek,
+    val foregroundPackageName: String?,
+    val activeBrowserUrl: String? = null,
+    val accumulatedForegroundTimeMillis: Map<String, Long> = emptyMap(),
+    val activeGeofenceIds: Set<String> = emptySet(),
+    val isFocusSessionActive: Boolean = false,
+    val isBreakActive: Boolean = false,
+    val activeFocusSessionProfileId: String? = null,
+    val breakWhitelistApps: Set<String> = emptySet(),
+    val isQuickBlockActive: Boolean = false,
+    val quickBlockExpirationEpochMillis: Long? = null,
+    val quickBlockTargetPackages: Set<String> = emptySet(),
+    val isStrictModeActive: Boolean = false,
+    val strictModeExpirationMillis: Long? = null
+)
+
+/**
+ * Central Restriction Engine: Pure domain evaluator.
+ * Zero Android framework imports. Fully deterministic.
+ */
+class CentralRestrictionEngine {
+
+    companion object {
+        // Packages that must never be blocked under any circumstances for safety
+        val EMERGENCY_ALLOWLIST_PACKAGES = setOf(
+            "com.android.phone",
+            "com.google.android.dialer",
+            "com.samsung.android.dialer",
+            "com.android.server.telecom",
+            "com.android.emergency",
+            "com.google.android.apps.safetyhub",
+            "com.android.settings",
+            "com.vr.takeback"
+        )
+    }
+
+    /**
+     * Evaluates access for foreground package and optional browser URL.
+     */
+    fun evaluate(
+        profiles: List<Profile>,
+        snapshot: SystemContextSnapshot
+    ): BlockDecision {
+        val targetPackage = snapshot.foregroundPackageName ?: return BlockDecision.Allowed
+
+        // Rule 0: Emergency Allowlist (Absolute Exemption)
+        if (isEmergencyPackage(targetPackage)) {
+            return BlockDecision.Allowed
+        }
+
+        // Rule 1: Break Whitelist during active Pomodoro Break
+        if (snapshot.isBreakActive && snapshot.breakWhitelistApps.contains(targetPackage)) {
+            return BlockDecision.Allowed
+        }
+
+        // Rule 1.5: Quick Block & Digital Detox Active
+        if (snapshot.isQuickBlockActive) {
+            val isTargetedByQuickBlock = snapshot.quickBlockTargetPackages.isEmpty() ||
+                    snapshot.quickBlockTargetPackages.contains(targetPackage)
+            if (isTargetedByQuickBlock) {
+                val remaining = snapshot.quickBlockExpirationEpochMillis?.let { it - snapshot.timestampMillis }?.coerceAtLeast(0L)
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = "quick_block",
+                    triggeringProfileName = "Quick Block",
+                    reason = BlockReason.QuickBlockActive,
+                    remainingDurationMillis = remaining
+                )
+            }
+        }
+
+        // Rule 2: Active Focus Session (High Priority Override)
+        if (snapshot.isFocusSessionActive && !snapshot.isBreakActive) {
+            val focusProfile = profiles.find { it.id == snapshot.activeFocusSessionProfileId }
+            if (focusProfile != null && isAppBlockedByProfile(focusProfile, targetPackage)) {
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = focusProfile.id,
+                    triggeringProfileName = focusProfile.name,
+                    reason = BlockReason.FocusSessionActive
+                )
+            }
+        }
+
+        // Rule 3: Active Profiles Evaluation (Union Semantics)
+        val enabledProfiles = profiles.filter { it.isEnabled }
+        for (profile in enabledProfiles) {
+            // Check if profile targets this app
+            val isTargeted = isAppBlockedByProfile(profile, targetPackage)
+            if (!isTargeted) continue
+
+            // 3.1: Check Schedules
+            val matchingSchedule = findActiveSchedule(profile.schedules, snapshot.localTime, snapshot.dayOfWeek)
+            if (matchingSchedule != null) {
+                val remainingSeconds = calculateRemainingScheduleSeconds(matchingSchedule, snapshot.localTime)
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = profile.id,
+                    triggeringProfileName = profile.name,
+                    reason = BlockReason.ScheduleActive,
+                    remainingDurationMillis = remainingSeconds * 1000L
+                )
+            }
+
+            // 3.2: Check Daily & Hourly Usage Limits
+            val limitDecision = evaluateUsageLimits(profile, targetPackage, snapshot)
+            if (limitDecision is BlockDecision.Blocked) {
+                return limitDecision
+            }
+
+            // 3.3: Check Geofences
+            val matchesGeofence = profile.geofences.any { snapshot.activeGeofenceIds.contains(it.id) && it.isEnabled }
+            if (matchesGeofence) {
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = profile.id,
+                    triggeringProfileName = profile.name,
+                    reason = BlockReason.GeofenceActive
+                )
+            }
+
+            // 3.4: Immediate / Always-Active Profile (profile is enabled with target apps and no conditional schedules/limits)
+            if (profile.schedules.isEmpty() && profile.usageLimits.isEmpty() && profile.geofences.isEmpty()) {
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = profile.id,
+                    triggeringProfileName = profile.name,
+                    reason = BlockReason.ScheduleActive,
+                    remainingDurationMillis = null
+                )
+            }
+        }
+
+        // Rule 4: Browser URL Filtering (if URL is present)
+        val activeUrl = snapshot.activeBrowserUrl
+        if (!activeUrl.isNullOrBlank()) {
+            val webDecision = evaluateWebFiltering(enabledProfiles, activeUrl, snapshot.localTime, snapshot.dayOfWeek)
+            if (webDecision is BlockDecision.Blocked) {
+                return webDecision
+            }
+        }
+
+        return BlockDecision.Allowed
+    }
+
+    private fun isEmergencyPackage(packageName: String): Boolean {
+        if (EMERGENCY_ALLOWLIST_PACKAGES.contains(packageName)) return true
+        if (packageName.contains("dialer", ignoreCase = true) || packageName.contains("telecom", ignoreCase = true)) {
+            return true
+        }
+        return false
+    }
+
+    private fun isAppBlockedByProfile(profile: Profile, packageName: String): Boolean {
+        // If app is explicitly whitelisted in this profile, it is NOT blocked by this profile
+        val isWhitelisted = profile.targetApps.any { it.packageName == packageName && it.isAllowlist }
+        if (isWhitelisted) return false
+
+        // Otherwise check if explicitly targeted
+        return profile.targetApps.any { it.packageName == packageName && !it.isAllowlist }
+    }
+
+    /**
+     * Evaluates schedule matching including overnight schedules.
+     */
+    fun findActiveSchedule(
+        schedules: List<Schedule>,
+        currentTime: LocalTime,
+        currentDay: DayOfWeek
+    ): Schedule? {
+        val currentSeconds = currentTime.toSecondOfDay()
+        val currentDayIndex = currentDay.value // 1 = Monday ... 7 = Sunday
+        val previousDayIndex = if (currentDayIndex == 1) 7 else currentDayIndex - 1
+
+        for (schedule in schedules) {
+            if (!schedule.isEnabled) continue
+
+            val start = schedule.startTimeSeconds
+            val end = schedule.endTimeSeconds
+
+            if (start <= end) {
+                // Daytime schedule: must be active on current day and within [start, end)
+                if (schedule.isDayActive(currentDayIndex) && currentSeconds in start until end) {
+                    return schedule
+                }
+            } else {
+                // Overnight schedule (e.g. 22:00 to 06:00)
+                // Case A: started yesterday evening and ends this morning
+                val activeFromYesterday = schedule.isDayActive(previousDayIndex) && currentSeconds < end
+                // Case B: started today evening and ends tomorrow morning
+                val activeFromToday = schedule.isDayActive(currentDayIndex) && currentSeconds >= start
+
+                if (activeFromYesterday || activeFromToday) {
+                    return schedule
+                }
+            }
+        }
+        return null
+    }
+
+    fun isProfileCurrentlyEnforcing(
+        profile: Profile,
+        currentTime: LocalTime,
+        currentDay: DayOfWeek,
+        accumulatedForegroundTimeMillis: Map<String, Long> = emptyMap()
+    ): Boolean {
+        if (!profile.isEnabled) return false
+
+        // 1. Direct active profile (no schedules configured) is immediately enforcing when enabled
+        if (profile.schedules.isEmpty()) {
+            return profile.targetApps.isNotEmpty() || profile.targetWebsites.isNotEmpty()
+        }
+
+        // 2. Scheduled profile: active if current moment is inside scheduled window
+        if (findActiveSchedule(profile.schedules, currentTime, currentDay) != null) {
+            return true
+        }
+
+        return false
+    }
+
+    private fun calculateRemainingScheduleSeconds(schedule: Schedule, currentTime: LocalTime): Long {
+        val currentSeconds = currentTime.toSecondOfDay()
+        val end = schedule.endTimeSeconds
+        return if (end >= currentSeconds) {
+            (end - currentSeconds).toLong()
+        } else {
+            (86400 - currentSeconds + end).toLong()
+        }
+    }
+
+    private fun evaluateUsageLimits(
+        profile: Profile,
+        packageName: String,
+        snapshot: SystemContextSnapshot
+    ): BlockDecision {
+        val usedMillis = snapshot.accumulatedForegroundTimeMillis[packageName] ?: 0L
+        val usedMinutes = (usedMillis / (1000 * 60)).toInt()
+
+        for (limit in profile.usageLimits) {
+            if (!limit.isEnabled) continue
+            val matchesApp = limit.targetPackageName == null || limit.targetPackageName == packageName
+            if (matchesApp) {
+                if (usedMinutes >= limit.dailyLimitMinutes) {
+                    return BlockDecision.Blocked(
+                        target = BlockTarget.Application(packageName),
+                        triggeringProfileId = profile.id,
+                        triggeringProfileName = profile.name,
+                        reason = BlockReason.DailyLimitExceeded(
+                            limitMinutes = limit.dailyLimitMinutes,
+                            usedMinutes = usedMinutes
+                        ),
+                        remainingDurationMillis = 0L // Blocked until midnight reset
+                    )
+                }
+            }
+        }
+        return BlockDecision.Allowed
+    }
+
+    private fun evaluateWebFiltering(
+        profiles: List<Profile>,
+        rawUrl: String,
+        localTime: LocalTime,
+        dayOfWeek: DayOfWeek
+    ): BlockDecision {
+        val cleanUrl = rawUrl.lowercase().trim()
+
+        for (profile in profiles) {
+            if (!isProfileCurrentlyEnforcing(profile, localTime, dayOfWeek)) {
+                continue
+            }
+            for (rule in profile.targetWebsites) {
+                val pattern = rule.domainPattern.lowercase().trim()
+                val isMatch = when (rule.ruleType) {
+                    WebsiteRuleType.EXACT_DOMAIN -> cleanUrl.contains(pattern)
+                    WebsiteRuleType.WILDCARD -> cleanUrl.contains(pattern.replace("*", ""))
+                    WebsiteRuleType.KEYWORD -> cleanUrl.contains(pattern)
+                }
+
+                if (isMatch) {
+                    if (rule.isAllowlist) {
+                        return BlockDecision.Allowed
+                    } else {
+                        return BlockDecision.Blocked(
+                            target = BlockTarget.Website(rawUrl),
+                            triggeringProfileId = profile.id,
+                            triggeringProfileName = profile.name,
+                            reason = BlockReason.KeywordMatch(pattern)
+                        )
+                    }
+                }
+            }
+        }
+        return BlockDecision.Allowed
+    }
+}
