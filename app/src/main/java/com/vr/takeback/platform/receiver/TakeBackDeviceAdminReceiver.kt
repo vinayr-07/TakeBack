@@ -67,7 +67,13 @@ class TakeBackDeviceAdminReceiver : DeviceAdminReceiver() {
 
     override fun onDisableRequested(context: Context, intent: Intent): CharSequence {
         Log.w(TAG, "TakeBack Standard Device Administrator deactivation requested by user")
-        return context.getString(R.string.device_admin_warning)
+        val strictRepo = try { TakeBackApplication.strictModeRepository } catch (e: Exception) { null }
+        val isStrictActive = strictRepo?.protectionState?.value?.isGlobalStrictActive == true
+        return if (isStrictActive) {
+            context.getString(R.string.device_admin_strict_warning)
+        } else {
+            context.getString(R.string.device_admin_warning)
+        }
     }
 
     override fun onDisabled(context: Context, intent: Intent) {

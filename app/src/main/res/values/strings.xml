@@ -5,4 +5,12 @@
     <string name="notification_channel_description">Shows active distraction protection and scheduled focus state.</string>
     <string name="device_admin_description">Enables TakeBack to deter unauthorized changes, settings tampering, and casual uninstallation while Strict Mode is active.</string>
     <string name="device_admin_warning">Warning: Deactivating TakeBack Device Administrator compromises your active Strict Mode protections, allowing profiles and restrictions to be bypassed. Are you sure you want to proceed?</string>
+    <string name="device_admin_strict_warning">Warning: TakeBack Strict Mode is currently ACTIVE. Deactivating Device Administrator will compromise your restrictions and mark protection status as compromised. To modify settings legitimately, authenticate within TakeBack first.</string>
+    <string name="shield_accessibility_title">Accessibility Protection</string>
+    <string name="shield_accessibility_reason">Disabling TakeBack\'s Accessibility Service halts real-time application limits and website blocking. Strict Mode is protecting this service from premature disabling.</string>
+    <string name="shield_device_admin_title">Device Administrator Protection</string>
+    <string name="shield_device_admin_reason">Deactivating TakeBack\'s Device Administrator removes anti-tamper and uninstallation protection. Strict Mode requires verification to modify this setting.</string>
+    <string name="shield_app_info_title">Application Settings Protection</string>
+    <string name="shield_app_info_reason">Modifying TakeBack\'s application settings, clearing storage, or force-stopping the application is blocked while Strict Mode is active.</string>
+    <string name="shield_authenticate_maintenance">Authenticate for Settings Access (5 Minutes)</string>
 </resources>

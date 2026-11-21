@@ -35,6 +35,7 @@ class BlockShieldActivity : ComponentActivity() {
         val profileName = intent.getStringExtra("EXTRA_PROFILE_NAME") ?: "Focus Profile"
         val reason = intent.getStringExtra("EXTRA_REASON") ?: "Restricted Focus Window"
         val isSettingsShield = intent.getBooleanExtra("EXTRA_IS_SETTINGS_SHIELD", false)
+        val targetLabel = intent.getStringExtra("EXTRA_TARGET_LABEL")
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -62,6 +63,7 @@ class BlockShieldActivity : ComponentActivity() {
                         profileName = profileName,
                         reason = reason,
                         isSettingsShield = isSettingsShield,
+                        targetLabel = targetLabel,
                         onGoHomeClick = {
                             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                                 addCategory(Intent.CATEGORY_HOME)
@@ -80,6 +82,12 @@ class BlockShieldActivity : ComponentActivity() {
                             mechanism = strictState.mechanism,
                             saltBase64 = strictState.saltBase64,
                             expectedHash = strictState.passwordHash,
+                            mutationType = com.vr.takeback.domain.security.MutationType.SETTINGS_MAINTENANCE,
+                            onTokenIssued = { token ->
+                                strictRepo.grantTemporarySettingsUnlock(durationMinutes = 5)
+                                showAuthDialog = false
+                                finish()
+                            },
                             onChallengeSolved = {
                                 strictRepo.grantTemporarySettingsUnlock(durationMinutes = 5)
                                 showAuthDialog = false
@@ -102,6 +110,7 @@ fun BlockShieldContent(
     profileName: String,
     reason: String,
     isSettingsShield: Boolean = false,
+    targetLabel: String? = null,
     onGoHomeClick: () -> Unit,
     onAuthenticateClick: () -> Unit = {}
 ) {
@@ -133,7 +142,7 @@ fun BlockShieldContent(
         Spacer(modifier = Modifier.height(28.dp))
 
         Text(
-            text = if (isSettingsShield) "Settings Access Locked" else "$appName is Paused",
+            text = if (isSettingsShield) (targetLabel ?: "Settings Access Locked") else "$appName is Paused",
             style = MaterialTheme.typography.displayMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground,
@@ -147,7 +156,7 @@ fun BlockShieldContent(
             else MaterialTheme.colorScheme.secondaryContainer
         ) {
             Text(
-                text = "GUARDED BY: $profileName",
+                text = if (isSettingsShield) "STRICT ANTI-TAMPER GUARD" else "GUARDED BY: $profileName",
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,

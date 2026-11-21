@@ -19,6 +19,9 @@ import com.vr.takeback.domain.model.BlockDecision
 import com.vr.takeback.domain.model.BlockReason
 import com.vr.takeback.domain.model.BlockTarget
 import com.vr.takeback.domain.model.EventType
+import com.vr.takeback.domain.security.RealAccessibilityNodeSnapshot
+import com.vr.takeback.domain.security.SettingsDestination
+import com.vr.takeback.domain.security.SettingsProtectionManager
 import com.vr.takeback.domain.usage.ForegroundSessionTracker
 import com.vr.takeback.presentation.ui.shield.BlockShieldActivity
 import kotlinx.coroutines.CoroutineScope
@@ -75,6 +78,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private var currentBackoffMillis: Long = INITIAL_RETRY_BACKOFF_MILLIS
     private var lastBlockedPackage: String? = null
     private var lastBlockedTimestamp: Long = 0
+    private var lastBlockedSettingsDestination: SettingsDestination? = null
+    private var lastBlockedSettingsTimestamp: Long = 0
 
     // Build 7 Issue 3 & Build 8 Issue 4: Monotonic elapsed realtime session tracker
     val sessionTracker = ForegroundSessionTracker(
@@ -305,14 +310,33 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
 
         if (strictState?.isSettingsLocked == true) {
-            if (isRestrictedSettingsDestination(packageName, rootInActiveWindow)) {
+            val rootNode = rootInActiveWindow
+            val snapshot = if (rootNode != null) RealAccessibilityNodeSnapshot(rootNode) else null
+            val decision = SettingsProtectionManager.evaluate(
+                packageName = packageName,
+                className = event.className?.toString(),
+                rootNode = snapshot,
+                isStrictLocked = strictState.isSettingsLocked,
+                isMaintenanceUnlocked = !strictState.isSettingsLocked
+            )
+
+            if (decision.isRestricted) {
+                // De-bounce rapid consecutive events for the same blocked settings destination (< 1.2s)
+                if (decision.destination == lastBlockedSettingsDestination && (now - lastBlockedSettingsTimestamp) < 1200) {
+                    return
+                }
+                lastBlockedSettingsDestination = decision.destination
+                lastBlockedSettingsTimestamp = now
+
                 performGlobalAction(GLOBAL_ACTION_HOME)
                 val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                     putExtra("EXTRA_APP_NAME", "Android Settings")
                     putExtra("EXTRA_PROFILE_NAME", "Strict Mode")
-                    putExtra("EXTRA_REASON", "Access to TakeBack settings, device administrator, and uninstall controls is locked by Strict Mode.")
+                    putExtra("EXTRA_REASON", decision.warningMessage)
                     putExtra("EXTRA_IS_SETTINGS_SHIELD", true)
+                    putExtra("EXTRA_DESTINATION", decision.destination.name)
+                    putExtra("EXTRA_TARGET_LABEL", decision.targetLabel)
                 }
                 startActivity(shieldIntent)
                 return
@@ -530,91 +554,6 @@ class TakeBackAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             packageName.substringAfterLast('.')
         }
-    }
-
-    private fun isRestrictedSettingsDestination(packageName: String, rootNode: AccessibilityNodeInfo?): Boolean {
-        if (rootNode == null) return false
-
-        // Invariant: Do not obstruct Device Administrator initial activation confirmation screen!
-        if (isDeviceAdminActivationConfirmation(rootNode)) {
-            return false
-        }
-
-        // Package installer uninstallation screen targeting TakeBack
-        if (packageName.contains("packageinstaller", ignoreCase = true)) {
-            return containsTextInNode(rootNode, "TakeBack")
-        }
-
-        val isSettingsPackage = packageName == "com.android.settings" ||
-                packageName == "com.samsung.android.settings" ||
-                packageName.contains(".settings")
-
-        if (isSettingsPackage) {
-            val hasTakeBack = containsTextInNode(rootNode, "TakeBack")
-
-            // 1. App Info / Details for TakeBack
-            val isAppManagement = containsTextInNode(rootNode, "Uninstall") ||
-                    containsTextInNode(rootNode, "Force stop") ||
-                    containsTextInNode(rootNode, "Disable") ||
-                    containsTextInNode(rootNode, "App info") ||
-                    containsTextInNode(rootNode, "Storage") ||
-                    containsTextInNode(rootNode, "Permissions")
-
-            if (hasTakeBack && isAppManagement) {
-                return true
-            }
-
-            // 2. Device Admin Settings
-            val isDeviceAdmin = containsTextInNode(rootNode, "Device admin") ||
-                    containsTextInNode(rootNode, "Device administrators") ||
-                    containsTextInNode(rootNode, "Device admin apps")
-            if (isDeviceAdmin && hasTakeBack) {
-                return true
-            }
-
-            // 3. Accessibility Settings for TakeBack
-            val isAccessibility = containsTextInNode(rootNode, "Accessibility") ||
-                    containsTextInNode(rootNode, "Installed apps") ||
-                    containsTextInNode(rootNode, "Installed services")
-            if (isAccessibility && hasTakeBack) {
-                return true
-            }
-
-            // 4. Special App Access
-            val isSpecialAccess = containsTextInNode(rootNode, "Usage access") ||
-                    containsTextInNode(rootNode, "Appear on top") ||
-                    containsTextInNode(rootNode, "Display over other apps") ||
-                    containsTextInNode(rootNode, "Special app access")
-            if (isSpecialAccess && hasTakeBack) {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    private fun isDeviceAdminActivationConfirmation(rootNode: AccessibilityNodeInfo): Boolean {
-        val hasActivate = containsTextInNode(rootNode, "Activate this device admin app") ||
-                containsTextInNode(rootNode, "Activate")
-        val hasTakeBack = containsTextInNode(rootNode, "TakeBack")
-        val hasDeactivate = containsTextInNode(rootNode, "Deactivate")
-        return hasActivate && hasTakeBack && !hasDeactivate
-    }
-
-    private fun containsTextInNode(node: AccessibilityNodeInfo, text: String): Boolean {
-        val nodeText = node.text?.toString() ?: ""
-        val nodeDesc = node.contentDescription?.toString() ?: ""
-
-        if (nodeText.contains(text, ignoreCase = true) || nodeDesc.contains(text, ignoreCase = true)) {
-            return true
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            val found = containsTextInNode(child, text)
-            if (found) return true
-        }
-        return false
     }
 
     private fun extractBrowserUrl(rootNode: AccessibilityNodeInfo?): String? {

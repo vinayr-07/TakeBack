@@ -33,6 +33,9 @@ data class StrictProtectionState(
 
     val isSettingsLocked: Boolean
         get() = isCurrentlyLocked && System.currentTimeMillis() > temporarySettingsUnlockUntilEpochMillis
+
+    val isCompromised: Boolean
+        get() = status == StrictProtectionStatus.COMPROMISED
 }
 
 class StrictModeRepository(private val context: Context? = null) {
