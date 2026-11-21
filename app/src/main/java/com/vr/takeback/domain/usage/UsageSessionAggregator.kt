@@ -115,6 +115,7 @@ object UsageSessionAggregator {
         val activeActivities = mutableMapOf<ActivityKey, Long>()
         val rawIntervals = mutableListOf<SessionInterval>()
         var screenInteractive = true
+        var keyguardShowing = false
         var deviceShuttingDown = false
 
         // 1. Inspect preceding events in lookback to find activities already open at startEpochMillis
@@ -126,7 +127,7 @@ object UsageSessionAggregator {
             val key = ActivityKey(event.packageName, event.className)
             when (event.type) {
                 NormalizedEventType.ACTIVITY_RESUMED -> {
-                    if (event.packageName != "android") {
+                    if (screenInteractive && !keyguardShowing && !deviceShuttingDown && event.packageName != "android") {
                         activeActivities[key] = event.timestampMillis
                     }
                 }
@@ -134,15 +135,24 @@ object UsageSessionAggregator {
                 NormalizedEventType.ACTIVITY_STOPPED -> {
                     activeActivities.remove(key)
                 }
-                NormalizedEventType.SCREEN_NON_INTERACTIVE,
-                NormalizedEventType.KEYGUARD_SHOWN,
-                NormalizedEventType.DEVICE_SHUTDOWN -> {
+                NormalizedEventType.SCREEN_NON_INTERACTIVE -> {
                     screenInteractive = false
                     activeActivities.clear()
                 }
                 NormalizedEventType.SCREEN_INTERACTIVE -> {
                     screenInteractive = true
                     deviceShuttingDown = false
+                }
+                NormalizedEventType.KEYGUARD_SHOWN -> {
+                    keyguardShowing = true
+                    activeActivities.clear()
+                }
+                NormalizedEventType.KEYGUARD_HIDDEN -> {
+                    keyguardShowing = false
+                }
+                NormalizedEventType.DEVICE_SHUTDOWN -> {
+                    deviceShuttingDown = true
+                    activeActivities.clear()
                 }
                 NormalizedEventType.DEVICE_STARTUP -> {
                     deviceShuttingDown = false
@@ -203,7 +213,7 @@ object UsageSessionAggregator {
 
             when (event.type) {
                 NormalizedEventType.ACTIVITY_RESUMED -> {
-                    if (screenInteractive && event.packageName != "android" && !deviceShuttingDown) {
+                    if (screenInteractive && !keyguardShowing && !deviceShuttingDown && event.packageName != "android") {
                         if (!activeActivities.containsKey(key)) {
                             activeActivities[key] = time
                         }
@@ -215,8 +225,7 @@ object UsageSessionAggregator {
                     closeActivity(key, time)
                 }
 
-                NormalizedEventType.SCREEN_NON_INTERACTIVE,
-                NormalizedEventType.KEYGUARD_SHOWN -> {
+                NormalizedEventType.SCREEN_NON_INTERACTIVE -> {
                     screenInteractive = false
                     closeAllActivities(time)
                 }
@@ -226,13 +235,18 @@ object UsageSessionAggregator {
                     deviceShuttingDown = false
                 }
 
+                NormalizedEventType.KEYGUARD_SHOWN -> {
+                    keyguardShowing = true
+                    closeAllActivities(time)
+                }
+
                 NormalizedEventType.KEYGUARD_HIDDEN -> {
-                    // Keyguard unlocked does not automatically resume apps unless an event is dispatched
+                    keyguardShowing = false
                 }
 
                 NormalizedEventType.DEVICE_SHUTDOWN -> {
-                    closeAllActivities(time)
                     deviceShuttingDown = true
+                    closeAllActivities(time)
                 }
 
                 NormalizedEventType.DEVICE_STARTUP -> {
@@ -251,7 +265,7 @@ object UsageSessionAggregator {
             endEpochMillis
         }
 
-        if (screenInteractive && !deviceShuttingDown) {
+        if (screenInteractive && !keyguardShowing && !deviceShuttingDown) {
             closeAllActivities(finalCloseTime)
         } else {
             activeActivities.clear()
@@ -351,12 +365,8 @@ object UsageSessionAggregator {
                 NormalizedEventType.SCREEN_NON_INTERACTIVE -> {
                     if (isInteractive) {
                         closeInteractiveWindow(time)
-                    } else if (initialState == InitialState.UNKNOWN && interactiveStart == null && rawIntervals.isEmpty()) {
-                        // First event seen was screen turning off, meaning screen was on from at least startEpochMillis
-                        val boundedEnd = minOf(endEpochMillis, time)
-                        if (boundedEnd > startEpochMillis) {
-                            rawIntervals.add(InteractiveInterval(startEpochMillis, boundedEnd))
-                        }
+                    } else if (initialState == InitialState.UNKNOWN) {
+                        // Requirement 2: Do NOT generate an exact numeric interactive interval from an unknown initial state.
                         hasIncompleteStart = true
                     }
                 }
@@ -454,9 +464,16 @@ object UsageSessionAggregator {
                     it.type == NormalizedEventType.SCREEN_NON_INTERACTIVE
         }
 
-        // Requirement 1: NEVER substitute appUnionDuration for deviceInteractiveTimeMillis.
+        // Requirement 1 & 2: NEVER substitute appUnionDuration for deviceInteractiveTimeMillis.
+        // If initial state was unknown and no verified screen-on intervals exist, device interactive time is unavailable.
         val deviceInteractiveTime = if (hasScreenEvents) {
-            interactiveIntervals.sumOf { it.durationMillis }
+            if (interactiveIntervals.isNotEmpty()) {
+                interactiveIntervals.sumOf { it.durationMillis }
+            } else if (!hasIncompleteInteractiveStart) {
+                0L // Verified zero: screen was known non-interactive at start and never turned on
+            } else {
+                null // Unknown initial state and no verified interactive intervals observed
+            }
         } else {
             null
         }

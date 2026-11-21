@@ -2,12 +2,16 @@ package com.vr.takeback.domain.usage
 
 import com.vr.takeback.data.repository.UsageEventsQueryResult
 import com.vr.takeback.data.repository.ValidatedUsageSnapshot
-import com.vr.takeback.domain.model.AppUsageInfo
+import com.vr.takeback.domain.engine.CentralRestrictionEngine
+import com.vr.takeback.domain.engine.SystemContextSnapshot
+import com.vr.takeback.domain.model.*
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.DayOfWeek
 import java.time.LocalDate
+import java.time.LocalTime
 
 class UsageRepositoryLogicTest {
 
@@ -21,6 +25,7 @@ class UsageRepositoryLogicTest {
             capturedAtMillis = System.currentTimeMillis() - 60000L,
             foregroundUsageByPackage = mapOf("com.instagram.android" to 3600000L),
             quality = UsageDataQuality.RECONSTRUCTED_COMPLETE,
+            isAvailable = true,
             dataSource = "UsageEvents"
         )
 
@@ -39,6 +44,7 @@ class UsageRepositoryLogicTest {
             capturedAtMillis = twentyMinutesAgo,
             foregroundUsageByPackage = mapOf("com.instagram.android" to 1200000L),
             quality = UsageDataQuality.PROVISIONAL,
+            isAvailable = true,
             dataSource = "UsageEvents"
         )
 
@@ -104,5 +110,175 @@ class UsageRepositoryLogicTest {
         assertEquals(5, app.reconstructedSessionCount)
         @Suppress("DEPRECATION")
         assertEquals("Deprecated launchCount must match reconstructedSessionCount", 5, app.launchCount)
+    }
+
+    @Test
+    fun sharedProfilePoolLimit_aggregatesUsageAcrossAllTargetApps() {
+        val engine = CentralRestrictionEngine()
+        val profile = Profile(
+            id = "social_pool",
+            name = "Social Pool",
+            isEnabled = true,
+            targetApps = listOf(
+                TargetApp("com.instagram.android", "Instagram", isAllowlist = false),
+                TargetApp("com.google.android.youtube", "YouTube", isAllowlist = false)
+            ),
+            usageLimits = listOf(
+                UsageLimit(
+                    id = 1,
+                    profileId = "social_pool",
+                    targetPackageName = null, // Shared pool limit!
+                    dailyLimitMinutes = 60,
+                    windowType = LimitWindowType.FULL_DAY,
+                    isEnabled = true
+                )
+            )
+        )
+
+        // Instagram: 35 minutes, YouTube: 30 minutes
+        // Total pool usage = 65 minutes (>= 60 minute limit)
+        // Individually, neither has reached 60 mins (35 < 60, 30 < 60)
+        val snapshot = SystemContextSnapshot(
+            timestampMillis = System.currentTimeMillis(),
+            localTime = LocalTime.of(15, 0),
+            dayOfWeek = DayOfWeek.FRIDAY,
+            foregroundPackageName = "com.instagram.android",
+            accumulatedForegroundTimeMillis = mapOf(
+                "com.instagram.android" to 35 * 60 * 1000L,
+                "com.google.android.youtube" to 30 * 60 * 1000L
+            ),
+            isUsageDataAvailable = true
+        )
+
+        val decision = engine.evaluate(listOf(profile), snapshot)
+        assertTrue("Shared pool limit must aggregate usage across all target apps and block when sum exceeds limit", decision is BlockDecision.Blocked)
+        val blocked = decision as BlockDecision.Blocked
+        assertTrue(blocked.reason is BlockReason.DailyLimitExceeded)
+        assertEquals(60, (blocked.reason as BlockReason.DailyLimitExceeded).limitMinutes)
+        assertEquals(65, (blocked.reason as BlockReason.DailyLimitExceeded).usedMinutes)
+    }
+
+    @Test
+    fun distinctSemantics_forHourlyAndSessionLimits() {
+        val engine = CentralRestrictionEngine()
+        val hourlyProfile = Profile(
+            id = "hourly_profile",
+            name = "Hourly Limit Profile",
+            isEnabled = true,
+            targetApps = listOf(TargetApp("com.reddit.frontpage", "Reddit", isAllowlist = false)),
+            usageLimits = listOf(
+                UsageLimit(
+                    id = 2,
+                    profileId = "hourly_profile",
+                    targetPackageName = "com.reddit.frontpage",
+                    dailyLimitMinutes = 20,
+                    windowType = LimitWindowType.PER_HOUR,
+                    isEnabled = true
+                )
+            )
+        )
+
+        val sessionProfile = Profile(
+            id = "session_profile",
+            name = "Session Limit Profile",
+            isEnabled = true,
+            targetApps = listOf(TargetApp("com.reddit.frontpage", "Reddit", isAllowlist = false)),
+            usageLimits = listOf(
+                UsageLimit(
+                    id = 3,
+                    profileId = "session_profile",
+                    targetPackageName = "com.reddit.frontpage",
+                    dailyLimitMinutes = 15,
+                    windowType = LimitWindowType.PER_SESSION,
+                    isEnabled = true
+                )
+            )
+        )
+
+        // Test Hourly: 25 minutes in current hour -> Blocked with HourlyQuotaExceeded
+        val hourlySnapshot = SystemContextSnapshot(
+            timestampMillis = System.currentTimeMillis(),
+            localTime = LocalTime.of(16, 30),
+            dayOfWeek = DayOfWeek.MONDAY,
+            foregroundPackageName = "com.reddit.frontpage",
+            accumulatedForegroundTimeMillis = mapOf("com.reddit.frontpage" to 50 * 60 * 1000L),
+            hourlyForegroundTimeMillis = mapOf("com.reddit.frontpage" to 25 * 60 * 1000L),
+            isUsageDataAvailable = true
+        )
+        val hourlyDecision = engine.evaluate(listOf(hourlyProfile), hourlySnapshot)
+        assertTrue(hourlyDecision is BlockDecision.Blocked)
+        assertTrue((hourlyDecision as BlockDecision.Blocked).reason is BlockReason.HourlyQuotaExceeded)
+
+        // Test Session: continuous session 18 minutes -> Blocked
+        val sessionSnapshot = SystemContextSnapshot(
+            timestampMillis = System.currentTimeMillis(),
+            localTime = LocalTime.of(16, 30),
+            dayOfWeek = DayOfWeek.MONDAY,
+            foregroundPackageName = "com.reddit.frontpage",
+            currentSessionDurationMillis = 18 * 60 * 1000L,
+            isUsageDataAvailable = true
+        )
+        val sessionDecision = engine.evaluate(listOf(sessionProfile), sessionSnapshot)
+        assertTrue(sessionDecision is BlockDecision.Blocked)
+    }
+
+    @Test
+    fun staleOrUnavailableData_doesNotResetExceededUsageToZero() {
+        val engine = CentralRestrictionEngine()
+        val profile = Profile(
+            id = "daily_p",
+            name = "Daily Limit",
+            isEnabled = true,
+            targetApps = listOf(TargetApp("com.instagram.android", "Instagram", isAllowlist = false)),
+            usageLimits = listOf(
+                UsageLimit(
+                    id = 4,
+                    profileId = "daily_p",
+                    targetPackageName = "com.instagram.android",
+                    dailyLimitMinutes = 60,
+                    windowType = LimitWindowType.FULL_DAY,
+                    isEnabled = true
+                )
+            )
+        )
+
+        // User previously used 75 mins (limit is 60). Now snapshot is stale / unavailable.
+        // It must NOT silently reset to 0 minutes and allow bypass!
+        val snapshot = SystemContextSnapshot(
+            timestampMillis = System.currentTimeMillis(),
+            localTime = LocalTime.of(18, 0),
+            dayOfWeek = DayOfWeek.TUESDAY,
+            foregroundPackageName = "com.instagram.android",
+            accumulatedForegroundTimeMillis = mapOf("com.instagram.android" to 75 * 60 * 1000L),
+            isUsageDataAvailable = false,
+            usageDataQuality = UsageDataQuality.STALE
+        )
+
+        val decision = engine.evaluate(listOf(profile), snapshot)
+        assertTrue("Exceeded usage must remain blocked even when snapshot is stale/unavailable", decision is BlockDecision.Blocked)
+    }
+
+    @Test
+    fun validatedUsageSnapshot_availabilityTracking() {
+        val today = LocalDate.now()
+        val available = ValidatedUsageSnapshot(
+            date = today,
+            capturedAtMillis = System.currentTimeMillis(),
+            foregroundUsageByPackage = mapOf("com.instagram.android" to 1000L),
+            quality = UsageDataQuality.PROVISIONAL,
+            isAvailable = true,
+            dataSource = "UsageEvents"
+        )
+        assertTrue(available.isAvailable)
+
+        val unavailable = ValidatedUsageSnapshot(
+            date = today,
+            capturedAtMillis = System.currentTimeMillis(),
+            foregroundUsageByPackage = emptyMap(),
+            quality = UsageDataQuality.PERMISSION_DENIED,
+            isAvailable = false,
+            dataSource = "Permission Denied"
+        )
+        assertFalse(unavailable.isAvailable)
     }
 }

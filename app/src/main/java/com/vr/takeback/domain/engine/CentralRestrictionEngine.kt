@@ -1,6 +1,7 @@
 package com.vr.takeback.domain.engine
 
 import com.vr.takeback.domain.model.*
+import com.vr.takeback.domain.usage.UsageDataQuality
 import java.time.DayOfWeek
 import java.time.LocalTime
 
@@ -14,6 +15,10 @@ data class SystemContextSnapshot(
     val foregroundPackageName: String?,
     val activeBrowserUrl: String? = null,
     val accumulatedForegroundTimeMillis: Map<String, Long> = emptyMap(),
+    val hourlyForegroundTimeMillis: Map<String, Long> = emptyMap(),
+    val currentSessionDurationMillis: Long = 0L,
+    val isUsageDataAvailable: Boolean = true,
+    val usageDataQuality: UsageDataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE,
     val activeGeofenceIds: Set<String> = emptySet(),
     val isFocusSessionActive: Boolean = false,
     val isBreakActive: Boolean = false,
@@ -241,30 +246,75 @@ class CentralRestrictionEngine {
         }
     }
 
+    /**
+     * Evaluates daily, hourly, and per-session usage limits.
+     * Enforces strict shared pool aggregation when targetPackageName is null.
+     */
     private fun evaluateUsageLimits(
         profile: Profile,
         packageName: String,
         snapshot: SystemContextSnapshot
     ): BlockDecision {
-        val usedMillis = snapshot.accumulatedForegroundTimeMillis[packageName] ?: 0L
-        val usedMinutes = (usedMillis / (1000 * 60)).toInt()
+        if (profile.usageLimits.isEmpty()) return BlockDecision.Allowed
 
         for (limit in profile.usageLimits) {
             if (!limit.isEnabled) continue
-            val matchesApp = limit.targetPackageName == null || limit.targetPackageName == packageName
-            if (matchesApp) {
-                if (usedMinutes >= limit.dailyLimitMinutes) {
-                    return BlockDecision.Blocked(
-                        target = BlockTarget.Application(packageName),
-                        triggeringProfileId = profile.id,
-                        triggeringProfileName = profile.name,
-                        reason = BlockReason.DailyLimitExceeded(
-                            limitMinutes = limit.dailyLimitMinutes,
-                            usedMinutes = usedMinutes
-                        ),
-                        remainingDurationMillis = 0L // Blocked until midnight reset
+
+            // Determine if this limit targets this package:
+            // null targetPackageName means shared pool limit for all profile's non-allowlisted target apps
+            val isTargeted = if (limit.targetPackageName == null) {
+                profile.targetApps.any { it.packageName == packageName && !it.isAllowlist }
+            } else {
+                limit.targetPackageName == packageName
+            }
+            if (!isTargeted) continue
+
+            val usedMillis: Long = when (limit.windowType) {
+                LimitWindowType.FULL_DAY -> {
+                    if (limit.targetPackageName == null) {
+                        // Shared pool limit: aggregate usage of ALL target apps in this profile
+                        val poolPackages = profile.targetApps.filter { !it.isAllowlist }.map { it.packageName }
+                        poolPackages.sumOf { snapshot.accumulatedForegroundTimeMillis[it] ?: 0L }
+                    } else {
+                        snapshot.accumulatedForegroundTimeMillis[packageName] ?: 0L
+                    }
+                }
+                LimitWindowType.PER_HOUR -> {
+                    if (limit.targetPackageName == null) {
+                        val poolPackages = profile.targetApps.filter { !it.isAllowlist }.map { it.packageName }
+                        poolPackages.sumOf { snapshot.hourlyForegroundTimeMillis[it] ?: 0L }
+                    } else {
+                        snapshot.hourlyForegroundTimeMillis[packageName] ?: 0L
+                    }
+                }
+                LimitWindowType.PER_SESSION -> {
+                    snapshot.currentSessionDurationMillis
+                }
+            }
+
+            val usedMinutes = (usedMillis / (1000 * 60)).toInt()
+
+            if (usedMinutes >= limit.dailyLimitMinutes) {
+                val reason = when (limit.windowType) {
+                    LimitWindowType.FULL_DAY -> BlockReason.DailyLimitExceeded(
+                        limitMinutes = limit.dailyLimitMinutes,
+                        usedMinutes = usedMinutes
+                    )
+                    LimitWindowType.PER_HOUR -> BlockReason.HourlyQuotaExceeded(
+                        limitMinutes = limit.dailyLimitMinutes
+                    )
+                    LimitWindowType.PER_SESSION -> BlockReason.DailyLimitExceeded(
+                        limitMinutes = limit.dailyLimitMinutes,
+                        usedMinutes = usedMinutes
                     )
                 }
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(packageName),
+                    triggeringProfileId = profile.id,
+                    triggeringProfileName = profile.name,
+                    reason = reason,
+                    remainingDurationMillis = 0L // Blocked until window reset
+                )
             }
         }
         return BlockDecision.Allowed

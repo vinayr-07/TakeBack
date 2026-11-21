@@ -159,7 +159,7 @@ class UsageSessionAggregatorTest {
     }
 
     @Test
-    fun missingInitialScreenInteractiveEvent_reportsIncompleteStartBoundary() {
+    fun missingInitialScreenInteractiveEvent_reportsIncompleteStartBoundary_andDoesNotSynthesizeMidnightInterval() {
         val startOfDay = 100000L
         val endOfDay = 500000L
 
@@ -177,9 +177,18 @@ class UsageSessionAggregatorTest {
         )
 
         assertTrue("Initial state was UNKNOWN so hasIncompleteStart must be true", hasIncompleteStart)
-        assertEquals(1, intervals.size)
-        assertEquals(startOfDay, intervals[0].startEpochMillis)
-        assertEquals(130000L, intervals[0].endEpochMillis)
+        assertEquals("Requirement 2: Must NOT synthesize an unprovable interval from midnight", 0, intervals.size)
+
+        val result = UsageSessionAggregator.reconstructFull(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+        assertFalse("Measurement must be marked unavailable without guessing", result.isDeviceInteractiveAvailable)
+        assertNull("Device interactive duration must be null", result.deviceInteractiveTimeMillis)
+        assertTrue(result.hasIncompleteStartBoundary)
     }
 
     @Test
@@ -281,5 +290,184 @@ class UsageSessionAggregatorTest {
         assertEquals(120000L, session.startEpochMillis)
         assertEquals("Must end exactly at shutdown time (140000), not continue to currentEpochMillis", 140000L, session.endEpochMillis)
         assertEquals(20000L, session.durationMillis)
+    }
+
+    @Test
+    fun lockAndUnlock_whileDisplayRemainsOn_allowsSubsequentAppSessions() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        // Screen turns on at 100k
+        // Instagram used from 110k to 120k
+        // Lock screen appears at 120k (screen stays on)
+        // User unlocks at 130k (KEYGUARD_HIDDEN, screen still on)
+        // Instagram resumes at 140k and pauses at 150k
+        val events = listOf(
+            RawUsageEvent("android", null, 100000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("com.instagram.android", "MainActivity", 110000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("android", null, 120000L, NormalizedEventType.KEYGUARD_SHOWN),
+            RawUsageEvent("android", null, 130000L, NormalizedEventType.KEYGUARD_HIDDEN),
+            RawUsageEvent("com.instagram.android", "MainActivity", 140000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.instagram.android", "MainActivity", 150000L, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val sessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+
+        assertEquals("Both sessions must be recorded because KEYGUARD_HIDDEN restores ability to track when screen remained interactive", 2, sessions.size)
+        assertEquals(110000L, sessions[0].startEpochMillis)
+        assertEquals(120000L, sessions[0].endEpochMillis)
+        assertEquals(140000L, sessions[1].startEpochMillis)
+        assertEquals(150000L, sessions[1].endEpochMillis)
+    }
+
+    @Test
+    fun lockFollowedByScreenOff_handlesIndependentTransitions() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        val events = listOf(
+            RawUsageEvent("android", null, 100000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("com.instagram.android", "MainActivity", 110000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("android", null, 120000L, NormalizedEventType.KEYGUARD_SHOWN),
+            RawUsageEvent("android", null, 125000L, NormalizedEventType.SCREEN_NON_INTERACTIVE),
+            RawUsageEvent("android", null, 150000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("android", null, 160000L, NormalizedEventType.KEYGUARD_HIDDEN),
+            RawUsageEvent("com.instagram.android", "MainActivity", 165000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.instagram.android", "MainActivity", 175000L, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val sessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+
+        assertEquals(2, sessions.size)
+        assertEquals(110000L, sessions[0].startEpochMillis)
+        assertEquals(120000L, sessions[0].endEpochMillis)
+        assertEquals(165000L, sessions[1].startEpochMillis)
+        assertEquals(175000L, sessions[1].endEpochMillis)
+    }
+
+    @Test
+    fun unlockFollowedByAppResume_withoutScreenInteractiveEvent_tracksSession() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        // Screen was turned interactive in lookback
+        val events = listOf(
+            RawUsageEvent("android", null, 80000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("android", null, 110000L, NormalizedEventType.KEYGUARD_SHOWN),
+            RawUsageEvent("android", null, 130000L, NormalizedEventType.KEYGUARD_HIDDEN),
+            RawUsageEvent("com.google.android.youtube", "Watch", 140000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.google.android.youtube", "Watch", 180000L, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val sessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+
+        assertEquals(1, sessions.size)
+        assertEquals("com.google.android.youtube", sessions[0].packageName)
+        assertEquals(140000L, sessions[0].startEpochMillis)
+        assertEquals(180000L, sessions[0].endEpochMillis)
+        assertEquals(40000L, sessions[0].durationMillis)
+    }
+
+    @Test
+    fun duplicateKeyguardTransitions_maintainRobustState() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        val events = listOf(
+            RawUsageEvent("android", null, 100000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("android", null, 110000L, NormalizedEventType.KEYGUARD_SHOWN),
+            RawUsageEvent("android", null, 112000L, NormalizedEventType.KEYGUARD_SHOWN), // duplicate
+            RawUsageEvent("android", null, 120000L, NormalizedEventType.KEYGUARD_HIDDEN),
+            RawUsageEvent("android", null, 122000L, NormalizedEventType.KEYGUARD_HIDDEN), // duplicate
+            RawUsageEvent("com.android.chrome", "TabbedActivity", 130000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.android.chrome", "TabbedActivity", 140000L, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val sessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+
+        assertEquals(1, sessions.size)
+        assertEquals("com.android.chrome", sessions[0].packageName)
+        assertEquals(130000L, sessions[0].startEpochMillis)
+        assertEquals(140000L, sessions[0].endEpochMillis)
+    }
+
+    @Test
+    fun appUsageAcrossMidnight_resumedBeforeMidnight_retainsUsageAfterMidnight() {
+        // startOfDay = 1000000L (Midnight)
+        val midnight = 1000000L
+        val endOfDay = midnight + 86400000L
+        val thirtyMinutesMillis = 30 * 60 * 1000L
+
+        // App resumed at 23:30 (midnight - 30m)
+        // Screen is interactive
+        // App pauses at 00:30 (midnight + 30m)
+        val events = listOf(
+            RawUsageEvent("android", null, midnight - 40 * 60 * 1000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("com.instagram.android", "MainActivity", midnight - thirtyMinutesMillis, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.instagram.android", "MainActivity", midnight + thirtyMinutesMillis, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val sessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = midnight,
+            endEpochMillis = endOfDay,
+            isToday = true,
+            isUserLaunchableApp = isLaunchable,
+            currentEpochMillis = midnight + 60 * 60 * 1000L
+        )
+
+        assertEquals("Session active across midnight must be captured for today", 1, sessions.size)
+        val session = sessions.first()
+        assertEquals("Start time for today's quota must be bounded at midnight (startOfDay)", midnight, session.startEpochMillis)
+        assertEquals("End time must be 00:30", midnight + thirtyMinutesMillis, session.endEpochMillis)
+        assertEquals("Session duration after midnight must be exactly 30 minutes", thirtyMinutesMillis, session.durationMillis)
+    }
+
+    @Test
+    fun appSession_whereOriginalResumeLiesOutsideLookback_reportsIncompleteBoundary() {
+        // App was resumed before lookback, so only a pause event exists after midnight
+        val midnight = 1000000L
+        val endOfDay = midnight + 86400000L
+
+        val events = listOf(
+            RawUsageEvent("android", null, midnight + 10000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            // No ACTIVITY_RESUMED in lookback
+            RawUsageEvent("com.instagram.android", "MainActivity", midnight + 30000L, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val sessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = midnight,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+
+        // Without a preceding resume event in lookback, an orphan pause cannot fabricate an arbitrary session
+        assertEquals("Orphan pause without preceding resume must not fabricate an arbitrary duration", 0, sessions.size)
     }
 }

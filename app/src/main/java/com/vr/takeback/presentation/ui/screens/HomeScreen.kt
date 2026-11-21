@@ -433,19 +433,53 @@ fun HomeScreen(
                                 )
                             }
                         } else {
-                            val totalMillis = usageSummary!!.deviceScreenTimeMillis
+                            val isInteractiveAvailable = usageSummary!!.isDeviceInteractiveAvailable && usageSummary!!.deviceScreenTimeMillis != null
+                            val deviceMillis = usageSummary!!.deviceScreenTimeMillis
+                            val totalAppMillis = usageSummary!!.totalTimeMillis
+
+                            val totalMillis = deviceMillis ?: totalAppMillis
                             val usedHours = totalMillis / (1000 * 3600)
                             val usedMins = (totalMillis % (1000 * 3600)) / (1000 * 60)
                             val allowanceMillis = dailyAllowanceMinutes * 60 * 1000L
                             val progress = if (allowanceMillis > 0) (totalMillis.toFloat() / allowanceMillis).coerceIn(0f, 1f) else 0f
                             val remainingMinutes = maxOf(0L, (allowanceMillis - totalMillis) / (1000 * 60))
 
-                            Text(
-                                text = "${usedHours}h ${usedMins}m",
-                                style = MaterialTheme.typography.displayMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
+                            if (isInteractiveAvailable) {
+                                Text(
+                                    text = "${usedHours}h ${usedMins}m",
+                                    style = MaterialTheme.typography.displayMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            } else if (usageSummary!!.isRealDataAvailable && totalAppMillis > 0L) {
+                                Column {
+                                    Text(
+                                        text = "${usedHours}h ${usedMins}m",
+                                        style = MaterialTheme.typography.displayMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = "Tracked Apps (Display interactive time unavailable)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            } else {
+                                Column {
+                                    Text(
+                                        text = "Unavailable",
+                                        style = MaterialTheme.typography.displayMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        text = "Screen state events unrecorded by OS",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
 
                             Spacer(modifier = Modifier.height(12.dp))
 

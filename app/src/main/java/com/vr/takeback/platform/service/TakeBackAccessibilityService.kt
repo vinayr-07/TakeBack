@@ -49,6 +49,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private var lastUsageSnapshotRefreshTime: Long = 0L
     private var lastBlockedPackage: String? = null
     private var lastBlockedTimestamp: Long = 0
+    @Volatile
+    private var currentForegroundPackage: String? = null
+    @Volatile
+    private var currentSessionStartTime: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -82,15 +86,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastUsageSnapshotRefreshTime > 30_000L) {
-            lastUsageSnapshotRefreshTime = now
-            serviceScope.launch {
-                try {
-                    TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
-                } catch (e: Exception) {
-                    // ignore
-                }
-            }
+        if (packageName != currentForegroundPackage) {
+            currentForegroundPackage = packageName
+            currentSessionStartTime = now
         }
 
         // Strict Mode Anti-Tamper: Protect against Force Stop / Uninstall through Settings
@@ -217,11 +215,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         } else emptySet()
 
-        val usageSnapshot = try {
-            TakeBackApplication.usageStatsRepository.getCachedUsageSnapshot()
+        val activeSnapshot = try {
+            TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
         } catch (e: Exception) {
-            emptyMap()
+            null
         }
+
+        val hasUsageLimitForApp = enabledProfiles.any { profile ->
+            profile.usageLimits.any { limit ->
+                limit.isEnabled && (limit.targetPackageName == null || limit.targetPackageName == packageName)
+            }
+        }
+
+        val currentSessionDuration = maxOf(0L, now - currentSessionStartTime)
 
         // Build current context snapshot
         val snapshot = SystemContextSnapshot(
@@ -230,19 +236,53 @@ class TakeBackAccessibilityService : AccessibilityService() {
             dayOfWeek = dayOfWeek,
             foregroundPackageName = packageName,
             activeBrowserUrl = browserUrl,
-            accumulatedForegroundTimeMillis = usageSnapshot,
+            accumulatedForegroundTimeMillis = activeSnapshot?.foregroundUsageByPackage ?: emptyMap(),
+            currentSessionDurationMillis = currentSessionDuration,
+            isUsageDataAvailable = activeSnapshot?.isAvailable ?: false,
+            usageDataQuality = activeSnapshot?.quality ?: com.vr.takeback.domain.usage.UsageDataQuality.UNKNOWN,
             isQuickBlockActive = isQuickBlockActive,
             quickBlockExpirationEpochMillis = quickBlockExpiry,
             quickBlockTargetPackages = quickBlockPackages
         )
 
-        val decision = engine.evaluate(activeProfiles, snapshot)
+        val immediateDecision = engine.evaluate(activeProfiles, snapshot)
 
-        if (decision is BlockDecision.Blocked) {
-            Log.i(TAG, "Blocking $packageName because: ${decision.reason} (Profile: ${decision.triggeringProfileName})")
+        if (immediateDecision is BlockDecision.Blocked) {
+            Log.i(TAG, "Blocking $packageName immediately because: ${immediateDecision.reason} (Profile: ${immediateDecision.triggeringProfileName})")
             lastBlockedPackage = packageName
             lastBlockedTimestamp = now
-            handleBlockDecision(decision)
+            handleBlockDecision(immediateDecision)
+            return
+        }
+
+        // Requirement 4: If usage limits apply and the snapshot is stale/unloaded,
+        // refresh in background without blocking the main thread, and re-evaluate only if
+        // the package is STILL foreground before executing any delayed block!
+        val isSnapshotFresh = activeSnapshot?.isAvailable == true && (now - activeSnapshot.capturedAtMillis <= 30_000L)
+        if (hasUsageLimitForApp && !isSnapshotFresh) {
+            serviceScope.launch {
+                try {
+                    val fresh = TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
+                    if (currentForegroundPackage == packageName) {
+                        val updatedSnapshot = snapshot.copy(
+                            timestampMillis = System.currentTimeMillis(),
+                            accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
+                            currentSessionDurationMillis = System.currentTimeMillis() - currentSessionStartTime,
+                            isUsageDataAvailable = fresh.isAvailable,
+                            usageDataQuality = fresh.quality
+                        )
+                        val delayedDecision = engine.evaluate(activeProfiles, updatedSnapshot)
+                        if (delayedDecision is BlockDecision.Blocked && currentForegroundPackage == packageName) {
+                            Log.i(TAG, "Delayed block on fresh snapshot for $packageName: ${delayedDecision.reason}")
+                            lastBlockedPackage = packageName
+                            lastBlockedTimestamp = System.currentTimeMillis()
+                            handleBlockDecision(delayedDecision)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed background refresh for usage limits", e)
+                }
+            }
         }
     }
 

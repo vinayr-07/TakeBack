@@ -74,11 +74,23 @@ fun InsightsScreen(
     val timelineEvents by timelineRepository.events.collectAsState()
 
     val hasPermission = usageStatsRepository.hasUsagePermission()
-    val screenTimeMillis = usageSummary?.deviceScreenTimeMillis ?: 0L
-    val totalMinutes = screenTimeMillis / (1000 * 60)
-    val hours = totalMinutes / 60
-    val minutes = totalMinutes % 60
-    val formattedScreenTime = if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+    val isInteractiveAvailable = usageSummary?.isDeviceInteractiveAvailable == true && usageSummary?.deviceScreenTimeMillis != null
+    val screenTimeMillis = usageSummary?.deviceScreenTimeMillis
+    val totalAppMillis = usageSummary?.totalTimeMillis ?: 0L
+
+    val formattedScreenTime = if (isInteractiveAvailable && screenTimeMillis != null) {
+        val totalMinutes = screenTimeMillis / (1000 * 60)
+        val hours = totalMinutes / 60
+        val minutes = totalMinutes % 60
+        if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+    } else if (usageSummary?.isRealDataAvailable == true && totalAppMillis > 0L) {
+        val totalMinutes = totalAppMillis / (1000 * 60)
+        val hours = totalMinutes / 60
+        val minutes = totalMinutes % 60
+        "${if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"} (Apps)"
+    } else {
+        "Unavailable"
+    }
 
     val blockedEventsCount = timelineEvents.count {
         it.eventType == EventType.APP_BLOCKED || it.eventType == EventType.WEBSITE_BLOCKED
@@ -239,7 +251,7 @@ fun InsightsScreen(
                         Spacer(modifier = Modifier.height(18.dp))
 
                         val weeklyDays = usageSummary?.weeklyOverview ?: emptyList()
-                        val maxDayMillis = weeklyDays.maxOfOrNull { it.totalTimeMillis }?.coerceAtLeast(1L) ?: (4 * 3600 * 1000L)
+                        val maxDayMillis = weeklyDays.maxOfOrNull { it.totalTimeMillis ?: 0L }?.coerceAtLeast(1L) ?: (4 * 3600 * 1000L)
 
                         // 7 Weekly Bars for Mon through Sun
                         Row(
@@ -251,10 +263,23 @@ fun InsightsScreen(
                         ) {
                             weeklyDays.forEach { day ->
                                 val isSelected = day.date == selectedDate
-                                val dayHours = day.totalTimeMillis / (1000 * 3600)
-                                val dayMins = (day.totalTimeMillis % (1000 * 3600)) / (1000 * 60)
-                                val timeLabel = if (day.totalTimeMillis == 0L) "-" else if (dayHours > 0) "${dayHours}h" else "${dayMins}m"
-                                val fillRatio = (day.totalTimeMillis.toFloat() / maxDayMillis.toFloat()).coerceIn(0.06f, 1f)
+                                val dayMillis = day.totalTimeMillis ?: 0L
+                                val dayHours = dayMillis / (1000 * 3600)
+                                val dayMins = (dayMillis % (1000 * 3600)) / (1000 * 60)
+                                val timeLabel = if (!day.isAvailable || day.totalTimeMillis == null) {
+                                    "N/A"
+                                } else if (day.totalTimeMillis == 0L) {
+                                    "-"
+                                } else if (dayHours > 0) {
+                                    "${dayHours}h"
+                                } else {
+                                    "${dayMins}m"
+                                }
+                                val fillRatio = if (day.isAvailable && day.totalTimeMillis != null) {
+                                    (dayMillis.toFloat() / maxDayMillis.toFloat()).coerceIn(0.06f, 1f)
+                                } else {
+                                    0.06f
+                                }
 
                                 Column(
                                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -298,7 +323,12 @@ fun InsightsScreen(
                                                 .fillMaxHeight(fillRatio)
                                                 .clip(RoundedCornerShape(4.dp))
                                                 .background(
-                                                    if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+                                                    when {
+                                                        !day.isAvailable || day.totalTimeMillis == null -> MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                                                        day.dataQuality == UsageDataQuality.RECONSTRUCTED_PARTIAL -> Color(0xFFD97706)
+                                                        isSelected -> MaterialTheme.colorScheme.primary
+                                                        else -> MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+                                                    }
                                                 )
                                         )
                                     }
@@ -382,7 +412,7 @@ fun InsightsScreen(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "Device Interactive Time",
+                                text = if (isInteractiveAvailable) "Device Interactive Time" else if (totalAppMillis > 0L) "Tracked App Time (Display Unrecorded)" else "Screen Time Unavailable",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(bottom = 6.dp)
