@@ -28,23 +28,39 @@ data class SessionInterval(
     val durationMillis: Long get() = maxOf(0L, endEpochMillis - startEpochMillis)
 }
 
+data class InteractiveInterval(
+    val startEpochMillis: Long,
+    val endEpochMillis: Long
+) {
+    val durationMillis: Long get() = maxOf(0L, endEpochMillis - startEpochMillis)
+}
+
+data class ReconstructionResult(
+    val appSessions: List<SessionInterval>,
+    val interactiveIntervals: List<InteractiveInterval>,
+    val deviceInteractiveTimeMillis: Long,
+    val totalTrackedAppUsageMillis: Long,
+    val hasIncompleteStartBoundary: Boolean,
+    val hasIncompleteEndBoundary: Boolean
+)
+
 /**
- * High-precision, deterministic session reconstruction engine.
+ * High-precision, deterministic session and interactive-time reconstruction engine.
  *
  * Reconstructs exact calendar-aligned application foreground sessions and
- * device screen-on intervals from raw UsageEvents.
+ * device-interactive intervals from raw UsageEvents.
  *
- * INVARIANTS:
- * 1. Zero Android framework imports - fully testable on JVM with injected clocks.
- * 2. Duplicate ACTIVITY_RESUMED events do not overwrite the initial start time.
- * 3. In single-window mode, when a new package takes foreground, unclosed activities
- *    from other packages are cleanly bounded at the handoff timestamp.
- * 4. Screen off (SCREEN_NON_INTERACTIVE / KEYGUARD_SHOWN) immediately bounds all active sessions.
- * 5. Device shutdown bounds active sessions at the shutdown timestamp.
- * 6. Historical queries cleanly bound sessions crossing the midnight boundary.
- * 7. Overlapping activities within the SAME package are merged into a single contiguous
- *    interval without double-counting duration.
- * 8. Never synthesizes artificial sessions or fake timestamps.
+ * ARCHITECTURAL INVARIANTS:
+ * 1. Zero Android framework imports - fully testable on JVM with deterministic injected clocks.
+ * 2. Multi-resume support: Overlapping foreground intervals from multiple applications (split-screen / multi-window)
+ *    are preserved independently. Starting app B does NOT artificially truncate app A.
+ * 3. NO arbitrary session caps: Continuous long sessions (e.g. 5+ hours) are never truncated.
+ * 4. Distinct metric semantics: Device-Interactive Time (display active/unlocked) is computed
+ *    from SCREEN/KEYGUARD events independently of application filters (launcher, settings, and home screen count).
+ * 5. Strict calendar interval clipping: All intervals are strictly bounded to [startEpochMillis, endEpochMillis).
+ * 6. Duplicate event protection: Repeated ACTIVITY_RESUMED events do not overwrite the initial start time.
+ * 7. Screen-off / keyguard enforcement: SCREEN_NON_INTERACTIVE and KEYGUARD_SHOWN cleanly close active sessions.
+ * 8. Boundary completeness tracking: Exposes explicit boundary quality flags when history begins mid-session.
  */
 object UsageSessionAggregator {
 
@@ -53,9 +69,9 @@ object UsageSessionAggregator {
         val className: String?
     )
 
-    // Maximum plausible continuous session without intermediate activity events (4 hours)
-    private const val MAX_UNINTERRUPTED_SESSION_MILLIS = 4L * 60 * 60 * 1000L
-
+    /**
+     * Reconstructs application foreground sessions for launchable applications.
+     */
     fun reconstructSessions(
         events: List<RawUsageEvent>,
         startEpochMillis: Long,
@@ -65,7 +81,7 @@ object UsageSessionAggregator {
         currentEpochMillis: Long = System.currentTimeMillis()
     ): List<SessionInterval> {
         val activeActivities = mutableMapOf<ActivityKey, Long>()
-        val intervals = mutableListOf<SessionInterval>()
+        val rawIntervals = mutableListOf<SessionInterval>()
         var screenInteractive = true
         var deviceShuttingDown = false
 
@@ -74,28 +90,14 @@ object UsageSessionAggregator {
             val boundedEnd = minOf(endEpochMillis, closeTime)
             val boundedStart = maxOf(startEpochMillis, started)
 
-            // Guard against runaway sessions where pause event was missed
-            val effectiveStart = if (boundedEnd - boundedStart > MAX_UNINTERRUPTED_SESSION_MILLIS) {
-                maxOf(boundedStart, boundedEnd - MAX_UNINTERRUPTED_SESSION_MILLIS)
-            } else {
-                boundedStart
-            }
-
-            if (boundedEnd > effectiveStart && isUserLaunchableApp(key.packageName)) {
-                intervals.add(
+            if (boundedEnd > boundedStart && isUserLaunchableApp(key.packageName)) {
+                rawIntervals.add(
                     SessionInterval(
                         packageName = key.packageName,
-                        startEpochMillis = effectiveStart,
+                        startEpochMillis = boundedStart,
                         endEpochMillis = boundedEnd
                     )
                 )
-            }
-        }
-
-        fun closeActivitiesForOtherPackages(currentPackageName: String, handoffTime: Long) {
-            val otherKeys = activeActivities.keys.filter { it.packageName != currentPackageName }
-            for (key in otherKeys) {
-                closeActivity(key, handoffTime)
             }
         }
 
@@ -108,7 +110,6 @@ object UsageSessionAggregator {
 
         val sortedEvents = events.sortedWith(
             compareBy<RawUsageEvent> { it.timestampMillis }.thenBy {
-                // Process pauses/stops before resumes if they have the exact same millisecond
                 when (it.type) {
                     NormalizedEventType.ACTIVITY_PAUSED,
                     NormalizedEventType.ACTIVITY_STOPPED,
@@ -127,10 +128,8 @@ object UsageSessionAggregator {
             when (event.type) {
                 NormalizedEventType.ACTIVITY_RESUMED -> {
                     if (screenInteractive && event.packageName != "android" && !deviceShuttingDown) {
-                        // When a new package resumes in foreground, close previous packages' unclosed activities
-                        closeActivitiesForOtherPackages(event.packageName, time)
-
-                        // Do not overwrite existing start time if activity is already marked active
+                        // Multi-resume support: Do NOT close other packages.
+                        // Do NOT overwrite existing start time if activity is already marked active.
                         if (!activeActivities.containsKey(key)) {
                             activeActivities[key] = time
                         }
@@ -161,13 +160,14 @@ object UsageSessionAggregator {
 
                 NormalizedEventType.DEVICE_STARTUP -> {
                     deviceShuttingDown = false
+                    activeActivities.clear()
                 }
 
                 NormalizedEventType.OTHER -> { /* no-op */ }
             }
         }
 
-        // Bounded closure at end of evaluation interval
+        // Bounded closure at end of interval
         val finalCloseTime = if (isToday) {
             minOf(endEpochMillis, currentEpochMillis)
         } else {
@@ -177,13 +177,12 @@ object UsageSessionAggregator {
         if (screenInteractive && !deviceShuttingDown) {
             closeAllActivities(finalCloseTime)
         } else {
-            // Screen is off or device is shut down; clear any unclosed residue without inventing time
             activeActivities.clear()
         }
 
-        // Merge overlapping or adjacent intervals per package
+        // Merge overlapping or adjacent activity intervals per package
         val mergedSessions = mutableListOf<SessionInterval>()
-        intervals
+        rawIntervals
             .groupBy { it.packageName }
             .forEach { (pkg, packageIntervals) ->
                 val sorted = packageIntervals.sortedBy { it.startEpochMillis }
@@ -193,7 +192,7 @@ object UsageSessionAggregator {
                 var mergedEnd = sorted.first().endEpochMillis
 
                 fun emitSession() {
-                    // Filter out sub-second transient flickers (e.g. intent redirect trampolines < 1000ms)
+                    // Filter sub-second transient flickers (< 1000ms)
                     if (mergedEnd - mergedStart >= 1000L) {
                         mergedSessions.add(
                             SessionInterval(
@@ -221,11 +220,183 @@ object UsageSessionAggregator {
     }
 
     /**
-     * Computes true elapsed device screen-on time by merging the union of
-     * all active application session intervals across all packages.
-     * This avoids double-counting split-screen or multi-activity overlapping windows.
+     * Reconstructs device-interactive intervals based strictly on screen and keyguard transitions.
+     * Does NOT filter out launchers, system settings, or system UI.
      */
-    fun computeDeviceScreenOnTimeMillis(sessions: List<SessionInterval>): Long {
+    fun reconstructDeviceInteractiveIntervals(
+        events: List<RawUsageEvent>,
+        startEpochMillis: Long,
+        endEpochMillis: Long,
+        isToday: Boolean,
+        currentEpochMillis: Long = System.currentTimeMillis()
+    ): List<InteractiveInterval> {
+        val rawIntervals = mutableListOf<InteractiveInterval>()
+        var isInteractive = false
+        var interactiveStart: Long? = null
+        var isShutDown = false
+
+        fun closeInteractiveWindow(closeTime: Long) {
+            val start = interactiveStart ?: return
+            val boundedEnd = minOf(endEpochMillis, closeTime)
+            val boundedStart = maxOf(startEpochMillis, start)
+            if (boundedEnd > boundedStart) {
+                rawIntervals.add(InteractiveInterval(boundedStart, boundedEnd))
+            }
+            interactiveStart = null
+            isInteractive = false
+        }
+
+        val sortedEvents = events.sortedWith(
+            compareBy<RawUsageEvent> { it.timestampMillis }.thenBy {
+                when (it.type) {
+                    NormalizedEventType.SCREEN_NON_INTERACTIVE,
+                    NormalizedEventType.KEYGUARD_SHOWN,
+                    NormalizedEventType.DEVICE_SHUTDOWN -> 0
+                    else -> 1
+                }
+            }
+        )
+
+        for (event in sortedEvents) {
+            val time = event.timestampMillis
+
+            when (event.type) {
+                NormalizedEventType.SCREEN_INTERACTIVE,
+                NormalizedEventType.KEYGUARD_HIDDEN -> {
+                    if (!isShutDown && !isInteractive) {
+                        isInteractive = true
+                        interactiveStart = time
+                    }
+                }
+
+                NormalizedEventType.SCREEN_NON_INTERACTIVE,
+                NormalizedEventType.KEYGUARD_SHOWN -> {
+                    if (isInteractive) {
+                        closeInteractiveWindow(time)
+                    }
+                }
+
+                NormalizedEventType.DEVICE_SHUTDOWN -> {
+                    isShutDown = true
+                    if (isInteractive) {
+                        closeInteractiveWindow(time)
+                    }
+                }
+
+                NormalizedEventType.DEVICE_STARTUP -> {
+                    isShutDown = false
+                    isInteractive = false
+                    interactiveStart = null
+                }
+
+                else -> { /* Ignore app lifecycle for device-level interactive state */ }
+            }
+        }
+
+        // Bounded closure at end of interval
+        val finalClose = if (isToday) {
+            minOf(endEpochMillis, currentEpochMillis)
+        } else {
+            endEpochMillis
+        }
+
+        if (isInteractive && !isShutDown) {
+            closeInteractiveWindow(finalClose)
+        }
+
+        // Merge contiguous / overlapping interactive slices
+        val sorted = rawIntervals.sortedBy { it.startEpochMillis }
+        if (sorted.isEmpty()) return emptyList()
+
+        val merged = mutableListOf<InteractiveInterval>()
+        var curStart = sorted.first().startEpochMillis
+        var curEnd = sorted.first().endEpochMillis
+
+        for (interval in sorted.drop(1)) {
+            if (interval.startEpochMillis <= curEnd) {
+                curEnd = maxOf(curEnd, interval.endEpochMillis)
+            } else {
+                if (curEnd - curStart >= 1000L) {
+                    merged.add(InteractiveInterval(curStart, curEnd))
+                }
+                curStart = interval.startEpochMillis
+                curEnd = interval.endEpochMillis
+            }
+        }
+        if (curEnd - curStart >= 1000L) {
+            merged.add(InteractiveInterval(curStart, curEnd))
+        }
+
+        return merged
+    }
+
+    /**
+     * Computes the total duration in milliseconds of an interactive interval list.
+     */
+    fun computeTotalInteractiveDuration(intervals: List<InteractiveInterval>): Long {
+        return intervals.sumOf { it.durationMillis }
+    }
+
+    /**
+     * Computes full reconstruction output with metrics and boundary quality detection.
+     */
+    fun reconstructFull(
+        events: List<RawUsageEvent>,
+        startEpochMillis: Long,
+        endEpochMillis: Long,
+        isToday: Boolean,
+        isUserLaunchableApp: (String) -> Boolean,
+        currentEpochMillis: Long = System.currentTimeMillis()
+    ): ReconstructionResult {
+        val appSessions = reconstructSessions(
+            events = events,
+            startEpochMillis = startEpochMillis,
+            endEpochMillis = endEpochMillis,
+            isToday = isToday,
+            isUserLaunchableApp = isUserLaunchableApp,
+            currentEpochMillis = currentEpochMillis
+        )
+
+        val interactiveIntervals = reconstructDeviceInteractiveIntervals(
+            events = events,
+            startEpochMillis = startEpochMillis,
+            endEpochMillis = endEpochMillis,
+            isToday = isToday,
+            currentEpochMillis = currentEpochMillis
+        )
+
+        // If screen interactive intervals were observed, use them as device interactive time.
+        // Fallback: If device screen events (15/16) are not dispatched by the OEM, use the
+        // union of foreground app sessions as a lower-bound fallback.
+        val interactiveDuration = computeTotalInteractiveDuration(interactiveIntervals)
+        val appUnionDuration = computeAppSessionUnionMillis(appSessions)
+        val effectiveInteractiveTime = if (interactiveDuration > 0L) {
+            maxOf(interactiveDuration, appUnionDuration)
+        } else {
+            appUnionDuration
+        }
+
+        val totalTrackedAppUsage = appSessions.sumOf { it.durationMillis }
+
+        // Boundary analysis
+        val firstEventTime = events.minOfOrNull { it.timestampMillis }
+        val hasIncompleteStart = firstEventTime != null && firstEventTime > (startEpochMillis + 60_000L) &&
+                events.any { it.timestampMillis < (startEpochMillis + 180_000L) && (it.type == NormalizedEventType.ACTIVITY_PAUSED || it.type == NormalizedEventType.ACTIVITY_STOPPED) }
+
+        return ReconstructionResult(
+            appSessions = appSessions,
+            interactiveIntervals = interactiveIntervals,
+            deviceInteractiveTimeMillis = effectiveInteractiveTime,
+            totalTrackedAppUsageMillis = totalTrackedAppUsage,
+            hasIncompleteStartBoundary = hasIncompleteStart,
+            hasIncompleteEndBoundary = false
+        )
+    }
+
+    /**
+     * Computes union of application session intervals across all packages.
+     */
+    fun computeAppSessionUnionMillis(sessions: List<SessionInterval>): Long {
         if (sessions.isEmpty()) return 0L
         val sorted = sessions.sortedBy { it.startEpochMillis }
 

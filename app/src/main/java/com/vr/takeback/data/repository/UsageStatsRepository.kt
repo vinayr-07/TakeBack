@@ -11,6 +11,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import com.vr.takeback.data.database.PersistedAppRecord
+import com.vr.takeback.data.database.PersistedDeviceRecord
+import com.vr.takeback.data.database.UsageLedgerDatabase
 import com.vr.takeback.domain.model.AppUsageInfo
 import com.vr.takeback.domain.usage.*
 import kotlinx.coroutines.Dispatchers
@@ -54,17 +57,21 @@ data class DayUsageOverview(
     val dayName: String,
     val totalTimeMillis: Long,
     val isToday: Boolean,
-    val isSelected: Boolean
+    val isSelected: Boolean,
+    val dataQuality: UsageDataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE
 )
 
 data class DailyUsageSummary(
     val selectedDate: LocalDate = LocalDate.now(),
-    val totalTimeMillis: Long,
-    val deviceScreenTimeMillis: Long = totalTimeMillis,
+    val totalTimeMillis: Long, // Sum of tracked app foreground usage
+    val deviceScreenTimeMillis: Long = totalTimeMillis, // Device Interactive Time (display active/unlocked)
     val topApps: List<AppUsageInfo>,
     val sessions: List<AppUsageSession>,
     val weeklyOverview: List<DayUsageOverview>,
     val isRealDataAvailable: Boolean,
+    val dataQuality: UsageDataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE,
+    val dataSourceDescription: String = "UsageEvents Reconstructed",
+    val completeThroughTimestampMillis: Long = System.currentTimeMillis(),
     val diagnostics: UsageDiagnostics? = null
 )
 
@@ -92,12 +99,26 @@ class UsageStatsRepository(private val context: Context) {
     private val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
     private val packageManager = context.packageManager
     private val allowancePrefs = context.getSharedPreferences("takeback_allowance_prefs", Context.MODE_PRIVATE)
+    private val ledgerDb = UsageLedgerDatabase(context)
 
     @Volatile
     private var cachedLaunchablePackages: Set<String>? = null
 
     @Volatile
     private var latestDiagnostics: UsageDiagnostics? = null
+
+    data class UsageSnapshot(
+        val date: LocalDate,
+        val capturedAtMillis: Long,
+        val foregroundUsageByPackage: Map<String, Long>,
+        val quality: UsageDataQuality
+    )
+
+    @Volatile
+    private var cachedUsageSnapshot: UsageSnapshot? = null
+
+    @Volatile
+    private var lastValidUsageSnapshot: Map<String, Long>? = null
 
     fun getLatestDiagnostics(): UsageDiagnostics? = latestDiagnostics
 
@@ -168,29 +189,28 @@ class UsageStatsRepository(private val context: Context) {
         }
     }
 
-    data class UsageSnapshot(
-        val date: LocalDate,
-        val capturedAtMillis: Long,
-        val foregroundUsageByPackage: Map<String, Long>
-    )
-
-    @Volatile
-    private var cachedUsageSnapshot: UsageSnapshot? = null
-
+    /**
+     * Returns the active cached usage snapshot for CentralRestrictionEngine.
+     * Guaranteed never to return emptyMap() during transient query failures if valid
+     * data was previously captured today, preventing restriction bypass.
+     */
     fun getCachedUsageSnapshot(): Map<String, Long> {
         val today = LocalDate.now()
         val snapshot = cachedUsageSnapshot
-        return if (snapshot != null && snapshot.date == today) {
+        return if (snapshot != null && snapshot.date == today && snapshot.foregroundUsageByPackage.isNotEmpty()) {
             snapshot.foregroundUsageByPackage
         } else {
-            emptyMap()
+            lastValidUsageSnapshot ?: emptyMap()
         }
+    }
+
+    fun getCachedUsageQuality(): UsageDataQuality {
+        return cachedUsageSnapshot?.quality ?: UsageDataQuality.UNKNOWN
     }
 
     /**
      * Refreshes the active today usage snapshot for CentralRestrictionEngine.
-     * Reconstructs true foreground usage strictly from midnight 00:00:00 to now,
-     * preventing pre-midnight usage in unrotated OS daily buckets from triggering limits prematurely.
+     * Reconstructs true foreground usage strictly from midnight 00:00:00 to now.
      */
     suspend fun refreshUsageSnapshot() = withContext(Dispatchers.IO) {
         if (!hasUsagePermission() || usageStatsManager == null) {
@@ -206,11 +226,16 @@ class UsageStatsRepository(private val context: Context) {
             .groupBy { it.packageName }
             .mapValues { (_, list) -> list.sumOf { it.durationMillis } }
 
-        cachedUsageSnapshot = UsageSnapshot(
+        val snapshot = UsageSnapshot(
             date = LocalDate.now(zone),
             capturedAtMillis = now,
-            foregroundUsageByPackage = usageMap
+            foregroundUsageByPackage = usageMap,
+            quality = UsageDataQuality.PROVISIONAL
         )
+        cachedUsageSnapshot = snapshot
+        if (usageMap.isNotEmpty()) {
+            lastValidUsageSnapshot = usageMap
+        }
     }
 
     suspend fun getTodayUsageSummary(): DailyUsageSummary = withContext(Dispatchers.IO) {
@@ -228,14 +253,54 @@ class UsageStatsRepository(private val context: Context) {
                 sessions = emptyList(),
                 weeklyOverview = emptyList(),
                 isRealDataAvailable = false,
+                dataQuality = UsageDataQuality.PERMISSION_DENIED,
+                dataSourceDescription = "Permission Denied",
                 diagnostics = buildErrorDiagnostics(targetDate, "Usage access permission not granted or service unavailable")
             )
         }
 
         val zone = ZoneId.systemDefault()
         val today = LocalDate.now(zone)
+        val isTargetToday = (targetDate == today)
+        val isTargetPast = targetDate.isBefore(today)
+
+        // 1. Check persistent database ledger for past days
+        if (isTargetPast) {
+            val persistedDevice = ledgerDb.getDeviceRecord(targetDate)
+            if (persistedDevice != null && persistedDevice.isFinalized) {
+                val persistedApps = ledgerDb.getAppRecords(targetDate)
+                val topApps = persistedApps.map { record ->
+                    AppUsageInfo(
+                        packageName = record.packageName,
+                        appName = record.appLabel,
+                        usageTimeMillis = record.foregroundDurationMillis,
+                        launchCount = record.launchCount,
+                        lastTimeUsedMillis = record.lastTimeUsedMillis,
+                        isBlocked = false
+                    )
+                }
+
+                val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, persistedDevice.deviceInteractiveMillis)
+
+                return@withContext DailyUsageSummary(
+                    selectedDate = targetDate,
+                    totalTimeMillis = persistedDevice.totalTrackedAppMillis,
+                    deviceScreenTimeMillis = persistedDevice.deviceInteractiveMillis,
+                    topApps = topApps,
+                    sessions = emptyList(), // Granular historical session intervals stored summarized
+                    weeklyOverview = weeklyOverview,
+                    isRealDataAvailable = true,
+                    dataQuality = persistedDevice.qualityStatus,
+                    dataSourceDescription = "Persisted Usage Ledger (${persistedDevice.dataSource})",
+                    completeThroughTimestampMillis = persistedDevice.queryTimestamp,
+                    diagnostics = null
+                )
+            }
+        }
+
+        // 2. Query UsageEvents from system
         val startOfDay = targetDate.atStartOfDay(zone).toInstant().toEpochMilli()
-        val endExclusive = if (targetDate == today) {
+        val endExclusive = if (isTargetToday) {
             System.currentTimeMillis()
         } else {
             targetDate.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
@@ -250,28 +315,50 @@ class UsageStatsRepository(private val context: Context) {
                 sessions = emptyList(),
                 weeklyOverview = emptyList(),
                 isRealDataAvailable = true,
+                dataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE,
+                dataSourceDescription = "UsageEvents Reconstructed",
                 diagnostics = null
             )
         }
 
-        val queryStart = maxOf(0L, startOfDay - 24L * 60L * 60L * 1000L)
+        // Include lookback (12 hours before midnight) to determine active session state at midnight
+        val queryStart = maxOf(0L, startOfDay - 12L * 60L * 60L * 1000L)
         val rawEvents = fetchRawUsageEvents(queryStart, endExclusive)
 
-        // Reconstruct sessions with deterministic time injection
-        val sessionIntervals = UsageSessionAggregator.reconstructSessions(
+        // If this is a past date and events are completely empty (purged by Android > 7d), report HISTORY_EXPIRED
+        if (isTargetPast && rawEvents.isEmpty()) {
+            val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, 0L)
+            return@withContext DailyUsageSummary(
+                selectedDate = targetDate,
+                totalTimeMillis = 0L,
+                deviceScreenTimeMillis = 0L,
+                topApps = emptyList(),
+                sessions = emptyList(),
+                weeklyOverview = weeklyOverview,
+                isRealDataAvailable = false,
+                dataQuality = UsageDataQuality.HISTORY_EXPIRED,
+                dataSourceDescription = "History Expired (Events purged by Android OS)",
+                completeThroughTimestampMillis = endExclusive,
+                diagnostics = buildErrorDiagnostics(targetDate, "System UsageEvents for $targetDate have been purged by OS")
+            )
+        }
+
+        // Reconstruct both application sessions and independent device-interactive time
+        val now = System.currentTimeMillis()
+        val reconstruction = UsageSessionAggregator.reconstructFull(
             events = rawEvents,
             startEpochMillis = startOfDay,
             endEpochMillis = endExclusive,
-            isToday = (targetDate == today),
+            isToday = isTargetToday,
             isUserLaunchableApp = ::isUserLaunchableApp,
-            currentEpochMillis = System.currentTimeMillis()
+            currentEpochMillis = now
         )
 
-        // True interactive screen-on time (union of all app intervals)
-        val screenOnTime = UsageSessionAggregator.computeDeviceScreenOnTimeMillis(sessionIntervals)
+        val deviceInteractiveTime = reconstruction.deviceInteractiveTimeMillis
+        val totalTrackedAppTime = reconstruction.totalTrackedAppUsageMillis
 
-        // Map to presentation sessions with resolved application labels
-        val sessions = sessionIntervals.map { interval ->
+        // Map reconstructed sessions with resolved application labels
+        val sessions = reconstruction.appSessions.map { interval ->
             AppUsageSession(
                 packageName = interval.packageName,
                 appName = resolveAppLabel(interval.packageName),
@@ -281,7 +368,7 @@ class UsageStatsRepository(private val context: Context) {
             )
         }
 
-        // Calculate per-application daily totals strictly from reconstructed sessions
+        // Group per application
         val sessionsByPackage = sessions.groupBy { it.packageName }
         val allApps = sessionsByPackage.map { (pkg, appSessions) ->
             val totalAppTime = appSessions.sumOf { it.durationMillis }
@@ -296,25 +383,120 @@ class UsageStatsRepository(private val context: Context) {
             )
         }.sortedByDescending { it.usageTimeMillis }
 
-        // Sum of all tracked apps foreground usage
-        val totalAppTime = allApps.sumOf { it.usageTimeMillis }
         val topApps = allApps.take(25)
 
-        // Build weekly overview
+        // Determine data quality
+        val lastEventTimestamp = rawEvents.maxOfOrNull { it.timestampMillis } ?: 0L
+        val dataQuality = when {
+            reconstruction.hasIncompleteStartBoundary -> UsageDataQuality.RECONSTRUCTED_PARTIAL
+            isTargetToday && (now - lastEventTimestamp > 180_000L) -> UsageDataQuality.PROVISIONAL
+            isTargetToday -> UsageDataQuality.PROVISIONAL
+            else -> UsageDataQuality.RECONSTRUCTED_COMPLETE
+        }
+
+        // Persist to durable ledger (past days finalized, today provisional)
+        val persistedDevice = PersistedDeviceRecord(
+            dateIso = targetDate.toString(),
+            deviceInteractiveMillis = deviceInteractiveTime,
+            totalTrackedAppMillis = totalTrackedAppTime,
+            dataSource = "UsageEvents",
+            qualityStatus = dataQuality,
+            queryTimestamp = now,
+            lastSyncEventTimestamp = lastEventTimestamp,
+            deviceTimezone = zone.id,
+            isFinalized = isTargetPast
+        )
+        val persistedAppRecords = allApps.map { app ->
+            PersistedAppRecord(
+                dateIso = targetDate.toString(),
+                packageName = app.packageName,
+                appLabel = app.appName,
+                foregroundDurationMillis = app.usageTimeMillis,
+                launchCount = app.launchCount,
+                lastTimeUsedMillis = app.lastTimeUsedMillis,
+                dataSource = "UsageEvents",
+                qualityStatus = dataQuality,
+                queryTimestamp = now,
+                lastSyncEventTimestamp = lastEventTimestamp,
+                deviceTimezone = zone.id
+            )
+        }
+        ledgerDb.persistDailyUsage(persistedDevice, persistedAppRecords)
+
+        // Update in-memory snapshot for restriction engine if target is today
+        if (isTargetToday) {
+            val usageMap = allApps.associate { it.packageName to it.usageTimeMillis }
+            cachedUsageSnapshot = UsageSnapshot(
+                date = today,
+                capturedAtMillis = now,
+                foregroundUsageByPackage = usageMap,
+                quality = dataQuality
+            )
+            if (usageMap.isNotEmpty()) {
+                lastValidUsageSnapshot = usageMap
+            }
+        }
+
+        // Weekly overview
+        val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, deviceInteractiveTime)
+
+        // Comprehensive diagnostic report
+        val diagnostics = collectDiagnostics(
+            targetDate = targetDate,
+            startOfDay = startOfDay,
+            endExclusive = endExclusive,
+            rawEvents = rawEvents,
+            sessions = reconstruction.appSessions,
+            deviceInteractiveTime = deviceInteractiveTime,
+            totalAppTime = totalTrackedAppTime,
+            perAppUsage = allApps.associate { it.packageName to it.usageTimeMillis },
+            perAppLaunches = allApps.associate { it.packageName to it.launchCount },
+            dataQuality = dataQuality
+        )
+        latestDiagnostics = diagnostics
+        Log.i(DIAG_TAG, diagnostics.toFormattedReport())
+
+        DailyUsageSummary(
+            selectedDate = targetDate,
+            totalTimeMillis = totalTrackedAppTime,
+            deviceScreenTimeMillis = deviceInteractiveTime,
+            topApps = topApps,
+            sessions = sessions,
+            weeklyOverview = weeklyOverview,
+            isRealDataAvailable = true,
+            dataQuality = dataQuality,
+            dataSourceDescription = "UsageEvents Reconstructed (${if (isTargetToday) "Live Intraday" else "Finalized"})",
+            completeThroughTimestampMillis = if (isTargetToday) now else endExclusive,
+            diagnostics = diagnostics
+        )
+    }
+
+    private fun buildWeeklyOverview(
+        targetDate: LocalDate,
+        today: LocalDate,
+        zone: ZoneId,
+        selectedDayInteractiveTime: Long
+    ): List<DayUsageOverview> {
         val monday = targetDate.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
-        val weeklyOverview = (0..6).map { offset ->
+        return (0..6).map { offset ->
             val day = monday.plusDays(offset.toLong())
             val dayTotal = when {
                 day.isAfter(today) -> 0L
-                day == targetDate -> screenOnTime
+                day == targetDate -> selectedDayInteractiveTime
                 else -> {
-                    val dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
-                    val dayEnd = if (day == today) {
-                        System.currentTimeMillis()
+                    // Check database ledger first
+                    val persisted = ledgerDb.getDeviceRecord(day)
+                    if (persisted != null) {
+                        persisted.deviceInteractiveMillis
                     } else {
-                        day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                        val dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
+                        val dayEnd = if (day == today) {
+                            System.currentTimeMillis()
+                        } else {
+                            day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                        }
+                        computeDeviceInteractiveForWindow(dayStart, dayEnd, day == today)
                     }
-                    computeScreenOnTimeForWindow(dayStart, dayEnd, day == today)
                 }
             }
 
@@ -326,33 +508,6 @@ class UsageStatsRepository(private val context: Context) {
                 isSelected = (day == targetDate)
             )
         }
-
-        // Collect comprehensive diagnostics
-        val diagnostics = collectDiagnostics(
-            targetDate = targetDate,
-            startOfDay = startOfDay,
-            endExclusive = endExclusive,
-            rawEvents = rawEvents,
-            sessions = sessionIntervals,
-            screenOnTime = screenOnTime,
-            totalAppTime = totalAppTime,
-            perAppUsage = allApps.associate { it.packageName to it.usageTimeMillis },
-            perAppLaunches = allApps.associate { it.packageName to it.launchCount }
-        )
-        latestDiagnostics = diagnostics
-
-        Log.i(DIAG_TAG, diagnostics.toFormattedReport())
-
-        DailyUsageSummary(
-            selectedDate = targetDate,
-            totalTimeMillis = totalAppTime,
-            deviceScreenTimeMillis = screenOnTime,
-            topApps = topApps,
-            sessions = sessions,
-            weeklyOverview = weeklyOverview,
-            isRealDataAvailable = true,
-            diagnostics = diagnostics
-        )
     }
 
     private fun extractRawIntervals(
@@ -360,7 +515,7 @@ class UsageStatsRepository(private val context: Context) {
         endEpochMillis: Long,
         isToday: Boolean
     ): List<SessionInterval> {
-        val queryStart = maxOf(0L, startEpochMillis - 24L * 60L * 60L * 1000L)
+        val queryStart = maxOf(0L, startEpochMillis - 12L * 60L * 60L * 1000L)
         val events = fetchRawUsageEvents(queryStart, endEpochMillis)
         return UsageSessionAggregator.reconstructSessions(
             events = events,
@@ -415,9 +570,18 @@ class UsageStatsRepository(private val context: Context) {
         return rawList
     }
 
-    private fun computeScreenOnTimeForWindow(start: Long, end: Long, isToday: Boolean): Long {
-        val intervals = extractRawIntervals(start, end, isToday)
-        return UsageSessionAggregator.computeDeviceScreenOnTimeMillis(intervals)
+    private fun computeDeviceInteractiveForWindow(start: Long, end: Long, isToday: Boolean): Long {
+        val queryStart = maxOf(0L, start - 12L * 60L * 60L * 1000L)
+        val events = fetchRawUsageEvents(queryStart, end)
+        val result = UsageSessionAggregator.reconstructFull(
+            events = events,
+            startEpochMillis = start,
+            endEpochMillis = end,
+            isToday = isToday,
+            isUserLaunchableApp = ::isUserLaunchableApp,
+            currentEpochMillis = System.currentTimeMillis()
+        )
+        return result.deviceInteractiveTimeMillis
     }
 
     private fun collectDiagnostics(
@@ -426,16 +590,17 @@ class UsageStatsRepository(private val context: Context) {
         endExclusive: Long,
         rawEvents: List<RawUsageEvent>,
         sessions: List<SessionInterval>,
-        screenOnTime: Long,
+        deviceInteractiveTime: Long,
         totalAppTime: Long,
         perAppUsage: Map<String, Long>,
-        perAppLaunches: Map<String, Int>
+        perAppLaunches: Map<String, Int>,
+        dataQuality: UsageDataQuality
     ): UsageDiagnostics {
         val zone = ZoneId.systemDefault()
         val dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS").withZone(zone)
         val now = System.currentTimeMillis()
 
-        // 1. Query queryAndAggregateUsageStats (wrap into HashMap because Android ArrayMap throws UnsupportedOperationException on toArray)
+        // 1. Query queryAndAggregateUsageStats (wrapped in HashMap to protect against ArrayMap toArray crash)
         val aggMap: Map<String, UsageStats> = try {
             val raw = usageStatsManager?.queryAndAggregateUsageStats(startOfDay, endExclusive)
             if (raw != null) HashMap(raw) else emptyMap()
@@ -475,7 +640,7 @@ class UsageStatsRepository(private val context: Context) {
             )
         }
 
-        // 3. Filter decisions for all observed packages
+        // 3. Filter decisions
         val allSeenPackages = mutableSetOf<String>()
         allSeenPackages.addAll(aggMap.keys)
         allSeenPackages.addAll(dailyStats.map { it.packageName })
@@ -536,10 +701,11 @@ class UsageStatsRepository(private val context: Context) {
             calculationDiagnostics = CalculationDiagnostics(
                 totalReconstructedSessions = sessions.size,
                 totalAppUsageMillis = totalAppTime,
-                deviceScreenOnTimeMillis = screenOnTime,
+                deviceScreenOnTimeMillis = deviceInteractiveTime,
                 perAppUsage = perAppUsage,
                 perAppLaunchCounts = perAppLaunches,
-                snapshotTimestampMillis = now
+                snapshotTimestampMillis = now,
+                dataQuality = dataQuality
             )
         )
     }
@@ -567,7 +733,7 @@ class UsageStatsRepository(private val context: Context) {
             ),
             rawOsResults = RawOsResults(0L, 0, emptyList(), 0, 0L, emptyList(), 0, null, null),
             filterDiagnostics = FilterDiagnostics(0, 0, 0, emptyMap()),
-            calculationDiagnostics = CalculationDiagnostics(0, 0L, 0L, emptyMap(), emptyMap(), now)
+            calculationDiagnostics = CalculationDiagnostics(0, 0L, 0L, emptyMap(), emptyMap(), now, UsageDataQuality.QUERY_FAILED)
         )
     }
 

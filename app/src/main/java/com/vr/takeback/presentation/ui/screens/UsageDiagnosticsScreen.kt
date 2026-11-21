@@ -160,7 +160,7 @@ fun UsageDiagnosticsScreen(
                                     color = if (diagnostics.queryInfo.isSuccess) Color(0xFF064E3B) else MaterialTheme.colorScheme.errorContainer
                                 ) {
                                     Text(
-                                        text = if (diagnostics.queryInfo.isSuccess) "VERIFIED" else "ERROR",
+                                        text = diagnostics.calculationDiagnostics.dataQuality.displayLabel.uppercase(),
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
@@ -172,7 +172,7 @@ fun UsageDiagnosticsScreen(
                             Spacer(modifier = Modifier.height(14.dp))
 
                             DiagnosticRow(
-                                label = "TakeBack Screen-On Time (Union)",
+                                label = "TakeBack Device Interactive Time",
                                 value = formatMinutesSeconds(diagnostics.calculationDiagnostics.deviceScreenOnTimeMillis),
                                 isHighlight = true,
                                 color = MaterialTheme.colorScheme.primary

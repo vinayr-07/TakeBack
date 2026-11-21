@@ -31,6 +31,7 @@ data class UsageDiagnostics(
         sb.appendLine("Execution Time:      ${queryInfo.queryExecutedFormatted}")
         sb.appendLine("API Level:           ${queryInfo.apiLevel}")
         sb.appendLine("Permission Granted:  ${queryInfo.hasUsagePermission}")
+        sb.appendLine("Data Quality:        ${calculationDiagnostics.dataQuality.displayLabel} - ${calculationDiagnostics.dataQuality.technicalDescription}")
         sb.appendLine("Query Status:        ${if (queryInfo.isSuccess) "SUCCESS" else "FAILED: ${queryInfo.errorMessage}"}")
         sb.appendLine("--------------------------------------------------")
         sb.appendLine("1. RAW ANDROID OS LAYER COMPARISON:")
@@ -49,8 +50,8 @@ data class UsageDiagnostics(
         sb.appendLine("--------------------------------------------------")
         sb.appendLine("3. TAKEBACK RECONSTRUCTION LAYER:")
         sb.appendLine("   - Reconstructed Sessions:      ${calculationDiagnostics.totalReconstructedSessions}")
-        sb.appendLine("   - Reconstructed Total App Time:${formatMillis(calculationDiagnostics.totalAppUsageMillis)}")
-        sb.appendLine("   - Device Screen-On Time:       ${formatMillis(calculationDiagnostics.deviceScreenOnTimeMillis)}")
+        sb.appendLine("   - Total Tracked App Usage:     ${formatMillis(calculationDiagnostics.totalAppUsageMillis)}")
+        sb.appendLine("   - Device Interactive Time:     ${formatMillis(calculationDiagnostics.deviceScreenOnTimeMillis)}")
         sb.appendLine("   - Top Apps Count:              ${calculationDiagnostics.perAppUsage.size}")
         sb.appendLine("--------------------------------------------------")
         sb.appendLine("4. ROOT-CAUSE SUMMARY:")
@@ -125,5 +126,6 @@ data class CalculationDiagnostics(
     val deviceScreenOnTimeMillis: Long,
     val perAppUsage: Map<String, Long>,
     val perAppLaunchCounts: Map<String, Int>,
-    val snapshotTimestampMillis: Long
+    val snapshotTimestampMillis: Long,
+    val dataQuality: UsageDataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE
 )

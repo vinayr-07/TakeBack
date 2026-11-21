@@ -385,7 +385,7 @@ fun HomeScreen(
                             if (usageSummary?.isRealDataAvailable == true) {
                                 Badge(containerColor = MaterialTheme.colorScheme.secondaryContainer) {
                                     Text(
-                                        text = "Verified Usage Data",
+                                        text = usageSummary?.dataQuality?.displayLabel ?: "Usage Data",
                                         color = MaterialTheme.colorScheme.onSecondaryContainer,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                                         fontSize = 11.sp

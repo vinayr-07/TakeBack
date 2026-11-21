@@ -1,6 +1,7 @@
 package com.vr.takeback.domain.usage
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -43,18 +44,14 @@ class UsageSessionAggregatorTest {
     }
 
     @Test
-    fun singleApp_openedMultipleTimes_producesSeparateSessions() {
+    fun singleApp_continuousFiveHours_doesNotTruncateSession() {
         val startOfDay = 100000L
-        val endOfDay = 5000000L
+        val endOfDay = 30000000L
+        val fiveHoursMillis = 5L * 60 * 60 * 1000L // 5 hours continuous
 
         val events = listOf(
-            // Session 1: 5 minutes
             RawUsageEvent("com.instagram.android", "MainActivity", 200000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.instagram.android", "MainActivity", 500000L, NormalizedEventType.ACTIVITY_PAUSED),
-
-            // Session 2: 10 minutes (after a 10 min break)
-            RawUsageEvent("com.instagram.android", "MainActivity", 1100000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.instagram.android", "MainActivity", 1700000L, NormalizedEventType.ACTIVITY_PAUSED)
+            RawUsageEvent("com.instagram.android", "MainActivity", 200000L + fiveHoursMillis, NormalizedEventType.ACTIVITY_PAUSED)
         )
 
         val sessions = UsageSessionAggregator.reconstructSessions(
@@ -65,21 +62,22 @@ class UsageSessionAggregatorTest {
             isUserLaunchableApp = isLaunchable
         )
 
-        assertEquals("Should produce 2 discrete sessions", 2, sessions.size)
-        assertEquals(300000L, sessions[0].durationMillis)
-        assertEquals(600000L, sessions[1].durationMillis)
+        assertEquals(1, sessions.size)
+        val session = sessions.first()
+        assertEquals("Five-hour session must NOT be capped at 4 hours", fiveHoursMillis, session.durationMillis)
     }
 
     @Test
-    fun sequentialApps_packageHandoff_boundsPreviousAppAtNewAppResumeTime() {
+    fun multiResume_overlappingForegroundApps_tracksBothAppsIndependentlyWithoutTruncation() {
         val startOfDay = 100000L
         val endOfDay = 5000000L
 
-        // Instagram opens at 200000.
-        // User opens Chrome at 300000 without waiting for Instagram's pause event.
+        // Split-screen: Instagram resumes at 200000 and pauses at 400000.
+        // Chrome resumes at 300000 and pauses at 450000.
         val events = listOf(
             RawUsageEvent("com.instagram.android", "MainActivity", 200000L, NormalizedEventType.ACTIVITY_RESUMED),
             RawUsageEvent("com.android.chrome", "Main", 300000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.instagram.android", "MainActivity", 400000L, NormalizedEventType.ACTIVITY_PAUSED),
             RawUsageEvent("com.android.chrome", "Main", 450000L, NormalizedEventType.ACTIVITY_PAUSED)
         )
 
@@ -91,13 +89,13 @@ class UsageSessionAggregatorTest {
             isUserLaunchableApp = isLaunchable
         )
 
-        assertEquals("Both apps should be recorded with clean boundary handoff", 2, sessions.size)
+        assertEquals("Both simultaneously resumed apps must be recorded independently", 2, sessions.size)
         val insta = sessions.find { it.packageName == "com.instagram.android" }!!
         val chrome = sessions.find { it.packageName == "com.android.chrome" }!!
 
         assertEquals(200000L, insta.startEpochMillis)
-        assertEquals(300000L, insta.endEpochMillis)
-        assertEquals(100000L, insta.durationMillis)
+        assertEquals(400000L, insta.endEpochMillis)
+        assertEquals(200000L, insta.durationMillis)
 
         assertEquals(300000L, chrome.startEpochMillis)
         assertEquals(450000L, chrome.endEpochMillis)
@@ -109,9 +107,6 @@ class UsageSessionAggregatorTest {
         val startOfDay = 100000L
         val endOfDay = 5000000L
 
-        // App resumes at 200000.
-        // Secondary resume event fires at 250000 (e.g. fragment switch, window focus re-gain).
-        // App pauses at 300000.
         val events = listOf(
             RawUsageEvent("com.instagram.android", "MainActivity", 200000L, NormalizedEventType.ACTIVITY_RESUMED),
             RawUsageEvent("com.instagram.android", "MainActivity", 250000L, NormalizedEventType.ACTIVITY_RESUMED),
@@ -160,7 +155,7 @@ class UsageSessionAggregatorTest {
         assertEquals("com.google.android.youtube", session.packageName)
         assertEquals(110000L, session.startEpochMillis)
         assertEquals(170000L, session.endEpochMillis)
-        assertEquals("Duration must be exact span without duplicate addition (60s)", 60000L, session.durationMillis)
+        assertEquals(60000L, session.durationMillis)
     }
 
     @Test
@@ -188,6 +183,39 @@ class UsageSessionAggregatorTest {
         assertEquals(120000L, session.startEpochMillis)
         assertEquals(150000L, session.endEpochMillis)
         assertEquals(30000L, session.durationMillis)
+    }
+
+    @Test
+    fun deviceInteractiveIntervals_tracksDisplayActivityIndependentlyOfPackages() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        // Screen unlocks at 120000, user is on home launcher (non-launchable app),
+        // then turns screen off at 180000.
+        // User unlocks again at 220000 and locks at 250000.
+        val events = listOf(
+            RawUsageEvent("android", null, 120000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("android", null, 120500L, NormalizedEventType.KEYGUARD_HIDDEN),
+            RawUsageEvent("com.sec.android.app.launcher", "Launcher", 121000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("android", null, 180000L, NormalizedEventType.SCREEN_NON_INTERACTIVE),
+            RawUsageEvent("android", null, 180500L, NormalizedEventType.KEYGUARD_SHOWN),
+            RawUsageEvent("android", null, 220000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("android", null, 250000L, NormalizedEventType.SCREEN_NON_INTERACTIVE)
+        )
+
+        val intervals = UsageSessionAggregator.reconstructDeviceInteractiveIntervals(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false
+        )
+
+        assertEquals("Should produce 2 interactive intervals", 2, intervals.size)
+        assertEquals(60000L, intervals[0].durationMillis) // 120k to 180k
+        assertEquals(30000L, intervals[1].durationMillis) // 220k to 250k
+
+        val totalInteractive = UsageSessionAggregator.computeTotalInteractiveDuration(intervals)
+        assertEquals("Total device interactive time must be 90s regardless of launcher exclusion", 90000L, totalInteractive)
     }
 
     @Test
@@ -256,7 +284,7 @@ class UsageSessionAggregatorTest {
             events = events,
             startEpochMillis = startOfDay,
             endEpochMillis = endOfDay,
-            isToday = false, // Historical date
+            isToday = false,
             isUserLaunchableApp = isLaunchable,
             currentEpochMillis = 900000L
         )
@@ -269,37 +297,22 @@ class UsageSessionAggregatorTest {
     }
 
     @Test
-    fun computeDeviceScreenOnTimeMillis_mergesOverlappingIntervalsAcrossPackages() {
-        val sessions = listOf(
-            // App A: 10:00 to 10:20 (20 min)
-            SessionInterval("com.instagram.android", 100000L, 120000L),
-            // App B: 10:10 to 10:30 (20 min in split screen)
-            SessionInterval("com.android.chrome", 110000L, 130000L),
-            // App C: 11:00 to 11:15 (15 min)
-            SessionInterval("com.reddit.frontpage", 200000L, 215000L)
-        )
-
-        val totalAppTime = sessions.sumOf { it.durationMillis }
-        val screenOnTime = UsageSessionAggregator.computeDeviceScreenOnTimeMillis(sessions)
-
-        // Sum of per-app durations: 20k + 20k + 15k = 55k
-        assertEquals(55000L, totalAppTime)
-
-        // True screen-on time: [100000..130000] (30k) + [200000..215000] (15k) = 45k
-        assertEquals(45000L, screenOnTime)
-    }
-
-    @Test
-    fun nonLaunchableApps_areExcludedFromSessions() {
+    fun reconstructFull_detectsBoundaryQualityAndSeparateMetrics() {
         val startOfDay = 100000L
         val endOfDay = 500000L
 
+        // App A and App B run in split-screen (overlap from 120000 to 140000)
+        // Screen is active from 110000 to 150000 (includes 10s of home screen before and after)
         val events = listOf(
-            RawUsageEvent("com.sec.android.app.launcher", "Launcher", 110000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.sec.android.app.launcher", "Launcher", 140000L, NormalizedEventType.ACTIVITY_PAUSED)
+            RawUsageEvent("android", null, 110000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("com.instagram.android", "MainActivity", 115000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.android.chrome", "Main", 120000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.instagram.android", "MainActivity", 140000L, NormalizedEventType.ACTIVITY_PAUSED),
+            RawUsageEvent("com.android.chrome", "Main", 145000L, NormalizedEventType.ACTIVITY_PAUSED),
+            RawUsageEvent("android", null, 150000L, NormalizedEventType.SCREEN_NON_INTERACTIVE)
         )
 
-        val sessions = UsageSessionAggregator.reconstructSessions(
+        val result = UsageSessionAggregator.reconstructFull(
             events = events,
             startEpochMillis = startOfDay,
             endEpochMillis = endOfDay,
@@ -307,6 +320,8 @@ class UsageSessionAggregatorTest {
             isUserLaunchableApp = isLaunchable
         )
 
-        assertTrue("Non-launchable apps must not produce sessions", sessions.isEmpty())
+        assertEquals("Instagram: 25s, Chrome: 25s => Total app usage = 50s", 50000L, result.totalTrackedAppUsageMillis)
+        assertEquals("Device screen active from 110k to 150k => 40s", 40000L, result.deviceInteractiveTimeMillis)
+        assertFalse(result.hasIncompleteStartBoundary)
     }
 }

@@ -35,6 +35,7 @@ import com.vr.takeback.data.repository.TimelineRepository
 import com.vr.takeback.data.repository.UsageStatsRepository
 import com.vr.takeback.domain.model.AppUsageInfo
 import com.vr.takeback.domain.model.EventType
+import com.vr.takeback.domain.usage.UsageDataQuality
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
@@ -344,19 +345,28 @@ fun InsightsScreen(
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.primary
                             )
-                            if (usageSummary?.isRealDataAvailable == true) {
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = Color(0xFF064E3B)
-                                ) {
-                                    Text(
-                                        text = if (selectedDate == LocalDate.now()) "LIVE TODAY" else "VERIFIED DATA",
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color(0xFFA7F3D0)
-                                    )
-                                }
+                            val quality = usageSummary?.dataQuality ?: UsageDataQuality.UNKNOWN
+                            val (badgeBg, badgeText) = when (quality) {
+                                UsageDataQuality.EXACT_SYSTEM_RESULT,
+                                UsageDataQuality.RECONSTRUCTED_COMPLETE -> Color(0xFF064E3B) to Color(0xFFA7F3D0)
+                                UsageDataQuality.PROVISIONAL -> Color(0xFF1E3A8A) to Color(0xFFBFDBFE)
+                                UsageDataQuality.RECONSTRUCTED_PARTIAL -> Color(0xFF78350F) to Color(0xFFFDE68A)
+                                UsageDataQuality.HISTORY_EXPIRED -> Color(0xFF374151) to Color(0xFFD1D5DB)
+                                UsageDataQuality.PERMISSION_DENIED,
+                                UsageDataQuality.QUERY_FAILED -> Color(0xFF7F1D1D) to Color(0xFFFECACA)
+                                UsageDataQuality.UNKNOWN -> Color.DarkGray to Color.LightGray
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = badgeBg
+                            ) {
+                                Text(
+                                    text = quality.displayLabel.uppercase(),
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = badgeText
+                                )
                             }
                         }
 
@@ -371,7 +381,7 @@ fun InsightsScreen(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "device screen-on time (from 00:00)",
+                                text = "Device Interactive Time",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(bottom = 6.dp)
@@ -379,17 +389,15 @@ fun InsightsScreen(
                         }
 
                         val appSumMinutes = (usageSummary?.totalTimeMillis ?: 0L) / (1000 * 60)
-                        if (appSumMinutes > totalMinutes) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            val appHours = appSumMinutes / 60
-                            val appMins = appSumMinutes % 60
-                            val appSumFormatted = if (appHours > 0) "${appHours}h ${appMins}m" else "${appMins}m"
-                            Text(
-                                text = "Sum of tracked app usage: $appSumFormatted (includes split-screen/multi-window overlap)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
+                        val appHours = appSumMinutes / 60
+                        val appMins = appSumMinutes % 60
+                        val appSumFormatted = if (appHours > 0) "${appHours}h ${appMins}m" else "${appMins}m"
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Total Tracked App Usage: $appSumFormatted • Source: ${usageSummary?.dataSourceDescription ?: "Reconstructed"}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
@@ -472,7 +480,7 @@ fun InsightsScreen(
                                             style = MaterialTheme.typography.bodyMedium
                                         )
                                         Text(
-                                            text = if (app.launchCount > 0) "${app.launchCount} launch${if (app.launchCount != 1) "es" else ""} • Tap for launch log" else "0 launches • Tap for details",
+                                            text = if (app.launchCount > 0) "${app.launchCount} session${if (app.launchCount != 1) "s" else ""} • Tap for session history" else "No recorded sessions • Tap for details",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
@@ -957,7 +965,7 @@ fun InsightsScreen(
                                                 fontWeight = FontWeight.SemiBold
                                             )
                                             Text(
-                                                text = "Launch #${sessionIndex + 1}",
+                                                text = "Session #${sessionIndex + 1}",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )

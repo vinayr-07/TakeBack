@@ -57,6 +57,6 @@ class UsageDiagnosticsTest {
         assertTrue(report.contains("TAKEBACK USAGE STATISTICS DIAGNOSTICS"))
         assertTrue(report.contains("Target Date:         2026-11-21"))
         assertTrue(report.contains("OS Aggregate Over-reporting:"))
-        assertTrue(report.contains("Device Screen-On Time"))
+        assertTrue(report.contains("Device Interactive Time"))
     }
 }
