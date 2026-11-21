@@ -30,10 +30,11 @@ sealed class BlockReason {
     object ScheduleActive : BlockReason()
     data class DailyLimitExceeded(val limitMinutes: Int, val usedMinutes: Int) : BlockReason()
     data class HourlyQuotaExceeded(val limitMinutes: Int) : BlockReason()
+    data class SessionQuotaExceeded(val limitMinutes: Int, val usedMinutes: Int) : BlockReason()
     data class GoalNotMet(val requiredMinutes: Int, val completedMinutes: Int) : BlockReason()
     object GeofenceActive : BlockReason()
     object FocusSessionActive : BlockReason()
     object QuickBlockActive : BlockReason()
-    object AdultContentFilter : BlockReason()
+    data class DomainBlock(val domain: String) : BlockReason()
     data class KeywordMatch(val keyword: String) : BlockReason()
 }

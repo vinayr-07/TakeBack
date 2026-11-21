@@ -264,9 +264,9 @@ class SettingsProtectionManagerTest {
         assertFalse("Authenticated maintenance must permit settings access", decision.isRestricted)
     }
 
-    // 12. Accessibility service interruption / null node fallback
+    // 12. Accessibility service interruption / null node tree (no false positive block)
     @Test
-    fun test12_serviceInterruption_nullNodeFallback() {
+    fun test12_serviceInterruption_nullNodeFallback_doesNotBlock() {
         val decision = SettingsProtectionManager.evaluate(
             packageName = "com.android.settings",
             className = "com.android.settings.accessibility.ToggleAccessibilityServicePreferenceFragment",
@@ -274,8 +274,71 @@ class SettingsProtectionManagerTest {
             isStrictLocked = true,
             isMaintenanceUnlocked = false
         )
-        assertTrue("Known toggle class name must restrict even when rootNode is temporarily null", decision.isRestricted)
-        assertEquals(SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS, decision.destination)
+        assertFalse("Null or inaccessible node tree must never produce false positive blocks", decision.isRestricted)
+        assertEquals(SettingsDestination.UNKNOWN_OR_INACCESSIBLE, decision.destination)
+    }
+
+    // 12a. Unrelated Device Admin activation is allowed
+    @Test
+    fun test12a_unrelatedDeviceAdminActivation_isAllowed() {
+        val root = mockNode(
+            text = "Activate this device admin app",
+            children = listOf(
+                mockNode(text = "Find My Device"),
+                mockNode(text = "Activate")
+            )
+        )
+        val decision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.android.settings.DeviceAdminAdd",
+            rootNode = root,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertFalse("Unrelated device admin activation must be allowed", decision.isRestricted)
+        assertEquals(SettingsDestination.UNRELATED_DEVICE_ADMIN_ACTIVATION, decision.destination)
+    }
+
+    // 12b. Installed accessibility services list is allowed
+    @Test
+    fun test12b_installedAccessibilityServices_isAllowed() {
+        val root = mockNode(
+            text = "Installed services",
+            children = listOf(
+                mockNode(text = "TalkBack"),
+                mockNode(text = "TakeBack")
+            )
+        )
+        val decision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.android.settings.accessibility.InstalledServicesActivity",
+            rootNode = root,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertFalse("Installed services list must not be blocked", decision.isRestricted)
+        assertEquals(SettingsDestination.INSTALLED_ACCESSIBILITY_SERVICES, decision.destination)
+    }
+
+    // 12c. Security and privacy settings are allowed
+    @Test
+    fun test12c_securityAndPrivacySettings_isAllowed() {
+        val root = mockNode(
+            text = "Security & privacy",
+            children = listOf(
+                mockNode(text = "Lock screen"),
+                mockNode(text = "Biometrics")
+            )
+        )
+        val decision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.android.settings.security.SecuritySettings",
+            rootNode = root,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertFalse("General security & privacy settings must not be blocked", decision.isRestricted)
+        assertEquals(SettingsDestination.SECURITY_AND_PRIVACY_SETTINGS, decision.destination)
     }
 
     // 13. Device Admin initial activation screen is NEVER blocked

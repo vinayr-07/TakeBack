@@ -180,7 +180,7 @@ fun SettingsScreen(
                         }
 
                         // Protection Compromised Warning Banner if Device Admin was deactivated
-                        if (strictState.status == StrictProtectionStatus.COMPROMISED) {
+                        if (strictState.isCompromised) {
                             Spacer(modifier = Modifier.height(12.dp))
                             Card(
                                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),

@@ -96,6 +96,30 @@ class ScheduleCoordinatorTest {
     }
 
     @Test
+    fun testOvernightSchedule_rebootOnSaturdayMorning_findsSaturdayMorningEnd() {
+        // Sleep schedule: Friday 22:00 to Saturday 06:00
+        val fridayMask = 16 // Friday only (1 shl 4)
+        val schedule = Schedule(
+            id = 2,
+            profileId = "sleep_schedule",
+            daysOfWeekMask = fridayMask,
+            startTimeSeconds = 22 * 3600, // 22:00
+            endTimeSeconds = 6 * 3600,    // 06:00
+            isEnabled = true
+        )
+
+        // Given device reboot at Saturday 02:00 (midway through Friday night overnight schedule)
+        val saturdayEarlyMorning = LocalDateTime.of(2026, 11, 28, 2, 0)
+        assertEquals(DayOfWeek.SATURDAY, saturdayEarlyMorning.dayOfWeek)
+
+        // computeNextEndOccurrenceMillis MUST find Saturday 06:00 (today), not skip to next week!
+        val nextEnd = ScheduleCoordinator.computeNextEndOccurrenceMillis(schedule, saturdayEarlyMorning, zone)
+        assertNotNull(nextEnd)
+        val expectedEnd = LocalDateTime.of(2026, 11, 28, 6, 0).atZone(zone).toInstant().toEpochMilli()
+        assertEquals("Reboot at Saturday 02:00 must find upcoming Saturday 06:00 boundary", expectedEnd, nextEnd)
+    }
+
+    @Test
     fun testEqualStartAndEndTime_treatedAs24HourActive() {
         val schedule = Schedule(
             id = 3,

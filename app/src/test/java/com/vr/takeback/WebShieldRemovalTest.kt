@@ -74,4 +74,53 @@ class WebShieldRemovalTest {
         val wikiDecision = engine.evaluate(listOf(webProfile), wikiSnap)
         assertTrue("Unrestricted URL must be allowed", wikiDecision is BlockDecision.Allowed)
     }
+
+    @Test
+    fun testLookalikeAndPathAttackDomains_remainAllowedUnderExactDomain() {
+        val webProfile = Profile(
+            id = "exact_rule_profile",
+            name = "Exact Rule",
+            isEnabled = true,
+            targetWebsites = listOf(
+                TargetWebsite(
+                    domainPattern = "instagram.com",
+                    ruleType = WebsiteRuleType.EXACT_DOMAIN,
+                    isAllowlist = false
+                )
+            )
+        )
+
+        val baseSnapshot = SystemContextSnapshot(
+            timestampMillis = System.currentTimeMillis(),
+            localTime = LocalTime.of(15, 0),
+            dayOfWeek = DayOfWeek.MONDAY,
+            foregroundPackageName = "com.android.chrome"
+        )
+
+        // 1. Prefix lookalike: notinstagram.com must be ALLOWED
+        val prefixLookalike = baseSnapshot.copy(activeBrowserUrl = "https://notinstagram.com/feed")
+        val d1 = engine.evaluate(listOf(webProfile), prefixLookalike)
+        assertTrue("Prefix lookalike domain must be allowed", d1 is BlockDecision.Allowed)
+
+        // 2. Attacker subdomain: instagram.com.attacker.test must be ALLOWED
+        val attackerSubdomain = baseSnapshot.copy(activeBrowserUrl = "https://instagram.com.attacker.test")
+        val d2 = engine.evaluate(listOf(webProfile), attackerSubdomain)
+        assertTrue("Attacker domain using target as subdomain must be allowed", d2 is BlockDecision.Allowed)
+
+        // 3. Target in URL path: safe.test/instagram.com must be ALLOWED
+        val pathTarget = baseSnapshot.copy(activeBrowserUrl = "https://safe.test/path/to/instagram.com")
+        val d3 = engine.evaluate(listOf(webProfile), pathTarget)
+        assertTrue("Target in URL path must be allowed", d3 is BlockDecision.Allowed)
+
+        // 4. Target in query param: safe.test?q=instagram.com must be ALLOWED
+        val queryTarget = baseSnapshot.copy(activeBrowserUrl = "https://safe.test/search?q=instagram.com")
+        val d4 = engine.evaluate(listOf(webProfile), queryTarget)
+        assertTrue("Target in query parameter must be allowed", d4 is BlockDecision.Allowed)
+
+        // 5. Genuine exact domain: instagram.com/profile must be BLOCKED with DomainBlock
+        val genuineTarget = baseSnapshot.copy(activeBrowserUrl = "https://instagram.com/profile")
+        val d5 = engine.evaluate(listOf(webProfile), genuineTarget)
+        assertTrue("Genuine exact domain must be blocked", d5 is BlockDecision.Blocked)
+        assertEquals(BlockReason.DomainBlock("instagram.com"), (d5 as BlockDecision.Blocked).reason)
+    }
 }

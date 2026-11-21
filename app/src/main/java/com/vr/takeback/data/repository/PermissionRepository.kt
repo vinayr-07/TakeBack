@@ -62,6 +62,7 @@ class PermissionRepository(private val context: Context? = null) {
     private fun checkUsageStatsPermission(ctx: Context): Boolean {
         val appOps = ctx.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
         val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            @Suppress("DEPRECATION")
             appOps.unsafeCheckOpNoThrow(
                 AppOpsManager.OPSTR_GET_USAGE_STATS,
                 android.os.Process.myUid(),

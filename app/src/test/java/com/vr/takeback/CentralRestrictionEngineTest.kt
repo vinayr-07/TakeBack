@@ -261,11 +261,11 @@ class CentralRestrictionEngineTest {
             localTime = LocalTime.of(14, 0),
             dayOfWeek = DayOfWeek.MONDAY,
             foregroundPackageName = "com.android.chrome",
-            activeBrowserUrl = "https://m.facebook.com/feed"
+            activeBrowserUrl = "https://facebook.com/feed"
         )
         val decisionBlocked = engine.evaluate(listOf(profile), snapshotBlockedWeb)
         assertTrue("Facebook should be blocked during active profile schedule", decisionBlocked is BlockDecision.Blocked)
-        assertEquals("facebook.com", ((decisionBlocked as BlockDecision.Blocked).reason as BlockReason.KeywordMatch).keyword)
+        assertEquals("facebook.com", ((decisionBlocked as BlockDecision.Blocked).reason as BlockReason.DomainBlock).domain)
 
         // 2. Allowlisted URL -> Allowed
         val snapshotAllowedWeb = snapshotBlockedWeb.copy(activeBrowserUrl = "https://developer.android.com/reference")

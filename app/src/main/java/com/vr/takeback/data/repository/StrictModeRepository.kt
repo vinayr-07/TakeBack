@@ -14,8 +14,12 @@ import java.util.Base64
 
 enum class StrictProtectionStatus {
     DISABLED,
+    ACTIVATION_PENDING,
     ACTIVE,
-    COMPROMISED // Armed by user, but Android Device Administrator was deactivated
+    INTERRUPTED, // Armed by user, but Android Device Administrator was deactivated
+    COMPROMISED, // Device Administrator deactivated while Strict Mode was armed
+    RECOVERY_REQUIRED, // Explicit user recovery required to restore protection
+    STORAGE_ERROR // Fail-closed when persistence or storage fails
 }
 
 data class StrictProtectionState(
@@ -28,14 +32,22 @@ data class StrictProtectionState(
     val temporaryUnlockUntilEpochMillis: Long = 0L,
     val temporarySettingsUnlockUntilEpochMillis: Long = 0L
 ) {
+    // Section 2.2: Fail-closed. Active, Interrupted, Compromised, Recovery, or Storage Error all lock mutations.
     val isCurrentlyLocked: Boolean
-        get() = isGlobalStrictActive && status != StrictProtectionStatus.DISABLED
+        get() = isGlobalStrictActive ||
+                status == StrictProtectionStatus.ACTIVE ||
+                status == StrictProtectionStatus.INTERRUPTED ||
+                status == StrictProtectionStatus.COMPROMISED ||
+                status == StrictProtectionStatus.RECOVERY_REQUIRED ||
+                status == StrictProtectionStatus.STORAGE_ERROR
 
     val isSettingsLocked: Boolean
         get() = isCurrentlyLocked && System.currentTimeMillis() > temporarySettingsUnlockUntilEpochMillis
 
     val isCompromised: Boolean
-        get() = status == StrictProtectionStatus.COMPROMISED
+        get() = status == StrictProtectionStatus.INTERRUPTED ||
+                status == StrictProtectionStatus.COMPROMISED ||
+                status == StrictProtectionStatus.RECOVERY_REQUIRED
 }
 
 class StrictModeRepository(private val context: Context? = null) {
@@ -47,43 +59,63 @@ class StrictModeRepository(private val context: Context? = null) {
 
     private fun loadPersistedState(): StrictProtectionState {
         val adminActive = context?.let { TakeBackDeviceAdminReceiver.isAdminActive(it) } ?: false
-        if (prefs == null) return StrictProtectionState(isDeviceAdminActive = adminActive)
-
-        val isActive = prefs.getBoolean("is_strict_active", false)
-        val mechanismName = prefs.getString("strict_mechanism", StrictMechanism.TEXT_CHALLENGE.name) ?: StrictMechanism.TEXT_CHALLENGE.name
-        val mechanism = try { StrictMechanism.valueOf(mechanismName) } catch (e: Exception) { StrictMechanism.TEXT_CHALLENGE }
-        val salt = prefs.getString("strict_salt", null)
-        val hash = prefs.getString("strict_hash", null)
-        val unlockUntil = prefs.getLong("unlock_until_epoch", 0L)
-        val settingsUnlockUntil = prefs.getLong("unlock_settings_until_epoch", 0L)
-
-        val status = when {
-            !isActive -> StrictProtectionStatus.DISABLED
-            adminActive -> StrictProtectionStatus.ACTIVE
-            else -> StrictProtectionStatus.COMPROMISED
+        if (prefs == null) {
+            return StrictProtectionState(
+                isDeviceAdminActive = adminActive,
+                status = StrictProtectionStatus.DISABLED
+            )
         }
 
-        return StrictProtectionState(
-            isGlobalStrictActive = isActive,
-            isDeviceAdminActive = adminActive,
-            status = status,
-            mechanism = mechanism,
-            saltBase64 = salt,
-            passwordHash = hash,
-            temporaryUnlockUntilEpochMillis = unlockUntil,
-            temporarySettingsUnlockUntilEpochMillis = settingsUnlockUntil
-        )
+        return try {
+            val isActive = prefs.getBoolean("is_strict_active", false)
+            val mechanismName = prefs.getString("strict_mechanism", StrictMechanism.TEXT_CHALLENGE.name) ?: StrictMechanism.TEXT_CHALLENGE.name
+            val mechanism = try { StrictMechanism.valueOf(mechanismName) } catch (e: Exception) { StrictMechanism.TEXT_CHALLENGE }
+            val salt = prefs.getString("strict_salt", null)
+            val hash = prefs.getString("strict_hash", null)
+            val unlockUntil = prefs.getLong("unlock_until_epoch", 0L)
+            val settingsUnlockUntil = prefs.getLong("unlock_settings_until_epoch", 0L)
+
+            val status = when {
+                !isActive -> StrictProtectionStatus.DISABLED
+                adminActive -> StrictProtectionStatus.ACTIVE
+                else -> StrictProtectionStatus.INTERRUPTED // Armed by user, but admin is deactivated
+            }
+
+            StrictProtectionState(
+                isGlobalStrictActive = isActive,
+                isDeviceAdminActive = adminActive,
+                status = status,
+                mechanism = mechanism,
+                saltBase64 = salt,
+                passwordHash = hash,
+                temporaryUnlockUntilEpochMillis = unlockUntil,
+                temporarySettingsUnlockUntilEpochMillis = settingsUnlockUntil
+            )
+        } catch (e: Exception) {
+            // Section 2.2 & 3.3 Fail-closed: Persistence read failure must NOT allow sensitive mutations.
+            android.util.Log.e("StrictModeRepository", "Failed to read Strict Mode state; failing closed with STORAGE_ERROR", e)
+            StrictProtectionState(
+                isGlobalStrictActive = true,
+                isDeviceAdminActive = adminActive,
+                status = StrictProtectionStatus.STORAGE_ERROR
+            )
+        }
     }
 
     private fun persistState(state: StrictProtectionState) {
-        prefs?.edit()?.apply {
-            putBoolean("is_strict_active", state.isGlobalStrictActive)
-            putString("strict_mechanism", state.mechanism.name)
-            putString("strict_salt", state.saltBase64)
-            putString("strict_hash", state.passwordHash)
-            putLong("unlock_until_epoch", state.temporaryUnlockUntilEpochMillis)
-            putLong("unlock_settings_until_epoch", state.temporarySettingsUnlockUntilEpochMillis)
-            apply()
+        try {
+            prefs?.edit()?.apply {
+                putBoolean("is_strict_active", state.isGlobalStrictActive)
+                putString("strict_mechanism", state.mechanism.name)
+                putString("strict_salt", state.saltBase64)
+                putString("strict_hash", state.passwordHash)
+                putLong("unlock_until_epoch", state.temporaryUnlockUntilEpochMillis)
+                putLong("unlock_settings_until_epoch", state.temporarySettingsUnlockUntilEpochMillis)
+                apply()
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("StrictModeRepository", "Failed to persist Strict Mode state", e)
+            _protectionState.value = _protectionState.value.copy(status = StrictProtectionStatus.STORAGE_ERROR)
         }
     }
 
@@ -99,7 +131,7 @@ class StrictModeRepository(private val context: Context? = null) {
         val newStatus = when {
             !current.isGlobalStrictActive -> StrictProtectionStatus.DISABLED
             isAdminActive -> StrictProtectionStatus.ACTIVE
-            else -> StrictProtectionStatus.COMPROMISED // Armed but admin revoked!
+            else -> StrictProtectionStatus.INTERRUPTED // Armed but admin revoked!
         }
         val updated = current.copy(
             isDeviceAdminActive = isAdminActive,
@@ -112,6 +144,18 @@ class StrictModeRepository(private val context: Context? = null) {
     fun refreshAdminStatus() {
         val adminActive = isDeviceAdminActive()
         syncAdminState(adminActive)
+    }
+
+    fun markActivationPending() {
+        val current = _protectionState.value
+        _protectionState.value = current.copy(status = StrictProtectionStatus.ACTIVATION_PENDING)
+    }
+
+    fun cancelActivation() {
+        val current = _protectionState.value
+        if (current.status == StrictProtectionStatus.ACTIVATION_PENDING) {
+            _protectionState.value = current.copy(status = StrictProtectionStatus.DISABLED)
+        }
     }
 
     /**

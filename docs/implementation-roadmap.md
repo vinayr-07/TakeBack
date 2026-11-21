@@ -96,7 +96,7 @@ gantt
 - [x] **Milestone 6.2:** Activity Timeline:
   - Event logging and audit feed with automated 30-day retention pruning (`TimelineRepository`).
 - [x] **Milestone 6.3:** Website & Keyword Blocker:
-  - `DnsBlockMatcher` pure Kotlin domain matcher + accessibility URL node inspector across major browsers.
+  - `CentralRestrictionEngine` pure Kotlin domain matcher + accessibility URL node inspector across major browsers.
 - [x] **Milestone 6.4:** Shorts & Reels Filter:
   - Selective short-form container detection with automatic back navigation in `TakeBackAccessibilityService`.
 - [x] **Milestone 6.5:** Notification Blocker:

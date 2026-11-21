@@ -22,11 +22,11 @@ This matrix documents every documented capability of the reference application (
 | B.4 Blocking Screen / Overlay | Full-screen blocking dialog/overlay with countdown | Material 3 Dedicated Non-Bypassable `BlockShieldActivity` with clear-task flags and countdown timer | `BlockShieldActivity.kt`, `CentralRestrictionEngine.kt` | **Implemented & Verified** |
 | B.5 Emergency Allowlist & System Safeguards | Whitelist for phone, dialer, settings | Hardcoded unblockable emergency whitelist (`com.android.phone`, dialers, emergency SOS, settings) evaluated at Priority Level 0 | `CentralRestrictionEngine.kt` | **Implemented & Verified** |
 | **MODULE C: WEBSITE BLOCKER** |
-| C.1 Domain Blocking | Blocks specific domains in supported browsers | Dual architecture: On-device DNS sinkhole (`LocalDnsVpnService`) + URL node inspector (`TakeBackAccessibilityService`) | `LocalDnsVpnService.kt`, `DnsBlockMatcher.kt`, `TakeBackAccessibilityService.kt` | **Implemented & Verified** |
-| C.2 Wildcard & Subdomain Rules | `*.domain.com` matching | Subdomain pattern matcher in pure Kotlin domain layer | `DnsBlockMatcher.kt`, `DnsBlockMatcherTest.kt` | **Implemented & Verified** |
-| C.3 Browser Compatibility Suite | Publicly supported: Chrome, Samsung, Brave, Opera, Edge, Firefox | Dynamic view hierarchy inspection of browser address bars with fallback DNS loopback | `TakeBackAccessibilityService.kt`, `LocalDnsVpnService.kt` | **Implemented & Verified** |
-| C.4 Adult Content Filtering | Predefined category of adult sites | Curated high-confidence adult domain and keyword filter running 100% locally on-device | `DnsBlockMatcher.kt`, `DnsBlockMatcherTest.kt` | **Implemented & Verified** |
-| C.5 Keyword-in-URL Blocking | Blocks URLs containing flagged keywords | Text analysis engine on extracted browser address bar string | `CentralRestrictionEngine.kt`, `DnsBlockMatcher.kt` | **Implemented & Verified** |
+| C.1 Domain Blocking | Blocks specific domains in supported browsers | URL node inspector (`TakeBackAccessibilityService`) + pure domain matching in `CentralRestrictionEngine` | `TakeBackAccessibilityService.kt`, `CentralRestrictionEngine.kt` | **Implemented & Verified** |
+| C.2 Wildcard & Subdomain Rules | `*.domain.com` matching | Subdomain pattern matcher with boundary verification in pure Kotlin domain layer | `CentralRestrictionEngine.kt`, `CentralRestrictionEngineTest.kt` | **Implemented & Verified** |
+| C.3 Browser Compatibility Suite | Publicly supported: Chrome, Samsung, Brave, Opera, Edge, Firefox | Dynamic view hierarchy inspection of browser address bars across all supported browsers | `TakeBackAccessibilityService.kt` | **Implemented & Verified** |
+| C.4 Content Filtering & Allowlist | Predefined categories and custom domains | Exact domain and wildcard filtering with allowlist precedence evaluated locally | `CentralRestrictionEngine.kt`, `CentralRestrictionEngineTest.kt` | **Implemented & Verified** |
+| C.5 Keyword-in-URL Blocking | Blocks URLs containing flagged keywords | Text analysis engine on extracted browser address bar string | `CentralRestrictionEngine.kt` | **Implemented & Verified** |
 | **MODULE D: PROFILE MANAGEMENT** |
 | D.1 Multi-Profile Creation | Study, Work, Sleep, Custom profiles | 4 default built-in profiles (Work, Study, Sleep, Digital Detox) with custom profile creation | `ProfileRepository.kt`, `ProfilesScreen.kt` | **Implemented & Verified** |
 | D.2 Independent Profile Rules | Per-profile targets, limits, and triggers | Granular configuration per profile: target apps, websites, daily usage limits, and weekly schedules | `Profile.kt`, `ProfilesScreen.kt` | **Implemented & Verified** |
@@ -63,8 +63,8 @@ This matrix documents every documented capability of the reference application (
 | M.1 Distraction Notification Mute | Silences notifications from restricted apps | `NotificationListenerService` evaluating active blocked apps and auto-dismissing notifications (`cancelNotification`) | `TakeBackNotificationListenerService.kt` | **Implemented & Verified** |
 | **MODULE N: STRICT ALARM** |
 | N.1 Challenge-Based Wakeup Alarm | Math puzzle required to silence | Full-screen keyguard-waking activity (`StrictAlarmActivity`) with looping alarm tone, vibration, and math problem solver | `StrictAlarmActivity.kt`, `StrictAlarmReceiver.kt`, `MathChallengeGenerator.kt`, `MathChallengeGeneratorTest.kt` | **Implemented & Verified** |
-| **MODULE O: ADULT FILTER & KEYWORDS** |
-| O.1 SafeSearch & Adult Domain Filter | Filters adult sites across browsers | Pure Kotlin matcher with normalized hostname parser, adult TLD lists, and allowlist priority | `DnsBlockMatcher.kt`, `DnsBlockMatcherTest.kt` | **Implemented & Verified** |
+| **MODULE O: WEB FILTER & KEYWORDS** |
+| O.1 Domain & Keyword Filter | Filters restricted domains and keywords | Pure Kotlin matcher with normalized hostname parser, wildcard boundaries, and allowlist priority | `CentralRestrictionEngine.kt`, `CentralRestrictionEngineTest.kt` | **Implemented & Verified** |
 | **MODULE P: SETTINGS & BACKUP** |
 | P.1 Data Export & Purge | JSON export, zero-cloud privacy | 100% on-device architecture; zero telemetry, zero analytics tracking; JSON export & wipe UI | `SettingsScreen.kt` | **Implemented & Verified** |
 | P.2 Battery Exemption Guide | OEM setup guides (MIUI, Samsung, etc.) | Custom OEM intent launcher directing user to exact manufacturer battery settings (MIUI, Samsung, OnePlus, Huawei, Vivo) | `OemBatteryOptimizer.kt`, `SettingsScreen.kt` | **Implemented & Verified** |

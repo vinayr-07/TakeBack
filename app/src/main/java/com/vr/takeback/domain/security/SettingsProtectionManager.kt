@@ -46,17 +46,22 @@ data class MockAccessibilityNodeSnapshot(
 
 /**
  * Fine-grained classification of Android Settings destinations.
+ * Section 2.3: Separate classification cases for all distinct settings areas.
  */
 enum class SettingsDestination {
     SETTINGS_HOME,
     ACCESSIBILITY_SETTINGS,
+    INSTALLED_ACCESSIBILITY_SERVICES,
     TAKEBACK_ACCESSIBILITY_DETAILS,
     DEVICE_ADMIN_SETTINGS,
     TAKEBACK_DEVICE_ADMIN_DETAILS,
+    DEVICE_ADMIN_ACTIVATION, // Initial activation for TakeBack
+    UNRELATED_DEVICE_ADMIN_ACTIVATION, // Administrator activation for other apps
+    SECURITY_AND_PRIVACY_SETTINGS,
+    UNKNOWN_OR_INACCESSIBLE,
     TAKEBACK_APP_INFO,
     TAKEBACK_PERMISSION_SETTINGS,
     PACKAGE_INSTALLER_UNINSTALL,
-    DEVICE_ADMIN_ACTIVATION,
     OTHER_SETTINGS
 }
 
@@ -118,22 +123,22 @@ object SettingsProtectionManager {
         }
 
         if (rootNode == null) {
-            // Heuristic fallback if node hierarchy is unavailable during rapid window transition
-            if (cls.contains("deviceadminadd")) {
-                return SettingsDestination.TAKEBACK_DEVICE_ADMIN_DETAILS
-            }
-            if (cls.contains("toggleaccessibilityservicepreferencefragment")) {
-                return SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS
-            }
-            return SettingsDestination.SETTINGS_HOME
-        }
-
-        // 3. Initial Device Admin activation screen (MUST NOT BE BLOCKED)
-        if (isDeviceAdminActivationConfirmation(cls, rootNode)) {
-            return SettingsDestination.DEVICE_ADMIN_ACTIVATION
+            // Section 2.3: Unknown and incomplete node trees must NOT produce false positive classifications.
+            // Never guess TakeBack details when node hierarchy is unavailable or incomplete.
+            return SettingsDestination.UNKNOWN_OR_INACCESSIBLE
         }
 
         val hasTakeBack = containsText(rootNode, "TakeBack", MAX_SEARCH_DEPTH)
+
+        // 3. Initial Device Admin activation screen
+        val isDeviceAdminActivation = isDeviceAdminActivationConfirmation(cls, rootNode)
+        if (isDeviceAdminActivation) {
+            return if (hasTakeBack) {
+                SettingsDestination.DEVICE_ADMIN_ACTIVATION // TakeBack's own activation (MUST NOT BE BLOCKED)
+            } else {
+                SettingsDestination.UNRELATED_DEVICE_ADMIN_ACTIVATION // Other app activation
+            }
+        }
 
         // 4. Device Admin Details targeting TakeBack (Deactivation destination)
         val isDeviceAdminContext = cls.contains("deviceadminadd") ||
@@ -160,19 +165,24 @@ object SettingsProtectionManager {
                 containsText(rootNode, "TakeBack shortcut", MAX_SEARCH_DEPTH) ||
                 containsText(rootNode, "Allow TakeBack", MAX_SEARCH_DEPTH) ||
                 (hasTakeBack && containsText(rootNode, "Turn off", MAX_SEARCH_DEPTH)) ||
-                (hasTakeBack && cls.contains("toggleaccessibilityservice")) ||
-                (hasTakeBack && cls.contains("installedservice"))
+                (hasTakeBack && cls.contains("toggleaccessibilityservice"))
+
+        val isInstalledServicesList = (cls.contains("installedservice") ||
+                rootNode.text?.contains("Installed services", ignoreCase = true) == true ||
+                rootNode.text?.contains("Installed apps", ignoreCase = true) == true) &&
+                !hasAccessibilityControls
+
+        if (isInstalledServicesList) {
+            return SettingsDestination.INSTALLED_ACCESSIBILITY_SERVICES
+        }
 
         val isAccessibilityContext = pkg == "com.samsung.accessibility" ||
                 cls.contains("accessibility") ||
                 cls.contains("installedservice") ||
                 cls.contains("toggleaccessibilityservice") ||
-                containsText(rootNode, "Accessibility", MAX_SEARCH_DEPTH) ||
-                containsText(rootNode, "Installed apps", MAX_SEARCH_DEPTH) ||
-                containsText(rootNode, "Installed services", MAX_SEARCH_DEPTH) ||
-                containsText(rootNode, "Downloaded apps", MAX_SEARCH_DEPTH)
+                containsText(rootNode, "Accessibility", MAX_SEARCH_DEPTH)
 
-        if (hasAccessibilityControls || (isAccessibilityContext && hasTakeBack)) {
+        if (hasAccessibilityControls) {
             return SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS
         }
 
@@ -201,7 +211,16 @@ object SettingsProtectionManager {
             }
         }
 
-        // 9. General Settings Home
+        // 9. Security and Privacy settings
+        val isSecurityPrivacy = containsText(rootNode, "Security and privacy", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Biometrics and security", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Privacy", MAX_SEARCH_DEPTH) ||
+                cls.contains("securitysettings")
+        if (isSecurityPrivacy && !hasTakeBack) {
+            return SettingsDestination.SECURITY_AND_PRIVACY_SETTINGS
+        }
+
+        // 10. General Settings Home
         val isSettingsHome = containsText(rootNode, "Connections", MAX_SEARCH_DEPTH) ||
                 containsText(rootNode, "Sound and vibration", MAX_SEARCH_DEPTH) ||
                 containsText(rootNode, "Notifications", MAX_SEARCH_DEPTH) ||
@@ -288,11 +307,15 @@ object SettingsProtectionManager {
                 targetLabel = "Uninstallation Protection",
                 warningMessage = "Uninstalling TakeBack is blocked while Strict Mode is active."
             )
-            // General settings, category lists, and other destinations are NOT blocked (avoids nuisance blocking)
+            // Non-target destinations, general settings, lists, unknown screens are NEVER blocked (avoids nuisance blocking)
             SettingsDestination.SETTINGS_HOME,
             SettingsDestination.ACCESSIBILITY_SETTINGS,
+            SettingsDestination.INSTALLED_ACCESSIBILITY_SERVICES,
             SettingsDestination.DEVICE_ADMIN_SETTINGS,
             SettingsDestination.DEVICE_ADMIN_ACTIVATION,
+            SettingsDestination.UNRELATED_DEVICE_ADMIN_ACTIVATION,
+            SettingsDestination.SECURITY_AND_PRIVACY_SETTINGS,
+            SettingsDestination.UNKNOWN_OR_INACCESSIBLE,
             SettingsDestination.OTHER_SETTINGS -> ProtectionDecision(
                 isRestricted = false,
                 destination = destination,
@@ -306,12 +329,12 @@ object SettingsProtectionManager {
         className: String,
         rootNode: AccessibilityNodeSnapshot
     ): Boolean {
+        val isAddClass = className.contains("deviceadminadd")
         val hasActivate = containsText(rootNode, "Activate this device admin app", MAX_SEARCH_DEPTH) ||
                 containsText(rootNode, "Activate", MAX_SEARCH_DEPTH)
-        val hasTakeBack = containsText(rootNode, "TakeBack", MAX_SEARCH_DEPTH)
         val hasDeactivate = containsText(rootNode, "Deactivate", MAX_SEARCH_DEPTH) ||
                 containsText(rootNode, "Turn off", MAX_SEARCH_DEPTH)
-        return hasActivate && hasTakeBack && !hasDeactivate
+        return (isAddClass || hasActivate) && !hasDeactivate
     }
 
     private fun containsText(

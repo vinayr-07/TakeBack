@@ -28,7 +28,7 @@ flowchart TD
 
     subgraph PlatformLayer [Platform & Enforcement Infrastructure Layer]
         AccService[TakeBackAccessibilityService]
-        VpnService[LocalDnsVpnService]
+        DeviceAdmin[TakeBackDeviceAdminReceiver]
         FgService[FocusTimerService & AudioPlaybackService]
         NotifService[TakeBackNotificationListener]
         GeofenceClient[GeofenceBroadcastReceiver]
@@ -67,7 +67,7 @@ flowchart TD
 ### 4. Platform & System Services Layer (`com.vr.takeback.platform`)
 - **Background Execution:**
   - `TakeBackAccessibilityService`: Fast window-state observer and browser URL extractor.
-  - `LocalDnsVpnService`: Offline local DNS packet loopback filter.
+  - `TakeBackDeviceAdminReceiver`: Standard Device Administrator protection against unauthorized deactivation.
   - `FocusTimerForegroundService`: Keeps Pomodoro timer and audio playback resilient against OS termination.
   - `TakeBackNotificationListener`: Manages distraction suppression.
   - `ExactAlarmScheduler`: Registers wakeup alarms via `AlarmManager.setAlarmClock()`.

@@ -154,7 +154,9 @@ class ProfileRepository(context: Context? = null) {
         return try {
             TakeBackApplication.strictModeRepository.protectionState.value.isCurrentlyLocked
         } catch (e: Exception) {
-            false
+            // Section 3.3 Fail-closed: An exception while reading Strict Mode state must NOT be interpreted as disabled.
+            Log.e(TAG, "Failed to read Strict Mode state; failing closed", e)
+            true
         }
     }
 

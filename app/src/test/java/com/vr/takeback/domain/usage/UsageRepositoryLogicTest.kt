@@ -84,11 +84,11 @@ class UsageRepositoryLogicTest {
 
     @Test
     fun structuredQueryResults_distinguishErrorsFromEmptySuccess() {
-        val empty = UsageEventsQueryResult.EmptySuccess
-        val security = UsageEventsQueryResult.SecurityError(SecurityException("Denied"))
-        val nullResp = UsageEventsQueryResult.NullResponse
-        val queryErr = UsageEventsQueryResult.QueryError(RuntimeException("Failed"))
-        val success = UsageEventsQueryResult.Success(emptyList())
+        val empty: UsageEventsQueryResult = UsageEventsQueryResult.EmptySuccess
+        val security: UsageEventsQueryResult = UsageEventsQueryResult.SecurityError(SecurityException("Denied"))
+        val nullResp: UsageEventsQueryResult = UsageEventsQueryResult.NullResponse
+        val queryErr: UsageEventsQueryResult = UsageEventsQueryResult.QueryError(RuntimeException("Failed"))
+        val success: UsageEventsQueryResult = UsageEventsQueryResult.Success(emptyList())
 
         assertTrue(empty is UsageEventsQueryResult.EmptySuccess)
         assertTrue(security is UsageEventsQueryResult.SecurityError)

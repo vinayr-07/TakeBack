@@ -49,6 +49,32 @@ class CentralRestrictionEngine {
             "com.android.settings",
             "com.vr.takeback"
         )
+
+        /**
+         * Parses and extracts normalized lowercase hostname from a raw URL string.
+         * Strips scheme, ports, query parameters, fragments, and trailing dots.
+         * Pure JVM implementation without Android framework dependencies.
+         */
+        fun extractHost(rawUrl: String): String? {
+            val trimmed = rawUrl.trim()
+            if (trimmed.isEmpty()) return null
+            val urlWithScheme = if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+                "https://$trimmed"
+            } else {
+                trimmed
+            }
+            return try {
+                val uri = java.net.URI(urlWithScheme)
+                val host = uri.host?.lowercase()?.trimEnd('.')
+                if (host.isNullOrEmpty()) null else host
+            } catch (e: Exception) {
+                // Fallback for malformed URLs
+                val withoutScheme = urlWithScheme.substringAfter("://")
+                val hostPart = withoutScheme.substringBefore('/').substringBefore('?').substringBefore('#').substringBefore(':')
+                val host = hostPart.lowercase().trimEnd('.')
+                if (host.isEmpty()) null else host
+            }
+        }
     }
 
     /**
@@ -230,11 +256,16 @@ class CentralRestrictionEngine {
 
         // 1. Direct active profile (no schedules configured) is immediately enforcing when enabled
         if (profile.schedules.isEmpty()) {
-            return profile.targetApps.isNotEmpty() || profile.targetWebsites.isNotEmpty()
+            return profile.targetApps.isNotEmpty() || profile.targetWebsites.isNotEmpty() || profile.usageLimits.isNotEmpty()
         }
 
         // 2. Scheduled profile: active if current moment is inside scheduled window
         if (findActiveSchedule(profile.schedules, currentTime, currentDay) != null) {
+            return true
+        }
+
+        // 3. Profile with usage limits: limits govern target apps even outside schedule windows
+        if (profile.usageLimits.any { it.isEnabled }) {
             return true
         }
 
@@ -334,7 +365,7 @@ class CentralRestrictionEngine {
                     LimitWindowType.PER_HOUR -> BlockReason.HourlyQuotaExceeded(
                         limitMinutes = limit.dailyLimitMinutes
                     )
-                    LimitWindowType.PER_SESSION -> BlockReason.DailyLimitExceeded(
+                    LimitWindowType.PER_SESSION -> BlockReason.SessionQuotaExceeded(
                         limitMinutes = limit.dailyLimitMinutes,
                         usedMinutes = lastKnownMinutes
                     )
@@ -382,7 +413,7 @@ class CentralRestrictionEngine {
                     LimitWindowType.PER_HOUR -> BlockReason.HourlyQuotaExceeded(
                         limitMinutes = limit.dailyLimitMinutes
                     )
-                    LimitWindowType.PER_SESSION -> BlockReason.DailyLimitExceeded(
+                    LimitWindowType.PER_SESSION -> BlockReason.SessionQuotaExceeded(
                         limitMinutes = limit.dailyLimitMinutes,
                         usedMinutes = usedMinutes
                     )
@@ -406,16 +437,23 @@ class CentralRestrictionEngine {
         dayOfWeek: DayOfWeek
     ): BlockDecision {
         val cleanUrl = rawUrl.lowercase().trim()
+        val extractedHost = extractHost(cleanUrl)
 
         val activeProfiles = profiles.filter { isProfileCurrentlyEnforcing(it, localTime, dayOfWeek) }
 
-        // Allowlist rules take precedence over blocklist rules
+        // Section 5: Allowlist rules take precedence over blocklist rules (exact host & domain boundary matching)
         for (profile in activeProfiles) {
             for (rule in profile.targetWebsites.filter { it.isAllowlist }) {
                 val pattern = rule.domainPattern.lowercase().trim()
                 val isMatch = when (rule.ruleType) {
-                    WebsiteRuleType.EXACT_DOMAIN -> cleanUrl.contains(pattern)
-                    WebsiteRuleType.WILDCARD -> cleanUrl.contains(pattern.replace("*", ""))
+                    WebsiteRuleType.EXACT_DOMAIN -> {
+                        val ruleHost = extractHost(pattern) ?: pattern.trimEnd('.')
+                        extractedHost != null && extractedHost == ruleHost
+                    }
+                    WebsiteRuleType.WILDCARD -> {
+                        val baseDomain = pattern.removePrefix("*").removePrefix(".").trimEnd('.')
+                        extractedHost != null && (extractedHost == baseDomain || extractedHost.endsWith(".$baseDomain"))
+                    }
                     WebsiteRuleType.KEYWORD -> cleanUrl.contains(pattern)
                 }
                 if (isMatch) {
@@ -424,22 +462,36 @@ class CentralRestrictionEngine {
             }
         }
 
-        // Blocklist evaluation
+        // Section 5: Blocklist evaluation using robust host & wildcard boundary matching
         for (profile in activeProfiles) {
             for (rule in profile.targetWebsites.filter { !it.isAllowlist }) {
                 val pattern = rule.domainPattern.lowercase().trim()
+                var matchedDomain: String? = null
                 val isMatch = when (rule.ruleType) {
-                    WebsiteRuleType.EXACT_DOMAIN -> cleanUrl.contains(pattern)
-                    WebsiteRuleType.WILDCARD -> cleanUrl.contains(pattern.replace("*", ""))
+                    WebsiteRuleType.EXACT_DOMAIN -> {
+                        val ruleHost = extractHost(pattern) ?: pattern.trimEnd('.')
+                        matchedDomain = ruleHost
+                        extractedHost != null && extractedHost == ruleHost
+                    }
+                    WebsiteRuleType.WILDCARD -> {
+                        val baseDomain = pattern.removePrefix("*").removePrefix(".").trimEnd('.')
+                        matchedDomain = baseDomain
+                        extractedHost != null && (extractedHost == baseDomain || extractedHost.endsWith(".$baseDomain"))
+                    }
                     WebsiteRuleType.KEYWORD -> cleanUrl.contains(pattern)
                 }
 
                 if (isMatch) {
+                    val reason = if (rule.ruleType == WebsiteRuleType.KEYWORD) {
+                        BlockReason.KeywordMatch(pattern)
+                    } else {
+                        BlockReason.DomainBlock(matchedDomain ?: pattern)
+                    }
                     return BlockDecision.Blocked(
                         target = BlockTarget.Website(rawUrl),
                         triggeringProfileId = profile.id,
                         triggeringProfileName = profile.name,
-                        reason = BlockReason.KeywordMatch(pattern)
+                        reason = reason
                     )
                 }
             }

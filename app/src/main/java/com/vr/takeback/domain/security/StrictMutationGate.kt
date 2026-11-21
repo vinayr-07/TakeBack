@@ -47,13 +47,20 @@ object StrictMutationGate {
     /**
      * Issues a single-use authorization token for a specific mutation upon successful challenge solution.
      */
-    fun issueToken(mutationType: MutationType, targetId: String? = null): String {
+    fun issueToken(
+        mutationType: MutationType,
+        targetId: String? = null,
+        validityDurationMillis: Long = 60_000L
+    ): String {
         purgeExpiredTokens()
         val tokenId = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
         val token = OneTimeMutationToken(
             tokenId = tokenId,
             mutationType = mutationType,
-            targetId = targetId
+            targetId = targetId,
+            createdAtMillis = now,
+            expiresAtMillis = now + validityDurationMillis
         )
         activeTokens[tokenId] = token
         return tokenId
@@ -75,7 +82,9 @@ object StrictMutationGate {
         if (existing.mutationType != mutationType) {
             return false
         }
-        if (existing.targetId != null && targetId != null && existing.targetId != targetId) {
+        // Section 3.1: Token validation requires an exact target match, including nullability.
+        // A token issued for a specific target must never authorize targetId = null, and vice versa.
+        if (existing.targetId != targetId) {
             return false
         }
         return activeTokens.remove(token, existing)
@@ -90,7 +99,7 @@ object StrictMutationGate {
         val now = System.currentTimeMillis()
         if (now > existing.expiresAtMillis) return false
         if (existing.mutationType != mutationType) return false
-        if (existing.targetId != null && targetId != null && existing.targetId != targetId) return false
+        if (existing.targetId != targetId) return false
         return true
     }
 

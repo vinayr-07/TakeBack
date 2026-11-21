@@ -213,7 +213,14 @@ object ScheduleCoordinator {
 
         val endTime = LocalTime.ofSecondOfDay(endSec.toLong())
 
-        for (dayOffset in 0..7) {
+        // Section 6.1: Overnight schedule bug fix.
+        // If overnight (e.g. Friday 22:00 -> Saturday 06:00), the schedule may have started
+        // on the previous day (Friday) and end today (Saturday 06:00).
+        // Searching from dayOffset = -1 ensures that after a reboot on Saturday at 02:00,
+        // we find the upcoming 06:00 end boundary today rather than skipping to next week.
+        val searchStartOffset = if (isOvernight) -1 else 0
+
+        for (dayOffset in searchStartOffset..7) {
             val candidateStartDate = now.toLocalDate().plusDays(dayOffset.toLong())
             val dayOfWeekIndex = candidateStartDate.dayOfWeek.value // 1..7
 

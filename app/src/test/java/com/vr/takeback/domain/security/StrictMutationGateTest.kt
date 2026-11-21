@@ -48,6 +48,34 @@ class StrictMutationGateTest {
     }
 
     @Test
+    fun testTargetIdExactMatchAndNullabilityProtection() {
+        // Specific target token cannot be consumed with null target
+        val specificToken = StrictMutationGate.issueToken(MutationType.DELETE_PROFILE, "profile_target_99")
+        val nullConsumptionAttempt = StrictMutationGate.consumeToken(specificToken, MutationType.DELETE_PROFILE, null)
+        assertFalse("Specific target token must not authorize null-target consumption", nullConsumptionAttempt)
+
+        // General (null target) token cannot be consumed with a specific target
+        val nullToken = StrictMutationGate.issueToken(MutationType.CREATE_PROFILE, null)
+        val specificConsumptionAttempt = StrictMutationGate.consumeToken(nullToken, MutationType.CREATE_PROFILE, "unexpected_target")
+        assertFalse("General null-target token must not authorize specific-target consumption", specificConsumptionAttempt)
+
+        // General (null target) token succeeds with null target
+        val validNullConsumption = StrictMutationGate.consumeToken(nullToken, MutationType.CREATE_PROFILE, null)
+        assertTrue("General token consumed with matching null target must succeed", validNullConsumption)
+    }
+
+    @Test
+    fun testExpiredToken_isRejected() {
+        // Issue token with past expiration
+        val expiredToken = StrictMutationGate.issueToken(
+            mutationType = MutationType.TOGGLE_PROFILE,
+            targetId = "p1",
+            validityDurationMillis = -1000L
+        )
+        assertFalse("Expired token must be rejected", StrictMutationGate.consumeToken(expiredToken, MutationType.TOGGLE_PROFILE, "p1"))
+    }
+
+    @Test
     fun testNullOrEmptyToken_isRejected() {
         assertFalse(StrictMutationGate.consumeToken(null, MutationType.TOGGLE_PROFILE))
         assertFalse(StrictMutationGate.consumeToken("", MutationType.TOGGLE_PROFILE))

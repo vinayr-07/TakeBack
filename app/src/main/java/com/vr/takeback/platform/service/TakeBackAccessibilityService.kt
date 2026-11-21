@@ -190,7 +190,12 @@ class TakeBackAccessibilityService : AccessibilityService() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 val elapsed = SystemClock.elapsedRealtime()
                 when (intent?.action) {
-                    Intent.ACTION_SCREEN_ON -> sessionTracker.onScreenStateChanged(true, elapsed)
+                    Intent.ACTION_SCREEN_ON -> {
+                        val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                        val isLocked = km?.isKeyguardLocked ?: false
+                        sessionTracker.onKeyguardChanged(isLocked, elapsed)
+                        sessionTracker.onScreenStateChanged(true, elapsed)
+                    }
                     Intent.ACTION_SCREEN_OFF -> sessionTracker.onScreenStateChanged(false, elapsed)
                     Intent.ACTION_USER_PRESENT -> sessionTracker.onKeyguardChanged(false, elapsed)
                 }
@@ -364,14 +369,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val isQuickBlockActive = quickBlockState?.isActive == true
         val enabledProfiles = activeProfiles.filter { it.isEnabled }
 
-        // Core Invariance: If no profiles are enabled and Quick Block is off, allow all apps immediately
+        // Core Invariance: If no profiles are enforcing, no usage limits apply, and Quick Block is off, allow all apps immediately
         val localTime = LocalTime.now()
         val dayOfWeek = LocalDate.now().dayOfWeek
         val hasEnforcingProfiles = enabledProfiles.any { profile ->
             engine.isProfileCurrentlyEnforcing(profile, localTime, dayOfWeek)
         }
+        val hasUsageLimitForApp = enabledProfiles.any { profile ->
+            profile.usageLimits.any { limit ->
+                limit.isEnabled && (limit.targetPackageName == null || limit.targetPackageName == packageName)
+            }
+        }
 
-        if (!hasEnforcingProfiles && !isQuickBlockActive) {
+        if (!hasEnforcingProfiles && !isQuickBlockActive && !hasUsageLimitForApp) {
             return
         }
 
@@ -432,12 +442,6 @@ class TakeBackAccessibilityService : AccessibilityService() {
             TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
         } catch (e: Exception) {
             null
-        }
-
-        val hasUsageLimitForApp = enabledProfiles.any { profile ->
-            profile.usageLimits.any { limit ->
-                limit.isEnabled && (limit.targetPackageName == null || limit.targetPackageName == packageName)
-            }
         }
 
         val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
@@ -513,9 +517,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
             is BlockReason.ScheduleActive -> "Active schedule restriction"
             is BlockReason.DailyLimitExceeded -> "Daily usage limit reached (${decision.reason.limitMinutes}m)"
             is BlockReason.HourlyQuotaExceeded -> "Hourly allowance exhausted"
+            is BlockReason.SessionQuotaExceeded -> "Session limit reached (${decision.reason.limitMinutes}m)"
             is BlockReason.FocusSessionActive -> "Deep Focus sprint in progress"
             is BlockReason.QuickBlockActive -> "Quick Block active"
-            is BlockReason.AdultContentFilter -> "Content blocked by filter"
+            is BlockReason.DomainBlock -> "Restricted website (${decision.reason.domain})"
             is BlockReason.KeywordMatch -> "Blocked by keyword '${decision.reason.keyword}'"
             is BlockReason.GeofenceActive -> "Restricted at this location"
             is BlockReason.GoalNotMet -> "Productivity goal required first"

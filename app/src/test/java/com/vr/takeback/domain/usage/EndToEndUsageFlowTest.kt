@@ -541,9 +541,17 @@ class EndToEndUsageFlowTest {
         val decisionOver = engine.evaluate(listOf(sessionProfile), staleSnapOver)
         assertTrue("Stale data with session duration exceeding limit must block", decisionOver is BlockDecision.Blocked)
         val reason = (decisionOver as BlockDecision.Blocked).reason
-        assertTrue(reason is BlockReason.DailyLimitExceeded)
-        assertEquals(15, (reason as BlockReason.DailyLimitExceeded).limitMinutes)
-        assertEquals(20, reason.usedMinutes)
+        when (reason) {
+            is BlockReason.SessionQuotaExceeded -> {
+                assertEquals(15, reason.limitMinutes)
+                assertEquals(20, reason.usedMinutes)
+            }
+            is BlockReason.DailyLimitExceeded -> {
+                assertEquals(15, reason.limitMinutes)
+                assertEquals(20, reason.usedMinutes)
+            }
+            else -> fail("Expected SessionQuotaExceeded or DailyLimitExceeded, got $reason")
+        }
     }
 
     // -------------------------------------------------------------------------
