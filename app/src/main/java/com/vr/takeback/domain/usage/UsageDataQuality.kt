@@ -50,6 +50,11 @@ enum class UsageDataQuality(
         technicalDescription = "System UsageEvents retention expired (>7-10d) and no snapshot was persisted",
         isTrustworthy = false
     ),
+    STALE(
+        displayLabel = "Stale Snapshot",
+        technicalDescription = "Cached usage data is older than allowed freshness threshold",
+        isTrustworthy = false
+    ),
     UNKNOWN(
         displayLabel = "Unknown",
         technicalDescription = "Usage data has not yet been collected or initialized",

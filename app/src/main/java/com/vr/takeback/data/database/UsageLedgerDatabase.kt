@@ -6,7 +6,6 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.util.Log
-import com.vr.takeback.domain.model.AppUsageInfo
 import com.vr.takeback.domain.usage.UsageDataQuality
 import java.time.LocalDate
 
@@ -15,14 +14,17 @@ data class PersistedAppRecord(
     val packageName: String,
     val appLabel: String,
     val foregroundDurationMillis: Long,
-    val launchCount: Int,
+    val reconstructedSessionCount: Int,
     val lastTimeUsedMillis: Long,
     val dataSource: String,
     val qualityStatus: UsageDataQuality,
     val queryTimestamp: Long,
     val lastSyncEventTimestamp: Long,
     val deviceTimezone: String
-)
+) {
+    @Deprecated("Renamed to reconstructedSessionCount", ReplaceWith("reconstructedSessionCount"))
+    val launchCount: Int get() = reconstructedSessionCount
+}
 
 data class PersistedDeviceRecord(
     val dateIso: String,
@@ -52,7 +54,7 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
     companion object {
         const val TAG = "UsageLedgerDatabase"
         const val DATABASE_NAME = "takeback_usage_ledger.db"
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
 
         const val TABLE_DEVICE_LEDGER = "daily_device_ledger"
         const val TABLE_APP_LEDGER = "daily_app_usage_ledger"
@@ -77,7 +79,7 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
                 package_name TEXT NOT NULL,
                 app_label TEXT NOT NULL,
                 foreground_duration_ms INTEGER NOT NULL,
-                launch_count INTEGER NOT NULL DEFAULT 0,
+                reconstructed_session_count INTEGER NOT NULL DEFAULT 0,
                 last_time_used_ms INTEGER NOT NULL DEFAULT 0,
                 data_source TEXT NOT NULL,
                 quality_status TEXT NOT NULL,
@@ -96,19 +98,31 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Migration logic for future schema changes
+        if (oldVersion < 2) {
+            db.execSQL("DROP TABLE IF EXISTS $TABLE_APP_LEDGER")
+            db.execSQL("DROP TABLE IF EXISTS $TABLE_DEVICE_LEDGER")
+            onCreate(db)
+        }
     }
 
     /**
      * Idempotently saves or updates a daily usage ledger entry in a single atomic transaction.
+     * Prevents overwriting a finalized record with an unfinalized or partial snapshot.
+     * Returns true on success, false on error.
      */
     fun persistDailyUsage(
         deviceRecord: PersistedDeviceRecord,
         appRecords: List<PersistedAppRecord>
-    ) {
+    ): Boolean {
+        val existing = getDeviceRecord(LocalDate.parse(deviceRecord.dateIso))
+        if (existing != null && existing.isFinalized && !deviceRecord.isFinalized) {
+            Log.w(TAG, "Prevented overwrite of finalized record for ${deviceRecord.dateIso} with non-finalized record")
+            return false
+        }
+
         val db = writableDatabase
         db.beginTransaction()
-        try {
+        return try {
             // 1. Insert or update device interactive record
             val deviceValues = ContentValues().apply {
                 put("date_iso", deviceRecord.dateIso)
@@ -128,7 +142,7 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
                 SQLiteDatabase.CONFLICT_REPLACE
             )
 
-            // 2. Clear old app records for this date to prevent duplicate counts on update
+            // 2. Clear old app records for this date
             db.delete(TABLE_APP_LEDGER, "date_iso = ?", arrayOf(deviceRecord.dateIso))
 
             // 3. Insert fresh app records
@@ -138,7 +152,7 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
                     put("package_name", app.packageName)
                     put("app_label", app.appLabel)
                     put("foreground_duration_ms", app.foregroundDurationMillis)
-                    put("launch_count", app.launchCount)
+                    put("reconstructed_session_count", app.reconstructedSessionCount)
                     put("last_time_used_ms", app.lastTimeUsedMillis)
                     put("data_source", app.dataSource)
                     put("quality_status", app.qualityStatus.name)
@@ -155,8 +169,10 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
             }
 
             db.setTransactionSuccessful()
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to persist daily usage for ${deviceRecord.dateIso}", e)
+            false
         } finally {
             db.endTransaction()
         }
@@ -231,7 +247,7 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
                         packageName = cursor.getString(cursor.getColumnIndexOrThrow("package_name")),
                         appLabel = cursor.getString(cursor.getColumnIndexOrThrow("app_label")),
                         foregroundDurationMillis = cursor.getLong(cursor.getColumnIndexOrThrow("foreground_duration_ms")),
-                        launchCount = cursor.getInt(cursor.getColumnIndexOrThrow("launch_count")),
+                        reconstructedSessionCount = cursor.getInt(cursor.getColumnIndexOrThrow("reconstructed_session_count")),
                         lastTimeUsedMillis = cursor.getLong(cursor.getColumnIndexOrThrow("last_time_used_ms")),
                         dataSource = cursor.getString(cursor.getColumnIndexOrThrow("data_source")),
                         qualityStatus = try {

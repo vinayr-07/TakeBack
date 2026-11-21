@@ -1,6 +1,5 @@
 package com.vr.takeback.domain.usage
 
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.LocalDate
@@ -24,39 +23,52 @@ class UsageDiagnosticsTest {
                 hasUsagePermission = true,
                 isSuccess = true
             ),
-            rawOsResults = RawOsResults(
-                queryAndAggregateTotalMillis = 5400000L, // 1h 30m (over-reported due to 17:25 bucket)
-                queryAndAggregatePackageCount = 45,
-                queryAndAggregateTopPackages = listOf(
-                    PackageRawStat("com.instagram.android", 3600000L, 0L, 1732170000000L)
-                ),
-                dailyBucketCount = 1,
-                dailyIntervalTotalMillis = 5400000L,
-                dailyBuckets = emptyList(),
-                eventCount = 120,
-                firstEventTimestampFormatted = "2026-11-21 07:15:00.000",
-                lastEventTimestampFormatted = "2026-11-21 12:25:00.000"
+            totals = DiagnosticTotals(
+                allPackagesAggregateTotalMillis = 5400000L,
+                allPackagesIntervalDailyTotalMillis = 5400000L,
+                eligibleAggregateTotalMillis = 4000000L,
+                eligibleIntervalDailyTotalMillis = 4000000L,
+                eligibleTakeBackReconstructedTotalMillis = 2400000L,
+                eligibleDifferenceMillis = 1600000L,
+                excludedAggregateTotalMillis = 1400000L,
+                deviceInteractiveTimeMillis = 2700000L,
+                isDeviceInteractiveAvailable = true
             ),
             filterDiagnostics = FilterDiagnostics(
                 totalPackagesEvaluated = 45,
                 eligiblePackagesCount = 20,
-                excludedPackagesCount = 25,
-                filterDecisions = mapOf("com.android.systemui" to "EXCLUDED: Explicit system framework component")
+                excludedPackagesCount = 25
             ),
             calculationDiagnostics = CalculationDiagnostics(
                 totalReconstructedSessions = 12,
-                totalAppUsageMillis = 3000000L, // 50m (true usage since 00:00)
-                deviceScreenOnTimeMillis = 2700000L, // 45m (true screen-on time)
-                perAppUsage = mapOf("com.instagram.android" to 1800000L),
-                perAppLaunchCounts = mapOf("com.instagram.android" to 4),
-                snapshotTimestampMillis = 1732172401000L
-            )
+                totalAppUsageMillis = 2400000L,
+                deviceScreenOnTimeMillis = 2700000L,
+                snapshotTimestampMillis = 1732172401000L,
+                dataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE
+            ),
+            packageMatrix = listOf(
+                PackageComparisonEntry(
+                    packageName = "com.instagram.android",
+                    appLabel = "Instagram",
+                    queryAndAggregateMillis = 3600000L,
+                    intervalDailyMillis = 3600000L,
+                    takeBackReconstructedMillis = 1800000L,
+                    isEligibleUserApp = true,
+                    filterDecision = "INCLUDED: User App"
+                )
+            ),
+            dailyBuckets = emptyList(),
+            eventCount = 120,
+            firstEventTimestampFormatted = "2026-11-21 07:15:00.000",
+            lastEventTimestampFormatted = "2026-11-21 12:25:00.000"
         )
 
         val report = diagnostics.toFormattedReport()
         assertTrue(report.contains("TAKEBACK USAGE STATISTICS DIAGNOSTICS"))
         assertTrue(report.contains("Target Date:         2026-11-21"))
-        assertTrue(report.contains("OS Aggregate Over-reporting:"))
-        assertTrue(report.contains("Device Interactive Time"))
+        assertTrue(report.contains("MEASURED TOTALS COMPARISON (SAME PACKAGE POPULATIONS)"))
+        assertTrue(report.contains("Measured Display-On Time:"))
+        assertTrue(report.contains("TOP PACKAGES MEASUREMENT MATRIX:"))
+        assertTrue(report.contains("com.instagram.android"))
     }
 }

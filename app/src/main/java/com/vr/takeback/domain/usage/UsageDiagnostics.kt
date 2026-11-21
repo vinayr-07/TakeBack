@@ -1,74 +1,30 @@
 package com.vr.takeback.domain.usage
 
-import java.time.Instant
 import java.time.LocalDate
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
-/**
- * Diagnostic record capturing the complete execution trace of a usage query.
- * Exposes exact metrics from:
- * 1. OS queryAndAggregateUsageStats()
- * 2. OS queryUsageStats(INTERVAL_DAILY)
- * 3. UsageEvents event stream & session reconstruction
- * 4. Package filtering decisions
- */
-data class UsageDiagnostics(
-    val queryInfo: QueryMetadata,
-    val rawOsResults: RawOsResults,
-    val filterDiagnostics: FilterDiagnostics,
-    val calculationDiagnostics: CalculationDiagnostics
+data class PackageComparisonEntry(
+    val packageName: String,
+    val appLabel: String,
+    val queryAndAggregateMillis: Long,
+    val intervalDailyMillis: Long,
+    val takeBackReconstructedMillis: Long,
+    val isEligibleUserApp: Boolean,
+    val filterDecision: String
 ) {
-    fun toFormattedReport(): String {
-        val sb = StringBuilder()
-        sb.appendLine("==================================================")
-        sb.appendLine("      TAKEBACK USAGE STATISTICS DIAGNOSTICS       ")
-        sb.appendLine("==================================================")
-        sb.appendLine("Target Date:         ${queryInfo.targetDate}")
-        sb.appendLine("Timezone:            ${queryInfo.timeZoneId}")
-        sb.appendLine("Start Time:          ${queryInfo.startFormatted} (${queryInfo.startEpochMillis} ms)")
-        sb.appendLine("End Time:            ${queryInfo.endFormatted} (${queryInfo.endEpochMillis} ms)")
-        sb.appendLine("Execution Time:      ${queryInfo.queryExecutedFormatted}")
-        sb.appendLine("API Level:           ${queryInfo.apiLevel}")
-        sb.appendLine("Permission Granted:  ${queryInfo.hasUsagePermission}")
-        sb.appendLine("Data Quality:        ${calculationDiagnostics.dataQuality.displayLabel} - ${calculationDiagnostics.dataQuality.technicalDescription}")
-        sb.appendLine("Query Status:        ${if (queryInfo.isSuccess) "SUCCESS" else "FAILED: ${queryInfo.errorMessage}"}")
-        sb.appendLine("--------------------------------------------------")
-        sb.appendLine("1. RAW ANDROID OS LAYER COMPARISON:")
-        sb.appendLine("   - queryAndAggregate Total:     ${formatMillis(rawOsResults.queryAndAggregateTotalMillis)}")
-        sb.appendLine("   - queryAndAggregate Packages:  ${rawOsResults.queryAndAggregatePackageCount}")
-        sb.appendLine("   - queryUsageStats Daily Files: ${rawOsResults.dailyBucketCount}")
-        sb.appendLine("   - Daily Interval Total:        ${formatMillis(rawOsResults.dailyIntervalTotalMillis)}")
-        sb.appendLine("   - Raw Event Count:             ${rawOsResults.eventCount}")
-        sb.appendLine("   - First Event In Window:       ${rawOsResults.firstEventTimestampFormatted ?: "None"}")
-        sb.appendLine("   - Last Event In Window:        ${rawOsResults.lastEventTimestampFormatted ?: "None"}")
-        sb.appendLine("--------------------------------------------------")
-        sb.appendLine("2. PACKAGE FILTERING LAYER:")
-        sb.appendLine("   - Total Packages Evaluated:    ${filterDiagnostics.totalPackagesEvaluated}")
-        sb.appendLine("   - Eligible / Included:         ${filterDiagnostics.eligiblePackagesCount}")
-        sb.appendLine("   - Excluded:                    ${filterDiagnostics.excludedPackagesCount}")
-        sb.appendLine("--------------------------------------------------")
-        sb.appendLine("3. TAKEBACK RECONSTRUCTION LAYER:")
-        sb.appendLine("   - Reconstructed Sessions:      ${calculationDiagnostics.totalReconstructedSessions}")
-        sb.appendLine("   - Total Tracked App Usage:     ${formatMillis(calculationDiagnostics.totalAppUsageMillis)}")
-        sb.appendLine("   - Device Interactive Time:     ${formatMillis(calculationDiagnostics.deviceScreenOnTimeMillis)}")
-        sb.appendLine("   - Top Apps Count:              ${calculationDiagnostics.perAppUsage.size}")
-        sb.appendLine("--------------------------------------------------")
-        sb.appendLine("4. ROOT-CAUSE SUMMARY:")
-        sb.appendLine("   OS Aggregate Over-reporting:   ${formatMillis(rawOsResults.queryAndAggregateTotalMillis - calculationDiagnostics.totalAppUsageMillis)}")
-        sb.appendLine("   Reason: Android daily buckets rotate at internal device intervals (~24h from boot), NOT midnight. queryAndAggregateUsageStats returns pre-midnight usage.")
-        sb.appendLine("==================================================")
-        return sb.toString()
-    }
-
-    private fun formatMillis(millis: Long): String {
-        val totalSec = millis / 1000
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return String.format("%02dh %02dm %02ds (%d ms)", h, m, s, millis)
-    }
+    val differenceMillis: Long get() = queryAndAggregateMillis - takeBackReconstructedMillis
 }
+
+data class DiagnosticTotals(
+    val allPackagesAggregateTotalMillis: Long,
+    val allPackagesIntervalDailyTotalMillis: Long,
+    val eligibleAggregateTotalMillis: Long,
+    val eligibleIntervalDailyTotalMillis: Long,
+    val eligibleTakeBackReconstructedTotalMillis: Long,
+    val eligibleDifferenceMillis: Long,
+    val excludedAggregateTotalMillis: Long,
+    val deviceInteractiveTimeMillis: Long?,
+    val isDeviceInteractiveAvailable: Boolean
+)
 
 data class QueryMetadata(
     val targetDate: LocalDate,
@@ -85,25 +41,6 @@ data class QueryMetadata(
     val errorMessage: String? = null
 )
 
-data class RawOsResults(
-    val queryAndAggregateTotalMillis: Long,
-    val queryAndAggregatePackageCount: Int,
-    val queryAndAggregateTopPackages: List<PackageRawStat>,
-    val dailyBucketCount: Int,
-    val dailyIntervalTotalMillis: Long,
-    val dailyBuckets: List<DailyBucketInfo>,
-    val eventCount: Int,
-    val firstEventTimestampFormatted: String?,
-    val lastEventTimestampFormatted: String?
-)
-
-data class PackageRawStat(
-    val packageName: String,
-    val totalTimeInForegroundMillis: Long,
-    val totalTimeVisibleMillis: Long = 0L,
-    val lastTimeUsedMillis: Long = 0L
-)
-
 data class DailyBucketInfo(
     val beginTimestamp: Long,
     val endTimestamp: Long,
@@ -116,16 +53,97 @@ data class DailyBucketInfo(
 data class FilterDiagnostics(
     val totalPackagesEvaluated: Int,
     val eligiblePackagesCount: Int,
-    val excludedPackagesCount: Int,
-    val filterDecisions: Map<String, String>
+    val excludedPackagesCount: Int
 )
 
 data class CalculationDiagnostics(
     val totalReconstructedSessions: Int,
     val totalAppUsageMillis: Long,
     val deviceScreenOnTimeMillis: Long,
-    val perAppUsage: Map<String, Long>,
-    val perAppLaunchCounts: Map<String, Int>,
     val snapshotTimestampMillis: Long,
     val dataQuality: UsageDataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE
 )
+
+/**
+ * Diagnostic record capturing the complete empirical execution trace of a usage query.
+ * Exposes exact metrics compared across identical package populations.
+ * Reports purely measured facts without hardcoded conclusions or speculative rollover assumptions.
+ */
+data class UsageDiagnostics(
+    val queryInfo: QueryMetadata,
+    val totals: DiagnosticTotals,
+    val filterDiagnostics: FilterDiagnostics,
+    val calculationDiagnostics: CalculationDiagnostics,
+    val packageMatrix: List<PackageComparisonEntry>,
+    val dailyBuckets: List<DailyBucketInfo>,
+    val eventCount: Int,
+    val firstEventTimestampFormatted: String?,
+    val lastEventTimestampFormatted: String?
+) {
+    fun toFormattedReport(): String {
+        val sb = StringBuilder()
+        sb.appendLine("==================================================")
+        sb.appendLine("      TAKEBACK USAGE STATISTICS DIAGNOSTICS       ")
+        sb.appendLine("==================================================")
+        sb.appendLine("Target Date:         ${queryInfo.targetDate}")
+        sb.appendLine("Timezone:            ${queryInfo.timeZoneId}")
+        sb.appendLine("Query Window Start:  ${queryInfo.startFormatted} (${queryInfo.startEpochMillis} ms)")
+        sb.appendLine("Query Window End:    ${queryInfo.endFormatted} (${queryInfo.endEpochMillis} ms)")
+        sb.appendLine("Execution Timestamp: ${queryInfo.queryExecutedFormatted}")
+        sb.appendLine("Android API Level:   ${queryInfo.apiLevel}")
+        sb.appendLine("Permission Granted:  ${queryInfo.hasUsagePermission}")
+        sb.appendLine("Data Quality State:  ${calculationDiagnostics.dataQuality.displayLabel} (${calculationDiagnostics.dataQuality.technicalDescription})")
+        sb.appendLine("Query Status:        ${if (queryInfo.isSuccess) "SUCCESS" else "FAILED: ${queryInfo.errorMessage}"}")
+        sb.appendLine("--------------------------------------------------")
+        sb.appendLine("1. MEASURED TOTALS COMPARISON (SAME PACKAGE POPULATIONS):")
+        sb.appendLine("   A. All Observed Packages (${filterDiagnostics.totalPackagesEvaluated} total):")
+        sb.appendLine("      - queryAndAggregate Total:   ${formatMillis(totals.allPackagesAggregateTotalMillis)}")
+        sb.appendLine("      - INTERVAL_DAILY Total:      ${formatMillis(totals.allPackagesIntervalDailyTotalMillis)}")
+        sb.appendLine("      - Excluded System Packages:  ${formatMillis(totals.excludedAggregateTotalMillis)}")
+        sb.appendLine("   B. Eligible User-Facing Applications (${filterDiagnostics.eligiblePackagesCount} packages):")
+        sb.appendLine("      - queryAndAggregate Total:   ${formatMillis(totals.eligibleAggregateTotalMillis)}")
+        sb.appendLine("      - TakeBack Reconstructed:    ${formatMillis(totals.eligibleTakeBackReconstructedTotalMillis)}")
+        sb.appendLine("      - Measured Disparity:        ${formatMillis(totals.eligibleDifferenceMillis)}")
+        sb.appendLine("   C. Device-Interactive Display Time:")
+        sb.appendLine("      - Measured Display-On Time:  ${if (totals.isDeviceInteractiveAvailable && totals.deviceInteractiveTimeMillis != null) formatMillis(totals.deviceInteractiveTimeMillis) else "UNAVAILABLE (No screen-state events observed)"}")
+        sb.appendLine("--------------------------------------------------")
+        sb.appendLine("2. USAGE EVENTS STREAM METRICS:")
+        sb.appendLine("   - Event Count in Window:        $eventCount")
+        sb.appendLine("   - First Observed Event:         ${firstEventTimestampFormatted ?: "None"}")
+        sb.appendLine("   - Last Observed Event:          ${lastEventTimestampFormatted ?: "None"}")
+        sb.appendLine("   - Reconstructed Session Count:  ${calculationDiagnostics.totalReconstructedSessions}")
+        sb.appendLine("--------------------------------------------------")
+        sb.appendLine("3. TOP PACKAGES MEASUREMENT MATRIX:")
+        sb.appendLine(String.format("%-28s | %-12s | %-12s | %-12s", "Package", "OS Aggregate", "TakeBack", "Disparity"))
+        sb.appendLine("----------------------------------------------------------------------")
+        for (pkg in packageMatrix.take(15)) {
+            val name = if (pkg.packageName.length > 28) pkg.packageName.take(25) + "..." else pkg.packageName
+            sb.appendLine(
+                String.format(
+                    "%-28s | %-12s | %-12s | %-12s",
+                    name,
+                    formatShort(pkg.queryAndAggregateMillis),
+                    formatShort(pkg.takeBackReconstructedMillis),
+                    formatShort(pkg.differenceMillis)
+                )
+            )
+        }
+        sb.appendLine("==================================================")
+        return sb.toString()
+    }
+
+    private fun formatMillis(millis: Long): String {
+        val totalSec = millis / 1000
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        val s = totalSec % 60
+        return String.format("%02dh %02dm %02ds (%d ms)", h, m, s, millis)
+    }
+
+    private fun formatShort(millis: Long): String {
+        val totalSec = millis / 1000
+        val m = totalSec / 60
+        val s = totalSec % 60
+        return if (m >= 60) "${m / 60}h ${m % 60}m" else "${m}m ${s}s"
+    }
+}

@@ -352,6 +352,7 @@ fun InsightsScreen(
                                 UsageDataQuality.PROVISIONAL -> Color(0xFF1E3A8A) to Color(0xFFBFDBFE)
                                 UsageDataQuality.RECONSTRUCTED_PARTIAL -> Color(0xFF78350F) to Color(0xFFFDE68A)
                                 UsageDataQuality.HISTORY_EXPIRED -> Color(0xFF374151) to Color(0xFFD1D5DB)
+                                UsageDataQuality.STALE -> Color(0xFF451A03) to Color(0xFFFED7AA)
                                 UsageDataQuality.PERMISSION_DENIED,
                                 UsageDataQuality.QUERY_FAILED -> Color(0xFF7F1D1D) to Color(0xFFFECACA)
                                 UsageDataQuality.UNKNOWN -> Color.DarkGray to Color.LightGray
@@ -480,7 +481,7 @@ fun InsightsScreen(
                                             style = MaterialTheme.typography.bodyMedium
                                         )
                                         Text(
-                                            text = if (app.launchCount > 0) "${app.launchCount} session${if (app.launchCount != 1) "s" else ""} • Tap for session history" else "No recorded sessions • Tap for details",
+                                            text = if (app.reconstructedSessionCount > 0) "${app.reconstructedSessionCount} session${if (app.reconstructedSessionCount != 1) "s" else ""} • Tap for session history" else "No recorded sessions • Tap for details",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )

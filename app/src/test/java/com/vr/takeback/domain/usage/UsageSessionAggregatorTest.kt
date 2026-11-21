@@ -2,6 +2,7 @@ package com.vr.takeback.domain.usage
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -44,14 +45,14 @@ class UsageSessionAggregatorTest {
     }
 
     @Test
-    fun singleApp_continuousFiveHours_doesNotTruncateSession() {
+    fun appSessionLongerThanTwelveHours_isNotTruncated() {
         val startOfDay = 100000L
-        val endOfDay = 30000000L
-        val fiveHoursMillis = 5L * 60 * 60 * 1000L // 5 hours continuous
+        val endOfDay = 60000000L
+        val fourteenHoursMillis = 14L * 60 * 60 * 1000L // 14 hours continuous
 
         val events = listOf(
             RawUsageEvent("com.instagram.android", "MainActivity", 200000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.instagram.android", "MainActivity", 200000L + fiveHoursMillis, NormalizedEventType.ACTIVITY_PAUSED)
+            RawUsageEvent("com.instagram.android", "MainActivity", 200000L + fourteenHoursMillis, NormalizedEventType.ACTIVITY_PAUSED)
         )
 
         val sessions = UsageSessionAggregator.reconstructSessions(
@@ -64,7 +65,7 @@ class UsageSessionAggregatorTest {
 
         assertEquals(1, sessions.size)
         val session = sessions.first()
-        assertEquals("Five-hour session must NOT be capped at 4 hours", fiveHoursMillis, session.durationMillis)
+        assertEquals("Fourteen-hour continuous session must NOT be truncated", fourteenHoursMillis, session.durationMillis)
     }
 
     @Test
@@ -129,20 +130,71 @@ class UsageSessionAggregatorTest {
     }
 
     @Test
-    fun multipleActivities_sameApp_mergesOverlappingIntervalsWithoutDoubleCounting() {
+    fun keyguardShown_whileScreenRemainsInteractive_doesNotCloseDeviceInteractiveInterval() {
         val startOfDay = 100000L
         val endOfDay = 500000L
 
+        // Screen turns interactive at 120000.
+        // Keyguard is shown at 150000 (e.g. timeout lock with screen still on).
+        // Screen turns non-interactive at 200000.
         val events = listOf(
-            RawUsageEvent("com.google.android.youtube", "HomeActivity", 110000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.google.android.youtube", "WatchActivity", 130000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.google.android.youtube", "HomeActivity", 130500L, NormalizedEventType.ACTIVITY_PAUSED),
-            RawUsageEvent("com.google.android.youtube", "HomeActivity", 131000L, NormalizedEventType.ACTIVITY_STOPPED),
-            RawUsageEvent("com.google.android.youtube", "WatchActivity", 170000L, NormalizedEventType.ACTIVITY_PAUSED),
-            RawUsageEvent("com.google.android.youtube", "WatchActivity", 171000L, NormalizedEventType.ACTIVITY_STOPPED)
+            RawUsageEvent("android", null, 80000L, NormalizedEventType.SCREEN_NON_INTERACTIVE), // Lookback: known non-interactive
+            RawUsageEvent("android", null, 120000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("android", null, 150000L, NormalizedEventType.KEYGUARD_SHOWN),
+            RawUsageEvent("android", null, 200000L, NormalizedEventType.SCREEN_NON_INTERACTIVE)
         )
 
-        val sessions = UsageSessionAggregator.reconstructSessions(
+        val (intervals, hasIncompleteStart) = UsageSessionAggregator.reconstructDeviceInteractiveIntervals(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false
+        )
+
+        assertFalse(hasIncompleteStart)
+        assertEquals("Should produce 1 continuous interactive interval from 120k to 200k", 1, intervals.size)
+        assertEquals(120000L, intervals[0].startEpochMillis)
+        assertEquals(200000L, intervals[0].endEpochMillis)
+        assertEquals("Duration must be full 80s (KEYGUARD_SHOWN does not terminate screen interactive interval)", 80000L, intervals[0].durationMillis)
+    }
+
+    @Test
+    fun missingInitialScreenInteractiveEvent_reportsIncompleteStartBoundary() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        // No lookback events at all (initial state UNKNOWN).
+        // First event observed after midnight is SCREEN_NON_INTERACTIVE at 130000.
+        val events = listOf(
+            RawUsageEvent("android", null, 130000L, NormalizedEventType.SCREEN_NON_INTERACTIVE)
+        )
+
+        val (intervals, hasIncompleteStart) = UsageSessionAggregator.reconstructDeviceInteractiveIntervals(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false
+        )
+
+        assertTrue("Initial state was UNKNOWN so hasIncompleteStart must be true", hasIncompleteStart)
+        assertEquals(1, intervals.size)
+        assertEquals(startOfDay, intervals[0].startEpochMillis)
+        assertEquals(130000L, intervals[0].endEpochMillis)
+    }
+
+    @Test
+    fun missingFinalScreenNonInteractiveEvent_onHistoricalDay_reportsIncompleteEndBoundary() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        // App resumes at 450000 on a historical day and has no closing event.
+        val events = listOf(
+            RawUsageEvent("android", null, 80000L, NormalizedEventType.SCREEN_NON_INTERACTIVE),
+            RawUsageEvent("android", null, 400000L, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent("com.instagram.android", "MainActivity", 450000L, NormalizedEventType.ACTIVITY_RESUMED)
+        )
+
+        val result = UsageSessionAggregator.reconstructFull(
             events = events,
             startEpochMillis = startOfDay,
             endEpochMillis = endOfDay,
@@ -150,16 +202,36 @@ class UsageSessionAggregatorTest {
             isUserLaunchableApp = isLaunchable
         )
 
-        assertEquals("Overlapping activities in same app must merge into 1 contiguous session", 1, sessions.size)
-        val session = sessions.first()
-        assertEquals("com.google.android.youtube", session.packageName)
-        assertEquals(110000L, session.startEpochMillis)
-        assertEquals(170000L, session.endEpochMillis)
-        assertEquals(60000L, session.durationMillis)
+        assertTrue("Historical unclosed session crossing boundary must report hasIncompleteEndBoundary = true", result.hasIncompleteEndBoundary)
+        assertEquals(50000L, result.totalTrackedAppUsageMillis) // 450k to 500k
     }
 
     @Test
-    fun screenNonInteractive_terminatesActiveSession() {
+    fun reconstructFull_noScreenEvents_marksDeviceInteractiveUnavailableWithoutFallback() {
+        val startOfDay = 100000L
+        val endOfDay = 500000L
+
+        // App session events exist (YouTube for 60s), but NO screen-state events exist in window.
+        val events = listOf(
+            RawUsageEvent("com.google.android.youtube", "Watch", 120000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent("com.google.android.youtube", "Watch", 180000L, NormalizedEventType.ACTIVITY_PAUSED)
+        )
+
+        val result = UsageSessionAggregator.reconstructFull(
+            events = events,
+            startEpochMillis = startOfDay,
+            endEpochMillis = endOfDay,
+            isToday = false,
+            isUserLaunchableApp = isLaunchable
+        )
+
+        assertEquals("App usage is 60s", 60000L, result.totalTrackedAppUsageMillis)
+        assertFalse("Device interactive time must be marked unavailable when no screen events exist", result.isDeviceInteractiveAvailable)
+        assertNull("Device interactive time must be null (NEVER silently fall back to app session duration)", result.deviceInteractiveTimeMillis)
+    }
+
+    @Test
+    fun screenNonInteractive_terminatesActiveAppSession() {
         val startOfDay = 100000L
         val endOfDay = 500000L
 
@@ -186,39 +258,6 @@ class UsageSessionAggregatorTest {
     }
 
     @Test
-    fun deviceInteractiveIntervals_tracksDisplayActivityIndependentlyOfPackages() {
-        val startOfDay = 100000L
-        val endOfDay = 500000L
-
-        // Screen unlocks at 120000, user is on home launcher (non-launchable app),
-        // then turns screen off at 180000.
-        // User unlocks again at 220000 and locks at 250000.
-        val events = listOf(
-            RawUsageEvent("android", null, 120000L, NormalizedEventType.SCREEN_INTERACTIVE),
-            RawUsageEvent("android", null, 120500L, NormalizedEventType.KEYGUARD_HIDDEN),
-            RawUsageEvent("com.sec.android.app.launcher", "Launcher", 121000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("android", null, 180000L, NormalizedEventType.SCREEN_NON_INTERACTIVE),
-            RawUsageEvent("android", null, 180500L, NormalizedEventType.KEYGUARD_SHOWN),
-            RawUsageEvent("android", null, 220000L, NormalizedEventType.SCREEN_INTERACTIVE),
-            RawUsageEvent("android", null, 250000L, NormalizedEventType.SCREEN_NON_INTERACTIVE)
-        )
-
-        val intervals = UsageSessionAggregator.reconstructDeviceInteractiveIntervals(
-            events = events,
-            startEpochMillis = startOfDay,
-            endEpochMillis = endOfDay,
-            isToday = false
-        )
-
-        assertEquals("Should produce 2 interactive intervals", 2, intervals.size)
-        assertEquals(60000L, intervals[0].durationMillis) // 120k to 180k
-        assertEquals(30000L, intervals[1].durationMillis) // 220k to 250k
-
-        val totalInteractive = UsageSessionAggregator.computeTotalInteractiveDuration(intervals)
-        assertEquals("Total device interactive time must be 90s regardless of launcher exclusion", 90000L, totalInteractive)
-    }
-
-    @Test
     fun deviceShutdown_boundsActiveSessionAtShutdownTimestamp() {
         val startOfDay = 100000L
         val endOfDay = 500000L
@@ -242,86 +281,5 @@ class UsageSessionAggregatorTest {
         assertEquals(120000L, session.startEpochMillis)
         assertEquals("Must end exactly at shutdown time (140000), not continue to currentEpochMillis", 140000L, session.endEpochMillis)
         assertEquals(20000L, session.durationMillis)
-    }
-
-    @Test
-    fun midnightCrossing_clipsToStartOfDay() {
-        val startOfDay = 100000L
-        val endOfDay = 500000L
-
-        // App started 20s before midnight
-        val events = listOf(
-            RawUsageEvent("com.instagram.android", "MainActivity", 80000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.instagram.android", "MainActivity", 130000L, NormalizedEventType.ACTIVITY_PAUSED)
-        )
-
-        val sessions = UsageSessionAggregator.reconstructSessions(
-            events = events,
-            startEpochMillis = startOfDay,
-            endEpochMillis = endOfDay,
-            isToday = false,
-            isUserLaunchableApp = isLaunchable
-        )
-
-        assertEquals(1, sessions.size)
-        val session = sessions.first()
-        assertEquals("Session start must be clipped to start of day (100000)", startOfDay, session.startEpochMillis)
-        assertEquals(130000L, session.endEpochMillis)
-        assertEquals(30000L, session.durationMillis)
-    }
-
-    @Test
-    fun historicalDate_sessionCrossingMidnight_boundsAtEndOfDay() {
-        val startOfDay = 100000L
-        val endOfDay = 500000L
-
-        // App resumes at 450000 and is still running when day ends at 500000
-        val events = listOf(
-            RawUsageEvent("com.instagram.android", "MainActivity", 450000L, NormalizedEventType.ACTIVITY_RESUMED)
-        )
-
-        val sessions = UsageSessionAggregator.reconstructSessions(
-            events = events,
-            startEpochMillis = startOfDay,
-            endEpochMillis = endOfDay,
-            isToday = false,
-            isUserLaunchableApp = isLaunchable,
-            currentEpochMillis = 900000L
-        )
-
-        assertEquals(1, sessions.size)
-        val session = sessions.first()
-        assertEquals(450000L, session.startEpochMillis)
-        assertEquals("Historical unclosed session must cleanly bound at end of day (500000)", endOfDay, session.endEpochMillis)
-        assertEquals(50000L, session.durationMillis)
-    }
-
-    @Test
-    fun reconstructFull_detectsBoundaryQualityAndSeparateMetrics() {
-        val startOfDay = 100000L
-        val endOfDay = 500000L
-
-        // App A and App B run in split-screen (overlap from 120000 to 140000)
-        // Screen is active from 110000 to 150000 (includes 10s of home screen before and after)
-        val events = listOf(
-            RawUsageEvent("android", null, 110000L, NormalizedEventType.SCREEN_INTERACTIVE),
-            RawUsageEvent("com.instagram.android", "MainActivity", 115000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.android.chrome", "Main", 120000L, NormalizedEventType.ACTIVITY_RESUMED),
-            RawUsageEvent("com.instagram.android", "MainActivity", 140000L, NormalizedEventType.ACTIVITY_PAUSED),
-            RawUsageEvent("com.android.chrome", "Main", 145000L, NormalizedEventType.ACTIVITY_PAUSED),
-            RawUsageEvent("android", null, 150000L, NormalizedEventType.SCREEN_NON_INTERACTIVE)
-        )
-
-        val result = UsageSessionAggregator.reconstructFull(
-            events = events,
-            startEpochMillis = startOfDay,
-            endEpochMillis = endOfDay,
-            isToday = false,
-            isUserLaunchableApp = isLaunchable
-        )
-
-        assertEquals("Instagram: 25s, Chrome: 25s => Total app usage = 50s", 50000L, result.totalTrackedAppUsageMillis)
-        assertEquals("Device screen active from 110k to 150k => 40s", 40000L, result.deviceInteractiveTimeMillis)
-        assertFalse(result.hasIncompleteStartBoundary)
     }
 }

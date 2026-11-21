@@ -53,7 +53,7 @@ class UsageDataQualityTest {
             packageName = "com.instagram.android",
             appLabel = "Instagram",
             foregroundDurationMillis = 3600000L,
-            launchCount = 8,
+            reconstructedSessionCount = 8,
             lastTimeUsedMillis = 1732140000000L,
             dataSource = "UsageEvents",
             qualityStatus = UsageDataQuality.RECONSTRUCTED_COMPLETE,
@@ -64,6 +64,8 @@ class UsageDataQualityTest {
 
         assertEquals("com.instagram.android", app.packageName)
         assertEquals(3600000L, app.foregroundDurationMillis)
+        assertEquals(8, app.reconstructedSessionCount)
+        @Suppress("DEPRECATION")
         assertEquals(8, app.launchCount)
         assertEquals(UsageDataQuality.RECONSTRUCTED_COMPLETE, app.qualityStatus)
     }

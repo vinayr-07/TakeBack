@@ -4,12 +4,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -19,7 +16,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -71,7 +67,7 @@ fun UsageDiagnosticsScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Raw OS vs Reconstructed Screen Time",
+                            text = "Empirical Measured Comparison",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -151,7 +147,7 @@ fun UsageDiagnosticsScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Ground-Truth Comparison",
+                                    text = "Measured Totals (Same Package Population)",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold
                                 )
@@ -172,57 +168,38 @@ fun UsageDiagnosticsScreen(
                             Spacer(modifier = Modifier.height(14.dp))
 
                             DiagnosticRow(
-                                label = "TakeBack Device Interactive Time",
-                                value = formatMinutesSeconds(diagnostics.calculationDiagnostics.deviceScreenOnTimeMillis),
+                                label = "Device Interactive Display Time",
+                                value = if (diagnostics.totals.isDeviceInteractiveAvailable && diagnostics.totals.deviceInteractiveTimeMillis != null) {
+                                    formatMinutesSeconds(diagnostics.totals.deviceInteractiveTimeMillis)
+                                } else {
+                                    "Unavailable"
+                                },
                                 isHighlight = true,
-                                color = MaterialTheme.colorScheme.primary
+                                color = MaterialTheme.colorScheme.primary,
+                                subtitle = "Screen display active/interactive duration"
                             )
                             DiagnosticRow(
-                                label = "TakeBack Total App Time (Sum)",
-                                value = formatMinutesSeconds(diagnostics.calculationDiagnostics.totalAppUsageMillis)
+                                label = "TakeBack Reconstructed Eligible App Time",
+                                value = formatMinutesSeconds(diagnostics.totals.eligibleTakeBackReconstructedTotalMillis),
+                                subtitle = "${diagnostics.filterDiagnostics.eligiblePackagesCount} eligible user applications"
                             )
                             DiagnosticRow(
-                                label = "OS queryAndAggregateUsageStats()",
-                                value = formatMinutesSeconds(diagnostics.rawOsResults.queryAndAggregateTotalMillis),
-                                subtitle = "Unrotated interval bucket (${diagnostics.rawOsResults.queryAndAggregatePackageCount} pkgs)"
+                                label = "OS queryAndAggregate (Eligible Apps Only)",
+                                value = formatMinutesSeconds(diagnostics.totals.eligibleAggregateTotalMillis),
+                                subtitle = "Same ${diagnostics.filterDiagnostics.eligiblePackagesCount} eligible applications in OS aggregation"
                             )
                             DiagnosticRow(
-                                label = "OS queryUsageStats(INTERVAL_DAILY)",
-                                value = formatMinutesSeconds(diagnostics.rawOsResults.dailyIntervalTotalMillis),
-                                subtitle = "${diagnostics.rawOsResults.dailyBucketCount} daily file buckets"
+                                label = "Disparity on Eligible Apps",
+                                value = formatMinutesSeconds(diagnostics.totals.eligibleDifferenceMillis),
+                                subtitle = "OS Aggregate minus TakeBack Reconstructed on identical apps",
+                                isHighlight = true,
+                                color = MaterialTheme.colorScheme.tertiary
                             )
                             DiagnosticRow(
-                                label = "Raw UsageEvents In Interval",
-                                value = "${diagnostics.rawOsResults.eventCount} events",
-                                subtitle = "Span: ${diagnostics.rawOsResults.firstEventTimestampFormatted ?: "-"} to ${diagnostics.rawOsResults.lastEventTimestampFormatted ?: "-"}"
+                                label = "OS queryAndAggregate (All Packages)",
+                                value = formatMinutesSeconds(diagnostics.totals.allPackagesAggregateTotalMillis),
+                                subtitle = "Includes system daemons, wallpaper, and background packages (${diagnostics.filterDiagnostics.totalPackagesEvaluated} total)"
                             )
-
-                            val overReportingMillis = diagnostics.rawOsResults.queryAndAggregateTotalMillis - diagnostics.calculationDiagnostics.totalAppUsageMillis
-                            if (overReportingMillis > 0) {
-                                Spacer(modifier = Modifier.height(10.dp))
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(10.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.Info,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.tertiary,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Text(
-                                            text = "OS aggregate over-reported by ${formatMinutesSeconds(overReportingMillis)} due to pre-midnight bucket overlap.",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onTertiaryContainer
-                                        )
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -247,11 +224,14 @@ fun UsageDiagnosticsScreen(
                             MetadataText("End (Exclusive): ${diagnostics.queryInfo.endFormatted}")
                             MetadataText("API Level: ${diagnostics.queryInfo.apiLevel}")
                             MetadataText("Permission: ${if (diagnostics.queryInfo.hasUsagePermission) "Granted" else "Denied"}")
+                            MetadataText("Event Count: ${diagnostics.eventCount}")
+                            MetadataText("First Event: ${diagnostics.firstEventTimestampFormatted ?: "None"}")
+                            MetadataText("Last Event: ${diagnostics.lastEventTimestampFormatted ?: "None"}")
                         }
                     }
                 }
 
-                // Package Filtering Breakdown Card
+                // Per-Package Comparison Matrix Card
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -261,42 +241,62 @@ fun UsageDiagnosticsScreen(
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                text = "Package Filtering Policy",
+                                text = "Top Packages Comparison Matrix",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "${diagnostics.filterDiagnostics.eligiblePackagesCount} Included • ${diagnostics.filterDiagnostics.excludedPackagesCount} Excluded (${diagnostics.filterDiagnostics.totalPackagesEvaluated} total evaluated)",
+                                text = "Comparing identical package durations across OS queryAndAggregate and TakeBack",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
 
                             Spacer(modifier = Modifier.height(12.dp))
 
-                            // Show filter decision samples
-                            diagnostics.filterDiagnostics.filterDecisions.entries.take(15).forEach { (pkg, reason) ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
+                            diagnostics.packageMatrix.take(15).forEach { pkg ->
+                                Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Text(
-                                            text = pkg,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            fontWeight = FontWeight.Medium
+                                            text = pkg.appLabel,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Bold
                                         )
                                         Text(
-                                            text = reason,
+                                            text = "Diff: ${formatMinutesSeconds(pkg.differenceMillis)}",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (reason.startsWith("INCLUDED")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (pkg.differenceMillis > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                    Text(
+                                        text = "${pkg.packageName} • ${pkg.filterDecision}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "OS: ${formatMinutesSeconds(pkg.queryAndAggregateMillis)}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = "TakeBack: ${formatMinutesSeconds(pkg.takeBackReconstructedMillis)}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.primary
                                         )
                                     }
                                 }
-                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                             }
                         }
                     }
