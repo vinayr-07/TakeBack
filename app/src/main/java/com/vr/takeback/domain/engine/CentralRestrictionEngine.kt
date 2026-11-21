@@ -264,16 +264,17 @@ class CentralRestrictionEngine {
     ): BlockDecision {
         if (profile.usageLimits.isEmpty()) return BlockDecision.Allowed
 
-        // Defect 1: Check data availability before evaluating usage limits.
-        // When data is genuinely absent (not merely stale), we must not silently treat
-        // missing entries as zero usage – that would allow bypassing limits.
-        // However, we must also not block an app simply because a query failed.
-        val dataAbsent = !snapshot.isUsageDataAvailable && when (snapshot.usageDataQuality) {
+        // Build 8 Issue 2 & 3: Check data availability before evaluating usage limits.
+        // When data is unavailable or unverified, missing entries must not be silently treated
+        // as zero usage. However, innocent apps must also not be blocked on query failure (fail-open),
+        // while apps that already reached their limit on the same day remain restricted (last-known state).
+        val dataAbsent = !snapshot.isUsageDataAvailable || when (snapshot.usageDataQuality) {
             UsageDataQuality.PERMISSION_DENIED,
             UsageDataQuality.QUERY_FAILED,
-            UsageDataQuality.UNKNOWN -> true
+            UsageDataQuality.UNKNOWN,
+            UsageDataQuality.HISTORY_EXPIRED,
             UsageDataQuality.STALE -> true
-            else -> false // PROVISIONAL, RECONSTRUCTED_PARTIAL, RECONSTRUCTED_COMPLETE are present
+            else -> false
         }
 
         for (limit in profile.usageLimits) {

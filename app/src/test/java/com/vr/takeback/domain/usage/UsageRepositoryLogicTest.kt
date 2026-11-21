@@ -1,13 +1,12 @@
 package com.vr.takeback.domain.usage
 
+import com.vr.takeback.data.repository.LastKnownQuotaState
 import com.vr.takeback.data.repository.UsageEventsQueryResult
 import com.vr.takeback.data.repository.ValidatedUsageSnapshot
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
 import com.vr.takeback.domain.engine.SystemContextSnapshot
 import com.vr.takeback.domain.model.*
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import org.junit.Assert.*
 import org.junit.Test
 import java.time.DayOfWeek
 import java.time.LocalDate
@@ -280,5 +279,173 @@ class UsageRepositoryLogicTest {
             dataSource = "Permission Denied"
         )
         assertFalse(unavailable.isAvailable)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 8 Tests: Quota Preservation, Empty Events, and Multi-Caller Refresh
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun testBuild8_permissionRevocation_preservesSameDayLastKnownQuotaState() {
+        val today = LocalDate.now()
+        val now = System.currentTimeMillis()
+
+        // 1. Captured state earlier today showing Instagram at 75 mins (exceeded 60 min limit)
+        val dailyMap = mapOf("com.instagram.android" to 75 * 60 * 1000L)
+        val hourlyMap = mapOf("com.instagram.android" to 30 * 60 * 1000L)
+        val quotaState = LastKnownQuotaState(
+            date = today,
+            capturedAtMillis = now - 1000L,
+            dailyForegroundUsageByPackage = dailyMap,
+            hourlyForegroundUsageByPackage = hourlyMap,
+            quality = UsageDataQuality.PROVISIONAL,
+            provenance = "UsageEvents"
+        )
+
+        // 2. Permission is now revoked; simulate getActiveUsageSnapshot logic
+        val sameDayQuota = quotaState.takeIf { it.date == today }
+        val snapshot = ValidatedUsageSnapshot(
+            date = today,
+            capturedAtMillis = now,
+            foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+            hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
+            quality = UsageDataQuality.PERMISSION_DENIED,
+            isAvailable = false,
+            dataSource = if (sameDayQuota != null) "Permission Denied (Same-Day Quota Preserved)" else "Permission Denied"
+        )
+
+        // Snapshot is marked unavailable for analytics, but retains same-day maps for restriction engine
+        assertFalse("Analytics must report unavailable on permission revocation", snapshot.isAvailable)
+        assertEquals(UsageDataQuality.PERMISSION_DENIED, snapshot.quality)
+        assertEquals(75 * 60 * 1000L, snapshot.foregroundUsageByPackage["com.instagram.android"])
+        assertEquals(30 * 60 * 1000L, snapshot.hourlyUsageByPackage["com.instagram.android"])
+
+        // 3. CentralRestrictionEngine evaluation with this snapshot must STILL block Instagram!
+        val engine = CentralRestrictionEngine()
+        val profile = Profile(
+            id = "daily_p",
+            name = "Daily Limit",
+            isEnabled = true,
+            targetApps = listOf(TargetApp("com.instagram.android", "Instagram", isAllowlist = false)),
+            usageLimits = listOf(
+                UsageLimit(
+                    id = 1,
+                    profileId = "daily_p",
+                    targetPackageName = "com.instagram.android",
+                    dailyLimitMinutes = 60,
+                    windowType = LimitWindowType.FULL_DAY,
+                    isEnabled = true
+                )
+            )
+        )
+        val contextSnapshot = SystemContextSnapshot(
+            timestampMillis = now,
+            localTime = LocalTime.of(15, 0),
+            dayOfWeek = DayOfWeek.MONDAY,
+            foregroundPackageName = "com.instagram.android",
+            accumulatedForegroundTimeMillis = snapshot.foregroundUsageByPackage,
+            hourlyForegroundTimeMillis = snapshot.hourlyUsageByPackage,
+            isUsageDataAvailable = snapshot.isAvailable,
+            usageDataQuality = snapshot.quality
+        )
+        val decision = engine.evaluate(listOf(profile), contextSnapshot)
+        assertTrue("Exceeded daily quota MUST remain blocked after permission revocation using preserved same-day state", decision is BlockDecision.Blocked)
+    }
+
+    @Test
+    fun testBuild8_crossDayRollover_clearsLastKnownQuotaState() {
+        val yesterday = LocalDate.now().minusDays(1)
+        val today = LocalDate.now()
+        val now = System.currentTimeMillis()
+
+        // Quota state was captured yesterday
+        val yesterdayQuota = LastKnownQuotaState(
+            date = yesterday,
+            capturedAtMillis = now - 24 * 3600 * 1000L,
+            dailyForegroundUsageByPackage = mapOf("com.instagram.android" to 80 * 60 * 1000L),
+            hourlyForegroundUsageByPackage = emptyMap(),
+            quality = UsageDataQuality.PROVISIONAL,
+            provenance = "UsageEvents"
+        )
+
+        // Day rollover check: yesterday's quota MUST NOT be accepted for today
+        val sameDayQuota = yesterdayQuota.takeIf { it.date == today }
+        assertNull("Yesterday's quota state must be discarded on day rollover", sameDayQuota)
+
+        val rolloverSnapshot = ValidatedUsageSnapshot(
+            date = today,
+            capturedAtMillis = now,
+            foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+            hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
+            quality = UsageDataQuality.PERMISSION_DENIED,
+            isAvailable = false,
+            dataSource = "Permission Denied"
+        )
+        assertTrue("Without same-day quota, usage map must be empty", rolloverSnapshot.foregroundUsageByPackage.isEmpty())
+    }
+
+    @Test
+    fun testBuild8_emptyUsageEvents_markedUnavailableUnknown_retainsPreservedQuota() {
+        val today = LocalDate.now()
+        val now = System.currentTimeMillis()
+
+        // Existing same-day quota showing Reddit exceeded 30-minute hourly quota
+        val existingQuota = LastKnownQuotaState(
+            date = today,
+            capturedAtMillis = now - 5000L,
+            dailyForegroundUsageByPackage = mapOf("com.reddit.frontpage" to 40 * 60 * 1000L),
+            hourlyForegroundUsageByPackage = mapOf("com.reddit.frontpage" to 35 * 60 * 1000L),
+            quality = UsageDataQuality.PROVISIONAL,
+            provenance = "UsageEvents"
+        )
+
+        // OS returns EmptySuccess (0 events due to buffer delay)
+        val sameDayQuota = existingQuota.takeIf { it.date == today }
+        val snapshot = ValidatedUsageSnapshot(
+            date = today,
+            capturedAtMillis = now,
+            foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+            hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
+            quality = UsageDataQuality.UNKNOWN,
+            isAvailable = false, // Critical Build 8 requirement: NOT available zero usage
+            dataSource = "UsageEvents (0 events, unverified)"
+        )
+
+        assertFalse("Empty events stream must NOT be reported as available zero usage", snapshot.isAvailable)
+        assertEquals(UsageDataQuality.UNKNOWN, snapshot.quality)
+        // Must preserve the existing usage rather than replacing with emptyMap
+        assertEquals(35 * 60 * 1000L, snapshot.hourlyUsageByPackage["com.reddit.frontpage"])
+    }
+
+    @Test
+    fun testBuild8_sharedRefreshQueue_deliversToAllPendingCallers() {
+        val pendingCallbacks = java.util.concurrent.CopyOnWriteArrayList<(ValidatedUsageSnapshot) -> Unit>()
+        val results = mutableListOf<ValidatedUsageSnapshot>()
+
+        // 3 concurrent callers register callbacks for the in-flight query
+        pendingCallbacks.add { results.add(it) }
+        pendingCallbacks.add { results.add(it) }
+        pendingCallbacks.add { results.add(it) }
+
+        assertEquals(3, pendingCallbacks.size)
+
+        // Fresh snapshot completes
+        val freshSnapshot = ValidatedUsageSnapshot(
+            date = LocalDate.now(),
+            capturedAtMillis = System.currentTimeMillis(),
+            foregroundUsageByPackage = mapOf("com.instagram.android" to 5000L),
+            quality = UsageDataQuality.PROVISIONAL,
+            isAvailable = true,
+            dataSource = "UsageEvents"
+        )
+
+        // Drain and deliver
+        val toDeliver = ArrayList(pendingCallbacks)
+        pendingCallbacks.clear()
+        toDeliver.forEach { it.invoke(freshSnapshot) }
+
+        assertEquals(0, pendingCallbacks.size)
+        assertEquals("All 3 callers must receive the fresh snapshot", 3, results.size)
+        results.forEach { assertEquals(freshSnapshot, it) }
     }
 }

@@ -96,6 +96,23 @@ data class ValidatedUsageSnapshot(
     val hourlyUsageByPackage: Map<String, Long> = emptyMap()
 )
 
+/**
+ * Build 8 Issue 2: Dedicated state container for same-day last-known quota enforcement.
+ * Kept strictly independent from live analytics data availability:
+ * - If Usage Access permission is revoked or system queries fail, this state preserves
+ *   the daily and hourly usage maps previously captured on the same local date.
+ * - This prevents already-exceeded quota restrictions from being silently bypassed.
+ * - Discarded upon local midnight rollover (never uses yesterday's usage for today).
+ */
+data class LastKnownQuotaState(
+    val date: LocalDate,
+    val capturedAtMillis: Long,
+    val dailyForegroundUsageByPackage: Map<String, Long>,
+    val hourlyForegroundUsageByPackage: Map<String, Long>,
+    val quality: UsageDataQuality,
+    val provenance: String
+)
+
 class UsageStatsRepository(private val context: Context) {
 
     companion object {
@@ -134,6 +151,12 @@ class UsageStatsRepository(private val context: Context) {
 
     @Volatile
     private var lastValidatedSnapshot: ValidatedUsageSnapshot? = null
+
+    // Build 8 Issue 2: Separate, same-day last-known quota state for restriction enforcement
+    @Volatile
+    private var lastKnownQuotaState: LastKnownQuotaState? = null
+
+    fun getLastKnownQuotaState(): LastKnownQuotaState? = lastKnownQuotaState
 
     fun getLatestDiagnostics(): UsageDiagnostics? = latestDiagnostics
 
@@ -216,34 +239,50 @@ class UsageStatsRepository(private val context: Context) {
         val today = LocalDate.now()
         val now = System.currentTimeMillis()
 
+        // Discard previous day's quota state upon day rollover (never use yesterday's quota for today)
+        if (lastKnownQuotaState?.date != today) {
+            lastKnownQuotaState = null
+        }
+
         if (!hasUsagePermission() || usageStatsManager == null) {
-            lastValidatedSnapshot = null
+            // Build 8 Issue 2: Preserve same-day last-known quota state when permission is revoked.
+            // Analytics is marked unavailable (isAvailable = false, quality = PERMISSION_DENIED),
+            // but the last known daily/hourly maps from earlier today are retained so CentralRestrictionEngine
+            // does not silently allow an already-exceeded quota.
+            val sameDayQuota = lastKnownQuotaState?.takeIf { it.date == today }
             return ValidatedUsageSnapshot(
                 date = today,
                 capturedAtMillis = now,
-                foregroundUsageByPackage = emptyMap(),
+                foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+                hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                 quality = UsageDataQuality.PERMISSION_DENIED,
                 isAvailable = false,
-                dataSource = "Permission Denied"
+                dataSource = if (sameDayQuota != null) "Permission Denied (Same-Day Quota Preserved)" else "Permission Denied"
             )
         }
 
-        val snapshot = lastValidatedSnapshot ?: return ValidatedUsageSnapshot(
-            date = today,
-            capturedAtMillis = now,
-            foregroundUsageByPackage = emptyMap(),
-            quality = UsageDataQuality.UNKNOWN,
-            isAvailable = false,
-            dataSource = "No Snapshot"
-        )
+        val snapshot = lastValidatedSnapshot ?: run {
+            val sameDayQuota = lastKnownQuotaState?.takeIf { it.date == today }
+            return ValidatedUsageSnapshot(
+                date = today,
+                capturedAtMillis = now,
+                foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+                hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
+                quality = UsageDataQuality.UNKNOWN,
+                isAvailable = false,
+                dataSource = if (sameDayQuota != null) "Unloaded (Same-Day Quota Preserved)" else "No Snapshot"
+            )
+        }
 
         // Requirement 4: Never use yesterday's snapshot for today's quota
         if (snapshot.date != today) {
             lastValidatedSnapshot = null
+            lastKnownQuotaState = null
             return ValidatedUsageSnapshot(
                 date = today,
                 capturedAtMillis = now,
                 foregroundUsageByPackage = emptyMap(),
+                hourlyUsageByPackage = emptyMap(),
                 quality = UsageDataQuality.STALE,
                 isAvailable = false,
                 dataSource = "Cross-day Stale"
@@ -285,14 +324,15 @@ class UsageStatsRepository(private val context: Context) {
         val today = LocalDate.now(zone)
 
         if (!hasUsagePermission() || usageStatsManager == null) {
-            lastValidatedSnapshot = null
+            val sameDayQuota = lastKnownQuotaState?.takeIf { it.date == today }
             return@withContext ValidatedUsageSnapshot(
                 date = today,
                 capturedAtMillis = now,
-                foregroundUsageByPackage = emptyMap(),
+                foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+                hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                 quality = UsageDataQuality.PERMISSION_DENIED,
                 isAvailable = false,
-                dataSource = "Permission Denied"
+                dataSource = if (sameDayQuota != null) "Permission Denied (Same-Day Quota Preserved)" else "Permission Denied"
             )
         }
 
@@ -355,22 +395,28 @@ class UsageStatsRepository(private val context: Context) {
                 )
             }
             is UsageEventsQueryResult.EmptySuccess -> {
-                // Defect 5: Empty events for today is PROVISIONAL (device may simply be idle so far).
-                // It is NOT a verified zero; we cannot confirm the event buffer is not simply empty early.
+                // Build 8 Issue 3: Empty events is an unverified empty history, NOT verified zero usage.
+                // A successful query returning 0 events does not prove zero usage occurred (events could
+                // be unbuffered, delayed, or dropped by OS).
+                // It must NOT overwrite same-day last-known quota state with an empty map.
+                val sameDayQuota = lastKnownQuotaState?.takeIf { it.date == today }
                 ValidatedUsageSnapshot(
                     date = today,
                     capturedAtMillis = now,
-                    foregroundUsageByPackage = emptyMap(),
-                    quality = UsageDataQuality.PROVISIONAL,
-                    isAvailable = true, // plausible: genuinely no use yet today
-                    dataSource = "UsageEvents (0 events)"
+                    foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+                    hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
+                    quality = UsageDataQuality.UNKNOWN,
+                    isAvailable = false, // Unverified: empty stream does not assert available zero usage
+                    dataSource = "UsageEvents (0 events, unverified)"
                 )
             }
             is UsageEventsQueryResult.SecurityError -> {
+                val sameDayQuota = lastKnownQuotaState?.takeIf { it.date == today }
                 ValidatedUsageSnapshot(
                     date = today,
                     capturedAtMillis = now,
-                    foregroundUsageByPackage = lastValidatedSnapshot?.takeIf { it.date == today }?.foregroundUsageByPackage ?: emptyMap(),
+                    foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+                    hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                     quality = UsageDataQuality.PERMISSION_DENIED,
                     isAvailable = false,
                     dataSource = "SecurityException"
@@ -378,10 +424,12 @@ class UsageStatsRepository(private val context: Context) {
             }
             is UsageEventsQueryResult.QueryError,
             is UsageEventsQueryResult.NullResponse -> {
+                val sameDayQuota = lastKnownQuotaState?.takeIf { it.date == today }
                 ValidatedUsageSnapshot(
                     date = today,
                     capturedAtMillis = now,
-                    foregroundUsageByPackage = lastValidatedSnapshot?.takeIf { it.date == today }?.foregroundUsageByPackage ?: emptyMap(),
+                    foregroundUsageByPackage = sameDayQuota?.dailyForegroundUsageByPackage ?: emptyMap(),
+                    hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                     quality = UsageDataQuality.QUERY_FAILED,
                     isAvailable = false,
                     dataSource = "Query Failed"
@@ -390,6 +438,18 @@ class UsageStatsRepository(private val context: Context) {
         }
 
         lastValidatedSnapshot = snapshot
+
+        // Build 8 Issue 2: Update same-day last-known quota state on valid capture
+        if (snapshot.isAvailable && snapshot.date == today) {
+            lastKnownQuotaState = LastKnownQuotaState(
+                date = today,
+                capturedAtMillis = now,
+                dailyForegroundUsageByPackage = snapshot.foregroundUsageByPackage,
+                hourlyForegroundUsageByPackage = snapshot.hourlyUsageByPackage,
+                quality = snapshot.quality,
+                provenance = snapshot.dataSource
+            )
+        }
 
         // Build 7 Issue 6: Controlled idempotent checkpoint persistence reusing dailyReconstruction (no second full pass)
         if (snapshot.isAvailable && dailyReconstruction != null) {
@@ -621,30 +681,28 @@ class UsageStatsRepository(private val context: Context) {
                         diagnostics = buildErrorDiagnostics(targetDate, "System UsageEvents for $targetDate have been purged by OS")
                     )
                 } else {
-                    // Defect 5: Empty events within 7 days is NOT a verified zero.
-                    // For today: PROVISIONAL (device may not have been used yet today).
-                    // For yesterday or older within 7 days: RECONSTRUCTED_PARTIAL / UNKNOWN —
-                    // the buffer could have expired early or the day genuinely had no use.
-                    // We NEVER call this RECONSTRUCTED_COMPLETE (which asserts verified zero).
+                    // Build 8 Issue 3: Empty events is an unverified empty history, NOT verified zero usage.
+                    // An empty event query does not prove that zero usage occurred.
+                    // Must be represented as unavailable (isAvailable = false) rather than a verified zero.
                     val (quality, isAvailable) = when {
-                        isTargetToday -> Pair(UsageDataQuality.PROVISIONAL, true)
-                        daysAgo == 1L -> Pair(UsageDataQuality.RECONSTRUCTED_PARTIAL, false) // Cannot verify
+                        isTargetToday -> Pair(UsageDataQuality.UNKNOWN, false) // Unverified empty stream
+                        daysAgo == 1L -> Pair(UsageDataQuality.RECONSTRUCTED_PARTIAL, false) // Cannot verify past day
                         else -> Pair(UsageDataQuality.UNKNOWN, false)
                     }
-                    val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, if (isAvailable) 0L else null, quality)
+                    val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, null, quality)
                     return@withContext DailyUsageSummary(
                         selectedDate = targetDate,
                         totalTimeMillis = 0L,
-                        deviceScreenTimeMillis = if (isAvailable) 0L else null,
-                        isDeviceInteractiveAvailable = isAvailable,
+                        deviceScreenTimeMillis = null,
+                        isDeviceInteractiveAvailable = false,
                         topApps = emptyList(),
                         sessions = emptyList(),
                         weeklyOverview = weeklyOverview,
-                        isRealDataAvailable = isAvailable,
+                        isRealDataAvailable = false,
                         dataQuality = quality,
-                        dataSourceDescription = "UsageEvents (0 events observed; cannot confirm verified zero)",
+                        dataSourceDescription = "UsageEvents (0 events observed; unverified history)",
                         completeThroughTimestampMillis = endExclusive,
-                        diagnostics = if (!isAvailable) buildErrorDiagnostics(targetDate, "No UsageEvents within retention window; cannot verify zero usage") else null
+                        diagnostics = buildErrorDiagnostics(targetDate, "System UsageEvents stream is empty; unverified zero usage")
                     )
                 }
             }

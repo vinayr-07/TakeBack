@@ -551,7 +551,7 @@ class EndToEndUsageFlowTest {
     // -------------------------------------------------------------------------
     @Test
     fun testBuild7_screenOffDoesNotExtendApplicationSessionTime() {
-        val tracker = ForegroundSessionTracker { it.contains("launcher") }
+        val tracker = ForegroundSessionTracker { pkg -> pkg.contains("launcher") }
         val t0 = 1_000_000L
 
         // 1. Open Instagram at t0
@@ -563,13 +563,13 @@ class EndToEndUsageFlowTest {
         assertEquals(20 * 60 * 1000L, tracker.getCurrentSessionDuration(t20))
 
         // 3. Screen turns OFF at t20 (phone locked for 10 minutes)
-        tracker.onScreenStateChanged(isInteractive = false, timestampMillis = t20)
+        tracker.onScreenStateChanged(isInteractive = false, elapsedRealtimeMillis = t20)
         assertEquals("Session duration must be 0 while screen is off", 0L, tracker.getCurrentSessionDuration(t20 + 5 * 60 * 1000L))
 
         // 4. Screen turns ON and unlocked at t30 (10 minutes later)
         val t30 = t0 + 30 * 60 * 1000L
-        tracker.onScreenStateChanged(isInteractive = true, timestampMillis = t30)
-        tracker.onKeyguardChanged(isLocked = false, timestampMillis = t30)
+        tracker.onScreenStateChanged(isInteractive = true, elapsedRealtimeMillis = t30)
+        tracker.onKeyguardChanged(isLocked = false, elapsedRealtimeMillis = t30)
 
         // 5. User resumes Instagram for 5 minutes (at t35)
         val t35 = t30 + 5 * 60 * 1000L
@@ -584,7 +584,7 @@ class EndToEndUsageFlowTest {
     // -------------------------------------------------------------------------
     @Test
     fun testBuild7_launcherTransitionResetsSessionTime() {
-        val tracker = ForegroundSessionTracker { it.contains("launcher") }
+        val tracker = ForegroundSessionTracker { pkg -> pkg.contains("launcher") }
         val t0 = 1_000_000L
 
         // 1. Open Instagram for 20 minutes

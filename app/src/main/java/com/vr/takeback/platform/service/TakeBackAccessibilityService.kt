@@ -1,10 +1,13 @@
 package com.vr.takeback.platform.service
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -29,6 +32,7 @@ import kotlinx.coroutines.launch
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalTime
+import java.util.concurrent.CopyOnWriteArrayList
 
 class TakeBackAccessibilityService : AccessibilityService() {
 
@@ -62,39 +66,57 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private var lastBlockedPackage: String? = null
     private var lastBlockedTimestamp: Long = 0
 
-    // Build 7 Issue 3: Coherent foreground session tracker
-    val sessionTracker = ForegroundSessionTracker { pkg ->
-        pkg == applicationContext.packageName ||
-                pkg == "com.android.systemui" ||
-                pkg.contains("launcher", ignoreCase = true)
-    }
+    // Build 7 Issue 3 & Build 8 Issue 4: Monotonic elapsed realtime session tracker
+    val sessionTracker = ForegroundSessionTracker(
+        isExcludedPackage = { pkg ->
+            pkg == applicationContext.packageName ||
+                    pkg == "com.android.systemui" ||
+                    pkg.contains("launcher", ignoreCase = true)
+        },
+        elapsedRealtimeClock = { SystemClock.elapsedRealtime() }
+    )
 
-    // Build 7 Issue 4: Single-flight refresh job
+    // Build 8 Issue 1: Shared single-flight refresh queue
     @Volatile
     private var refreshJob: Job? = null
+    private val pendingRefreshCallbacks = CopyOnWriteArrayList<(ValidatedUsageSnapshot) -> Unit>()
 
     private var screenReceiver: BroadcastReceiver? = null
 
     /**
-     * Build 7 Issue 4: Real refresh throttling.
-     * Enforces minimum refresh interval, single-flight execution, and exponential failure retry backoff.
+     * Build 8 Issue 1: Shared single-flight refresh.
+     * Only one repository query executes at a time. Callers register callbacks that are
+     * preserved and delivered upon query completion.
      */
     fun triggerUsageSnapshotRefresh(
         force: Boolean = false,
         onFreshAvailable: ((ValidatedUsageSnapshot) -> Unit)? = null
     ) {
+        if (onFreshAvailable != null) {
+            pendingRefreshCallbacks.add(onFreshAvailable)
+        }
+
         val now = System.currentTimeMillis()
         val elapsed = now - lastUsageSnapshotRefreshTime
 
-        if (!force && elapsed < MIN_REFRESH_INTERVAL_MILLIS) {
-            return
-        }
-        if (!force && elapsed < currentBackoffMillis) {
+        if (refreshJob?.isActive == true) {
+            // Query already active; registered callback will receive result when done
             return
         }
 
-        if (refreshJob?.isActive == true) {
-            return // Single-flight guard
+        if (!force && elapsed < MIN_REFRESH_INTERVAL_MILLIS) {
+            if (onFreshAvailable != null) {
+                val active = TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
+                drainAndDeliverCallbacks(active)
+            }
+            return
+        }
+        if (!force && elapsed < currentBackoffMillis) {
+            if (onFreshAvailable != null) {
+                val active = TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
+                drainAndDeliverCallbacks(active)
+            }
+            return
         }
 
         refreshJob = serviceScope.launch {
@@ -102,12 +124,25 @@ class TakeBackAccessibilityService : AccessibilityService() {
                 val fresh = TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
                 lastUsageSnapshotRefreshTime = System.currentTimeMillis()
                 currentBackoffMillis = INITIAL_RETRY_BACKOFF_MILLIS // Reset backoff on success
-                onFreshAvailable?.invoke(fresh)
+                drainAndDeliverCallbacks(fresh)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed usage snapshot refresh", e)
                 lastUsageSnapshotRefreshTime = System.currentTimeMillis()
-                // Failure retry backoff: exponential backoff doubling up to MAX_RETRY_BACKOFF_MILLIS
                 currentBackoffMillis = minOf(MAX_RETRY_BACKOFF_MILLIS, currentBackoffMillis * 2)
+                val fallback = TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
+                drainAndDeliverCallbacks(fallback)
+            }
+        }
+    }
+
+    private fun drainAndDeliverCallbacks(snapshot: ValidatedUsageSnapshot) {
+        val callbacks = ArrayList(pendingRefreshCallbacks)
+        pendingRefreshCallbacks.clear()
+        for (callback in callbacks) {
+            try {
+                callback.invoke(snapshot)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error invoking refresh callback", e)
             }
         }
     }
@@ -117,7 +152,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
         isServiceRunning = true
         Log.i(TAG, "TakeBack Accessibility Service connected and active")
 
-        // Build 7 Issue 3: Register broadcast receiver for screen state transitions
+        // Build 8 Issue 4: Query actual device state from PowerManager and KeyguardManager
+        val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val isInteractive = powerManager?.isInteractive ?: true
+        val isLocked = keyguardManager?.isKeyguardLocked ?: false
+
+        sessionTracker.initializeState(
+            isInteractive = isInteractive,
+            isKeyguardLocked = isLocked,
+            elapsedRealtimeMillis = SystemClock.elapsedRealtime()
+        )
+
+        // Build 7 Issue 3 & Build 8 Issue 4: Register broadcast receiver with monotonic timestamps
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_SCREEN_OFF)
@@ -125,11 +172,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                val now = System.currentTimeMillis()
+                val elapsed = SystemClock.elapsedRealtime()
                 when (intent?.action) {
-                    Intent.ACTION_SCREEN_ON -> sessionTracker.onScreenStateChanged(true, now)
-                    Intent.ACTION_SCREEN_OFF -> sessionTracker.onScreenStateChanged(false, now)
-                    Intent.ACTION_USER_PRESENT -> sessionTracker.onKeyguardChanged(false, now)
+                    Intent.ACTION_SCREEN_ON -> sessionTracker.onScreenStateChanged(true, elapsed)
+                    Intent.ACTION_SCREEN_OFF -> sessionTracker.onScreenStateChanged(false, elapsed)
+                    Intent.ACTION_USER_PRESENT -> sessionTracker.onKeyguardChanged(false, elapsed)
                 }
             }
         }
@@ -140,7 +187,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             Log.w(TAG, "Failed to register screen state receiver", e)
         }
 
-        // Build 7 Issue 4: Initial refresh using the same throttled / single-flight guard
+        // Initial refresh using the same throttled / single-flight guard
         triggerUsageSnapshotRefresh(force = true)
     }
 
@@ -155,6 +202,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
             screenReceiver = null
         }
+        // Drain any pending callbacks with active cached snapshot so callers are not stranded
+        val fallback = TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
+        drainAndDeliverCallbacks(fallback)
         serviceScope.cancel()
         Log.i(TAG, "TakeBack Accessibility Service destroyed")
     }
@@ -168,15 +218,20 @@ class TakeBackAccessibilityService : AccessibilityService() {
         if (packageName == applicationContext.packageName) return
 
         val now = System.currentTimeMillis()
+        val eventType = event.eventType
+        val isWindowTransition = eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
 
-        // Build 7 Issue 3: Update coherent foreground session tracker before early-return
-        sessionTracker.onPackageChanged(packageName, now)
+        // Build 8 Issue 4: Drive foreground transitions ONLY by verified window transitions,
+        // ignoring arbitrary content-change or scroll events.
+        if (isWindowTransition) {
+            sessionTracker.onPackageChanged(packageName, SystemClock.elapsedRealtime())
+        }
 
         val isLauncherOrSystemUi = packageName == "com.android.systemui" ||
                 packageName.contains("launcher", ignoreCase = true)
 
-        // Now that session state is updated, early-return for launcher/systemUI packages.
-        // These cannot be blocked by profiles.
+        // Early-return for launcher/systemUI packages (these cannot be blocked by profiles).
         if (isLauncherOrSystemUi) {
             return
         }
@@ -317,7 +372,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         }
 
-        val currentSessionDuration = sessionTracker.getCurrentSessionDuration(now)
+        val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
 
         // Build current context snapshot
         val snapshot = SystemContextSnapshot(
@@ -346,16 +401,13 @@ class TakeBackAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Build 7 Issue 1 & Issue 4: Controlled refresh triggers.
+        // Build 7 Issue 4 & Build 8 Issue 1: Controlled refresh triggers.
         // Refresh only on window state changes (not on scrolling or content-changes).
-        val isWindowTransition = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
-
         val isSnapshotFresh = activeSnapshot?.isAvailable == true && (now - activeSnapshot.capturedAtMillis <= 30_000L)
         if (hasUsageLimitForApp && !isSnapshotFresh && isWindowTransition) {
             triggerUsageSnapshotRefresh(force = false) { fresh ->
                 if (sessionTracker.currentPackage == packageName) {
-                    val freshSessionDuration = sessionTracker.getCurrentSessionDuration(System.currentTimeMillis())
+                    val freshSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
                     val updatedSnapshot = snapshot.copy(
                         timestampMillis = System.currentTimeMillis(),
                         accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
