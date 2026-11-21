@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.data.repository.DailyUsageSummary
 import com.vr.takeback.data.repository.PermissionRepository
 import com.vr.takeback.data.repository.ProfileRepository
@@ -31,6 +32,8 @@ import com.vr.takeback.data.repository.QuickBlockRepository
 import com.vr.takeback.data.repository.UsageStatsRepository
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
 import com.vr.takeback.domain.model.Profile
+import com.vr.takeback.domain.security.MutationType
+import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 import java.time.LocalDate
 import java.time.LocalTime
 
@@ -82,6 +85,11 @@ fun HomeScreen(
         dailyAllowanceMinutes = usageStatsRepository.getDailyAllowanceMinutes()
     }
     var showAllowanceDialog by remember { mutableStateOf(false) }
+
+    // Strict Mode Protection for Home Profile Toggling
+    val strictRepo = TakeBackApplication.strictModeRepository
+    val strictState by strictRepo.protectionState.collectAsState()
+    var pendingToggleProfileId by remember { mutableStateOf<String?>(null) }
 
     // Evaluate active blocking status dynamically
     val engine = remember { CentralRestrictionEngine() }
@@ -693,7 +701,13 @@ fun HomeScreen(
                             }
                             Switch(
                                 checked = profile.isEnabled,
-                                onCheckedChange = { profileRepository.toggleProfile(profile.id) }
+                                onCheckedChange = {
+                                    if (strictState.isCurrentlyLocked) {
+                                        pendingToggleProfileId = profile.id
+                                    } else {
+                                        profileRepository.toggleProfile(profile.id)
+                                    }
+                                }
                             )
                         }
 
@@ -747,6 +761,26 @@ fun HomeScreen(
                     TextButton(onClick = { showAllowanceDialog = false }) {
                         Text("Close")
                     }
+                }
+            )
+        }
+
+        if (pendingToggleProfileId != null) {
+            StrictChallengeDialog(
+                mechanism = strictState.mechanism,
+                saltBase64 = strictState.saltBase64,
+                expectedHash = strictState.passwordHash,
+                mutationType = MutationType.TOGGLE_PROFILE,
+                targetId = pendingToggleProfileId,
+                onTokenIssued = { token ->
+                    val pid = pendingToggleProfileId
+                    if (pid != null) {
+                        profileRepository.toggleProfile(pid, token = token)
+                    }
+                    pendingToggleProfileId = null
+                },
+                onDismissRequest = {
+                    pendingToggleProfileId = null
                 }
             )
         }

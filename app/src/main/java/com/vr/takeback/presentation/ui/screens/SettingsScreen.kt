@@ -1,10 +1,6 @@
 package com.vr.takeback.presentation.ui.screens
 
-import android.app.Activity
 import android.content.Context
-import android.net.VpnService
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -23,10 +19,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import com.vr.takeback.data.repository.PermissionRepository
 import com.vr.takeback.data.repository.StrictModeRepository
+import com.vr.takeback.data.repository.StrictProtectionStatus
 import com.vr.takeback.domain.model.StrictMechanism
-import com.vr.takeback.platform.service.LocalDnsVpnService
+import com.vr.takeback.domain.security.MutationType
+import com.vr.takeback.platform.receiver.TakeBackDeviceAdminReceiver
 import com.vr.takeback.platform.util.OemBatteryOptimizer
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 
@@ -43,20 +43,14 @@ fun SettingsScreen(
     val strictState by strictModeRepository.protectionState.collectAsState()
 
     var showArmDialog by remember { mutableStateOf(false) }
+    var showAdminRequiredDialog by remember { mutableStateOf(false) }
     var showDisarmChallenge by remember { mutableStateOf(false) }
     var selectedMechanism by remember { mutableStateOf(StrictMechanism.TEXT_CHALLENGE) }
     var pinToSet by remember { mutableStateOf("") }
-    var isDnsShieldActive by remember {
-        mutableStateOf(LocalDnsVpnService.isFilterRunning || LocalDnsVpnService.isPersistedEnabled(context))
-    }
 
-    val vpnPrepareLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            LocalDnsVpnService.start(context)
-            isDnsShieldActive = true
-        }
+    // Recheck actual DevicePolicyManager administrator status upon resume
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        strictModeRepository.refreshAdminStatus()
     }
 
     Scaffold(
@@ -134,7 +128,7 @@ fun SettingsScreen(
                 }
             }
 
-            // Strict Mode Card
+            // Strict Mode Card (Mandatory Device Administrator Prerequisite)
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -158,7 +152,7 @@ fun SettingsScreen(
                                         fontWeight = FontWeight.Bold
                                     )
                                     Text(
-                                        text = "Prevent impulsive modifications",
+                                        text = "Mandatory Device Administrator protection",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -168,7 +162,12 @@ fun SettingsScreen(
                                 checked = strictState.isGlobalStrictActive,
                                 onCheckedChange = { isChecked ->
                                     if (isChecked) {
-                                        showArmDialog = true
+                                        val adminActive = strictModeRepository.isDeviceAdminActive()
+                                        if (!adminActive) {
+                                            showAdminRequiredDialog = true
+                                        } else {
+                                            showArmDialog = true
+                                        }
                                     } else {
                                         if (strictState.isCurrentlyLocked) {
                                             showDisarmChallenge = true
@@ -180,74 +179,54 @@ fun SettingsScreen(
                             )
                         }
 
+                        // Protection Compromised Warning Banner if Device Admin was deactivated
+                        if (strictState.status == StrictProtectionStatus.COMPROMISED) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Protection Compromised",
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Android Device Administrator was deactivated. Strict Mode protection is degraded. Reactivate Device Administrator to restore full anti-tamper security.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Button(
+                                        onClick = {
+                                            val adminIntent = TakeBackDeviceAdminReceiver.createAddDeviceAdminIntent(context)
+                                            context.startActivity(adminIntent)
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                    ) {
+                                        Text("Reactivate Device Administrator")
+                                    }
+                                }
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
                             text = if (strictState.isGlobalStrictActive) {
-                                "Strict Mode is currently ARMED (${strictState.mechanism.name}). All profile pausing, editing, and rule modifications require verification."
+                                "Strict Mode is currently ARMED (${strictState.mechanism.name}) with Standard Device Administrator. All profile modifications, schedule edits, and settings access require challenge verification."
                             } else {
-                                "When armed, restriction rules, schedules, and active profiles cannot be edited or paused without completing a 60-character complex text challenge or PIN."
+                                "Requires Standard Device Administrator. When armed, restriction rules, schedules, and active profiles cannot be edited or paused without completing verification. Settings tampering and uninstallation are deterred."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = if (strictState.isGlobalStrictActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                             fontWeight = if (strictState.isGlobalStrictActive) FontWeight.SemiBold else FontWeight.Normal
-                        )
-                    }
-                }
-            }
-
-            // Web Shield (Local DNS VPN Sinkhole) Card
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                ) {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Filled.Public, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Column {
-                                    Text(
-                                        text = "Web Shield (Local DNS)",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        text = "Local loopback domain filter",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                            Switch(
-                                checked = isDnsShieldActive,
-                                onCheckedChange = { checked ->
-                                    if (checked) {
-                                        val vpnIntent = VpnService.prepare(context)
-                                        if (vpnIntent != null) {
-                                            vpnPrepareLauncher.launch(vpnIntent)
-                                        } else {
-                                            LocalDnsVpnService.start(context)
-                                            isDnsShieldActive = true
-                                        }
-                                    } else {
-                                        LocalDnsVpnService.stop(context)
-                                        isDnsShieldActive = false
-                                    }
-                                }
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text(
-                            text = "Blocks distracting websites and adult content at the DNS level. Runs 100% locally on your device without routing through external proxy servers.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -329,85 +308,11 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Spacer(modifier = Modifier.height(12.dp))
-                        Button(
-                            onClick = { OemBatteryOptimizer.launchOptimizationSettings(context) },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
+                        OutlinedButton(
+                            onClick = { OemBatteryOptimizer.openAutoStartSettings(context) },
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(Icons.Filled.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Configure Battery Settings")
-                        }
-                    }
-                }
-            }
-
-            // 100% Free & Open Source Forever Card (Zero Paywalls)
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                ) {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Filled.Code, contentDescription = null, tint = Color(0xFF10B981))
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "100% Free & Open Source",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFF10B981)
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "TakeBack is completely free and open source. All features — including unlimited profiles, schedules, ambient audio synthesis, Strict Mode, and offline data export — are permanently unlocked for everyone. No paywalls, no ads, zero tracking.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-
-            // Privacy & Local Storage
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                ) {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Filled.CloudOff, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "100% Local-First Data",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "TakeBack never sends your app usage, visited websites, or settings to any remote server. Zero tracking, zero telemetry.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            OutlinedButton(onClick = { /* Export SAF */ }) {
-                                Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Export JSON")
-                            }
-                            OutlinedButton(
-                                onClick = { /* Wipe DB */ },
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                            ) {
-                                Icon(Icons.Outlined.DeleteForever, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Wipe All Data")
-                            }
+                            Text("Open OEM Optimization Settings")
                         }
                     }
                 }
@@ -435,6 +340,40 @@ fun SettingsScreen(
             }
         }
 
+        // Dialog: Device Administrator Mandatory Activation
+        if (showAdminRequiredDialog) {
+            AlertDialog(
+                onDismissRequest = { showAdminRequiredDialog = false },
+                icon = { Icon(Icons.Filled.Security, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                title = { Text("Device Administrator Required") },
+                text = {
+                    Text(
+                        "Standard Android Device Administrator is a mandatory prerequisite for enabling Strict Mode.\n\n" +
+                        "This grants TakeBack official presence in 'Device admin apps' to deter unauthorized settings tampering and casual uninstallation.\n\n" +
+                        "TakeBack uses Standard Device Administrator only. It never wipes device data or performs factory resets."
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showAdminRequiredDialog = false
+                            val adminIntent = TakeBackDeviceAdminReceiver.createAddDeviceAdminIntent(context)
+                            context.startActivity(adminIntent)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("Activate Device Admin")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAdminRequiredDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        // Dialog: Arm Strict Mode
         if (showArmDialog) {
             AlertDialog(
                 onDismissRequest = { showArmDialog = false },
@@ -473,6 +412,12 @@ fun SettingsScreen(
                 confirmButton = {
                     Button(
                         onClick = {
+                            if (!strictModeRepository.isDeviceAdminActive()) {
+                                showArmDialog = false
+                                showAdminRequiredDialog = true
+                                return@Button
+                            }
+
                             if (selectedMechanism == StrictMechanism.PIN) {
                                 if (pinToSet.length >= 4) {
                                     strictModeRepository.armStrictWithPin(pinToSet)
@@ -497,13 +442,15 @@ fun SettingsScreen(
             )
         }
 
+        // Dialog: Disarm Strict Mode Challenge
         if (showDisarmChallenge) {
             StrictChallengeDialog(
                 mechanism = strictState.mechanism,
                 saltBase64 = strictState.saltBase64,
                 expectedHash = strictState.passwordHash,
-                onChallengeSolved = {
-                    strictModeRepository.disarmStrict()
+                mutationType = MutationType.DISARM_STRICT_MODE,
+                onTokenIssued = { token ->
+                    strictModeRepository.disarmStrict(token)
                     showDisarmChallenge = false
                 },
                 onDismissRequest = { showDisarmChallenge = false }

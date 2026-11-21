@@ -1,7 +1,6 @@
 package com.vr.takeback
 
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
-import com.vr.takeback.domain.engine.DnsBlockMatcher
 import com.vr.takeback.domain.engine.SystemContextSnapshot
 import com.vr.takeback.domain.model.*
 import com.vr.takeback.domain.security.StrictModeManager
@@ -18,7 +17,7 @@ import java.time.LocalTime
  * - Emergency invariance (Priority 0)
  * - Quick Block timeout & target packages
  * - Strict Mode verification friction
- * - On-device DNS sinkhole blocking
+ * - Independent website rule blocking via CentralRestrictionEngine
  */
 class TakeBackSystemTest {
 
@@ -89,13 +88,31 @@ class TakeBackSystemTest {
         assertTrue("Valid challenge response must match", StrictModeManager.verifyTextChallenge(challenge, challenge))
         assertFalse("Mismatched challenge response must be rejected", StrictModeManager.verifyTextChallenge("WrongInput", challenge))
 
-        // Step 6: On-Device DNS Sinkhole Verification
-        val blockedDomains = setOf("instagram.com", "tiktok.com")
-        val allowlistedDomains = setOf("edu.tiktok.com")
+        // Step 6: Independent Website Restriction via CentralRestrictionEngine (DNS-free)
+        val webProfile = Profile(
+            id = "web_distraction",
+            name = "Web Filter",
+            isEnabled = true,
+            targetWebsites = listOf(
+                TargetWebsite("instagram.com", WebsiteRuleType.EXACT_DOMAIN, isAllowlist = false),
+                TargetWebsite("tiktok.com", WebsiteRuleType.EXACT_DOMAIN, isAllowlist = false),
+                TargetWebsite("edu.tiktok.com", WebsiteRuleType.EXACT_DOMAIN, isAllowlist = true)
+            )
+        )
 
-        assertTrue("Root domain must be blocked by DNS sinkhole", DnsBlockMatcher.shouldBlockDomain("instagram.com", blockedDomains, allowlistedDomains))
-        assertTrue("Subdomain must be blocked by DNS sinkhole", DnsBlockMatcher.shouldBlockDomain("api.instagram.com", blockedDomains, allowlistedDomains))
-        assertFalse("Specifically allowlisted subdomain must be permitted", DnsBlockMatcher.shouldBlockDomain("edu.tiktok.com", blockedDomains, allowlistedDomains))
-        assertFalse("Unrestricted domain must be permitted", DnsBlockMatcher.shouldBlockDomain("wikipedia.org", blockedDomains, allowlistedDomains))
+        val blockedWebSnap = SystemContextSnapshot(
+            timestampMillis = System.currentTimeMillis(),
+            localTime = LocalTime.of(14, 0),
+            dayOfWeek = DayOfWeek.MONDAY,
+            foregroundPackageName = "com.android.chrome",
+            activeBrowserUrl = "https://instagram.com/explore"
+        )
+        val webDecision = engine.evaluate(listOf(webProfile), blockedWebSnap)
+        assertTrue("Restricted website must be blocked by CentralRestrictionEngine", webDecision is BlockDecision.Blocked)
+        assertEquals(BlockTarget.Website("https://instagram.com/explore"), (webDecision as BlockDecision.Blocked).target)
+
+        val allowedWebSnap = blockedWebSnap.copy(activeBrowserUrl = "https://wikipedia.org/wiki/Kotlin")
+        val allowedDecision = engine.evaluate(listOf(webProfile), allowedWebSnap)
+        assertTrue("Unrestricted website must be allowed", allowedDecision is BlockDecision.Allowed)
     }
 }

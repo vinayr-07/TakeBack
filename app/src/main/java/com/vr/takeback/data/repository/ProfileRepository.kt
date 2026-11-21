@@ -2,7 +2,13 @@ package com.vr.takeback.data.repository
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
+import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.domain.model.*
+import com.vr.takeback.domain.security.MutationType
+import com.vr.takeback.domain.security.StrictMutationGate
+import com.vr.takeback.platform.alarm.ScheduleCoordinator
+import com.vr.takeback.platform.service.TakeBackAccessibilityService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -10,9 +16,18 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
-class ProfileRepository(private val context: Context? = null) {
+class ProfileRepository(context: Context? = null) {
 
-    private val prefs: SharedPreferences? = context?.getSharedPreferences("takeback_profiles_prefs", Context.MODE_PRIVATE)
+    companion object {
+        private const val TAG = "ProfileRepository"
+        private const val PREFS_NAME = "takeback_profiles_prefs"
+        private const val KEY_SAVED_PROFILES = "saved_profiles_json"
+    }
+
+    private val appContext: Context? = context?.applicationContext
+        ?: runCatching { TakeBackApplication.instance.applicationContext }.getOrNull()
+
+    private val prefs: SharedPreferences? = appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _profiles = MutableStateFlow<List<Profile>>(loadProfiles())
     val profiles: StateFlow<List<Profile>> = _profiles.asStateFlow()
@@ -21,7 +36,20 @@ class ProfileRepository(private val context: Context? = null) {
         return _profiles.value.find { it.id == id }
     }
 
-    fun toggleProfile(id: String) {
+    /**
+     * Toggles profile enabled state.
+     * Enforces StrictMutationGate when Strict Mode is active unless called from system origin.
+     */
+    fun toggleProfile(id: String, token: String? = null, isSystemOrigin: Boolean = false): Boolean {
+        val isStrict = isStrictActive()
+        if (isStrict && !isSystemOrigin) {
+            val valid = StrictMutationGate.consumeToken(token, MutationType.TOGGLE_PROFILE, id)
+            if (!valid) {
+                Log.w(TAG, "Rejected toggleProfile($id): Unauthorized under Strict Mode")
+                return false
+            }
+        }
+
         val updated = _profiles.value.map { profile ->
             if (profile.id == id) {
                 profile.copy(isEnabled = !profile.isEnabled, updatedAtMillis = System.currentTimeMillis())
@@ -29,9 +57,26 @@ class ProfileRepository(private val context: Context? = null) {
         }
         _profiles.value = updated
         persistProfiles(updated)
+        notifySystemOfProfileChange(updated)
+        return true
     }
 
-    fun saveProfile(profile: Profile) {
+    /**
+     * Saves or creates a profile.
+     * Enforces StrictMutationGate when Strict Mode is active unless called from system origin.
+     */
+    fun saveProfile(profile: Profile, token: String? = null, isSystemOrigin: Boolean = false): Boolean {
+        val isStrict = isStrictActive()
+        val isNew = getProfileById(profile.id) == null
+        if (isStrict && !isSystemOrigin) {
+            val expectedMutation = if (isNew) MutationType.CREATE_PROFILE else MutationType.SAVE_PROFILE
+            val valid = StrictMutationGate.consumeToken(token, expectedMutation, profile.id)
+            if (!valid) {
+                Log.w(TAG, "Rejected saveProfile(${profile.id}): Unauthorized under Strict Mode")
+                return false
+            }
+        }
+
         val current = _profiles.value.toMutableList()
         val index = current.indexOfFirst { it.id == profile.id }
         if (index >= 0) {
@@ -41,15 +86,45 @@ class ProfileRepository(private val context: Context? = null) {
         }
         _profiles.value = current
         persistProfiles(current)
+        notifySystemOfProfileChange(current)
+        return true
     }
 
-    fun deleteProfile(id: String) {
+    /**
+     * Deletes a profile.
+     * Enforces StrictMutationGate when Strict Mode is active.
+     */
+    fun deleteProfile(id: String, token: String? = null): Boolean {
+        val isStrict = isStrictActive()
+        if (isStrict) {
+            val valid = StrictMutationGate.consumeToken(token, MutationType.DELETE_PROFILE, id)
+            if (!valid) {
+                Log.w(TAG, "Rejected deleteProfile($id): Unauthorized under Strict Mode")
+                return false
+            }
+        }
+
         val updated = _profiles.value.filter { it.id != id }
         _profiles.value = updated
         persistProfiles(updated)
+        notifySystemOfProfileChange(updated)
+        return true
     }
 
-    fun duplicateProfile(id: String): Profile? {
+    /**
+     * Duplicates an existing profile.
+     * Enforces StrictMutationGate when Strict Mode is active.
+     */
+    fun duplicateProfile(id: String, token: String? = null): Profile? {
+        val isStrict = isStrictActive()
+        if (isStrict) {
+            val valid = StrictMutationGate.consumeToken(token, MutationType.DUPLICATE_PROFILE, id)
+            if (!valid) {
+                Log.w(TAG, "Rejected duplicateProfile($id): Unauthorized under Strict Mode")
+                return null
+            }
+        }
+
         val original = getProfileById(id) ?: return null
         val copy = original.copy(
             id = UUID.randomUUID().toString(),
@@ -58,7 +133,7 @@ class ProfileRepository(private val context: Context? = null) {
             createdAtMillis = System.currentTimeMillis(),
             updatedAtMillis = System.currentTimeMillis()
         )
-        saveProfile(copy)
+        saveProfile(copy, token = null, isSystemOrigin = true)
         return copy
     }
 
@@ -75,6 +150,25 @@ class ProfileRepository(private val context: Context? = null) {
         return packages
     }
 
+    private fun isStrictActive(): Boolean {
+        return try {
+            TakeBackApplication.strictModeRepository.protectionState.value.isCurrentlyLocked
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun notifySystemOfProfileChange(updatedProfiles: List<Profile>) {
+        appContext?.let { ctx ->
+            try {
+                ScheduleCoordinator.onProfilesChanged(ctx, updatedProfiles)
+                TakeBackAccessibilityService.notifyScheduleBoundary(ctx)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error notifying system components of profile change", e)
+            }
+        }
+    }
+
     private fun persistProfiles(list: List<Profile>) {
         if (prefs == null) return
         try {
@@ -87,6 +181,8 @@ class ProfileRepository(private val context: Context? = null) {
                     put("colorHex", p.colorHex)
                     put("isEnabled", p.isEnabled)
                     put("isPreset", p.isPreset)
+                    put("createdAtMillis", p.createdAtMillis)
+                    put("updatedAtMillis", p.updatedAtMillis)
 
                     val appsArray = JSONArray()
                     for (app in p.targetApps) {
@@ -126,22 +222,39 @@ class ProfileRepository(private val context: Context? = null) {
                         limitsArray.put(JSONObject().apply {
                             put("id", lim.id)
                             put("profileId", lim.profileId)
+                            if (lim.targetPackageName != null) {
+                                put("targetPackageName", lim.targetPackageName)
+                            }
                             put("dailyLimitMinutes", lim.dailyLimitMinutes)
+                            put("windowType", lim.windowType.name)
                             put("isEnabled", lim.isEnabled)
                         })
                     }
                     put("usageLimits", limitsArray)
+
+                    if (p.strictModeConfig != null) {
+                        val sm = p.strictModeConfig
+                        val smObj = JSONObject().apply {
+                            put("profileId", sm.profileId)
+                            put("isStrictActive", sm.isStrictActive)
+                            put("mechanism", sm.mechanism.name)
+                            put("saltBase64", sm.saltBase64)
+                            put("passwordHash", sm.passwordHash)
+                            put("delayMinutes", sm.delayMinutes)
+                        }
+                        put("strictModeConfig", smObj)
+                    }
                 }
                 jsonArray.put(obj)
             }
-            prefs.edit().putString("saved_profiles_json", jsonArray.toString()).apply()
+            prefs.edit().putString(KEY_SAVED_PROFILES, jsonArray.toString()).apply()
         } catch (e: Exception) {
-            // Log fallback
+            Log.e(TAG, "Failed to persist profiles to SharedPreferences", e)
         }
     }
 
     private fun loadProfiles(): List<Profile> {
-        val jsonStr = prefs?.getString("saved_profiles_json", null)
+        val jsonStr = prefs?.getString(KEY_SAVED_PROFILES, null)
         if (!jsonStr.isNullOrBlank()) {
             try {
                 val array = JSONArray(jsonStr)
@@ -150,10 +263,12 @@ class ProfileRepository(private val context: Context? = null) {
                     val obj = array.getJSONObject(i)
                     val id = obj.getString("id")
                     val name = obj.getString("name")
-                    val iconName = obj.optString("iconName", "shield")
+                    val iconName = obj.optString("iconName", "auto_stories")
                     val colorHex = obj.optString("colorHex", "#10B981")
                     val isEnabled = obj.optBoolean("isEnabled", false)
                     val isPreset = obj.optBoolean("isPreset", false)
+                    val createdAt = obj.optLong("createdAtMillis", System.currentTimeMillis())
+                    val updatedAt = obj.optLong("updatedAtMillis", System.currentTimeMillis())
 
                     val targetApps = mutableListOf<TargetApp>()
                     val appsArray = obj.optJSONArray("targetApps")
@@ -178,7 +293,11 @@ class ProfileRepository(private val context: Context? = null) {
                             targetWebsites.add(
                                 TargetWebsite(
                                     domainPattern = wObj.getString("domainPattern"),
-                                    ruleType = try { WebsiteRuleType.valueOf(wObj.optString("ruleType", "EXACT_DOMAIN")) } catch(e: Exception) { WebsiteRuleType.EXACT_DOMAIN },
+                                    ruleType = try {
+                                        WebsiteRuleType.valueOf(wObj.optString("ruleType", "EXACT_DOMAIN"))
+                                    } catch (e: Exception) {
+                                        WebsiteRuleType.EXACT_DOMAIN
+                                    },
                                     isAllowlist = wObj.optBoolean("isAllowlist", false)
                                 )
                             )
@@ -208,15 +327,44 @@ class ProfileRepository(private val context: Context? = null) {
                     if (limArray != null) {
                         for (j in 0 until limArray.length()) {
                             val lObj = limArray.getJSONObject(j)
+                            val targetPkg = if (lObj.has("targetPackageName") && !lObj.isNull("targetPackageName")) {
+                                lObj.getString("targetPackageName")
+                            } else null
+                            val windowType = try {
+                                LimitWindowType.valueOf(lObj.optString("windowType", "FULL_DAY"))
+                            } catch (e: Exception) {
+                                LimitWindowType.FULL_DAY
+                            }
+
                             limits.add(
                                 UsageLimit(
                                     id = lObj.optLong("id", System.currentTimeMillis()),
                                     profileId = lObj.optString("profileId", id),
+                                    targetPackageName = targetPkg,
                                     dailyLimitMinutes = lObj.optInt("dailyLimitMinutes", 30),
+                                    windowType = windowType,
                                     isEnabled = lObj.optBoolean("isEnabled", true)
                                 )
                             )
                         }
+                    }
+
+                    var strictConfig: StrictModeConfig? = null
+                    val smObj = obj.optJSONObject("strictModeConfig")
+                    if (smObj != null) {
+                        val smMech = try {
+                            StrictMechanism.valueOf(smObj.optString("mechanism", "PIN"))
+                        } catch (e: Exception) {
+                            StrictMechanism.PIN
+                        }
+                        strictConfig = StrictModeConfig(
+                            profileId = smObj.optString("profileId", id),
+                            isStrictActive = smObj.optBoolean("isStrictActive", false),
+                            mechanism = smMech,
+                            saltBase64 = if (smObj.has("saltBase64") && !smObj.isNull("saltBase64")) smObj.getString("saltBase64") else null,
+                            passwordHash = if (smObj.has("passwordHash") && !smObj.isNull("passwordHash")) smObj.getString("passwordHash") else null,
+                            delayMinutes = smObj.optInt("delayMinutes", 5)
+                        )
                     }
 
                     list.add(
@@ -227,20 +375,26 @@ class ProfileRepository(private val context: Context? = null) {
                             colorHex = colorHex,
                             isEnabled = isEnabled,
                             isPreset = isPreset,
+                            createdAtMillis = createdAt,
+                            updatedAtMillis = updatedAt,
                             targetApps = targetApps,
                             targetWebsites = targetWebsites,
                             schedules = schedules,
-                            usageLimits = limits
+                            usageLimits = limits,
+                            strictModeConfig = strictConfig
                         )
                     )
                 }
                 if (list.isNotEmpty()) return list
             } catch (e: Exception) {
-                // Fallback to defaults
+                Log.e(TAG, "Error deserializing profiles JSON, falling back", e)
             }
         }
+
         val defaults = createDefaultProfiles()
-        persistProfiles(defaults)
+        if (prefs != null) {
+            persistProfiles(defaults)
+        }
         return defaults
     }
 
@@ -271,7 +425,7 @@ class ProfileRepository(private val context: Context? = null) {
                     Schedule(
                         id = 1,
                         profileId = "study_preset",
-                        daysOfWeekMask = 31, // Mon-Fri (1+2+4+8+16 = 31)
+                        daysOfWeekMask = 31, // Mon-Fri
                         startTimeSeconds = 14 * 3600, // 14:00
                         endTimeSeconds = 18 * 3600   // 18:00
                     )
@@ -315,7 +469,7 @@ class ProfileRepository(private val context: Context? = null) {
                     Schedule(
                         id = 3,
                         profileId = "sleep_preset",
-                        daysOfWeekMask = 127, // All 7 days (1..7)
+                        daysOfWeekMask = 127, // All 7 days
                         startTimeSeconds = 22 * 3600 + 1800, // 22:30
                         endTimeSeconds = 6 * 3600 + 1800     // 06:30 (overnight!)
                     )

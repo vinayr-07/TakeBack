@@ -195,9 +195,14 @@ class CentralRestrictionEngine {
             val start = schedule.startTimeSeconds
             val end = schedule.endTimeSeconds
 
-            if (start <= end) {
+            if (start < end) {
                 // Daytime schedule: must be active on current day and within [start, end)
                 if (schedule.isDayActive(currentDayIndex) && currentSeconds in start until end) {
+                    return schedule
+                }
+            } else if (start == end) {
+                // Equal start & end times: explicitly defined as 24-hour full-day restriction for selected day
+                if (schedule.isDayActive(currentDayIndex)) {
                     return schedule
                 }
             } else {
@@ -402,11 +407,26 @@ class CentralRestrictionEngine {
     ): BlockDecision {
         val cleanUrl = rawUrl.lowercase().trim()
 
-        for (profile in profiles) {
-            if (!isProfileCurrentlyEnforcing(profile, localTime, dayOfWeek)) {
-                continue
+        val activeProfiles = profiles.filter { isProfileCurrentlyEnforcing(it, localTime, dayOfWeek) }
+
+        // Allowlist rules take precedence over blocklist rules
+        for (profile in activeProfiles) {
+            for (rule in profile.targetWebsites.filter { it.isAllowlist }) {
+                val pattern = rule.domainPattern.lowercase().trim()
+                val isMatch = when (rule.ruleType) {
+                    WebsiteRuleType.EXACT_DOMAIN -> cleanUrl.contains(pattern)
+                    WebsiteRuleType.WILDCARD -> cleanUrl.contains(pattern.replace("*", ""))
+                    WebsiteRuleType.KEYWORD -> cleanUrl.contains(pattern)
+                }
+                if (isMatch) {
+                    return BlockDecision.Allowed
+                }
             }
-            for (rule in profile.targetWebsites) {
+        }
+
+        // Blocklist evaluation
+        for (profile in activeProfiles) {
+            for (rule in profile.targetWebsites.filter { !it.isAllowlist }) {
                 val pattern = rule.domainPattern.lowercase().trim()
                 val isMatch = when (rule.ruleType) {
                     WebsiteRuleType.EXACT_DOMAIN -> cleanUrl.contains(pattern)
@@ -415,16 +435,12 @@ class CentralRestrictionEngine {
                 }
 
                 if (isMatch) {
-                    if (rule.isAllowlist) {
-                        return BlockDecision.Allowed
-                    } else {
-                        return BlockDecision.Blocked(
-                            target = BlockTarget.Website(rawUrl),
-                            triggeringProfileId = profile.id,
-                            triggeringProfileName = profile.name,
-                            reason = BlockReason.KeywordMatch(pattern)
-                        )
-                    }
+                    return BlockDecision.Blocked(
+                        target = BlockTarget.Website(rawUrl),
+                        triggeringProfileId = profile.id,
+                        triggeringProfileName = profile.name,
+                        reason = BlockReason.KeywordMatch(pattern)
+                    )
                 }
             }
         }

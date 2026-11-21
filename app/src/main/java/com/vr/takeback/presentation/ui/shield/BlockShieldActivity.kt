@@ -14,7 +14,7 @@ import androidx.compose.material.icons.filled.HourglassTop
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -22,6 +22,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vr.takeback.TakeBackApplication
+import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 import com.vr.takeback.ui.theme.TakeBackTheme
 
 class BlockShieldActivity : ComponentActivity() {
@@ -32,6 +34,7 @@ class BlockShieldActivity : ComponentActivity() {
         val appName = intent.getStringExtra("EXTRA_APP_NAME") ?: "This Application"
         val profileName = intent.getStringExtra("EXTRA_PROFILE_NAME") ?: "Focus Profile"
         val reason = intent.getStringExtra("EXTRA_REASON") ?: "Restricted Focus Window"
+        val isSettingsShield = intent.getBooleanExtra("EXTRA_IS_SETTINGS_SHIELD", false)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -50,10 +53,15 @@ class BlockShieldActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
+                    val strictRepo = TakeBackApplication.strictModeRepository
+                    val strictState by strictRepo.protectionState.collectAsState()
+                    var showAuthDialog by remember { mutableStateOf(false) }
+
                     BlockShieldContent(
                         appName = appName,
                         profileName = profileName,
                         reason = reason,
+                        isSettingsShield = isSettingsShield,
                         onGoHomeClick = {
                             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                                 addCategory(Intent.CATEGORY_HOME)
@@ -61,14 +69,31 @@ class BlockShieldActivity : ComponentActivity() {
                             }
                             startActivity(homeIntent)
                             finish()
+                        },
+                        onAuthenticateClick = {
+                            showAuthDialog = true
                         }
                     )
+
+                    if (showAuthDialog) {
+                        StrictChallengeDialog(
+                            mechanism = strictState.mechanism,
+                            saltBase64 = strictState.saltBase64,
+                            expectedHash = strictState.passwordHash,
+                            onChallengeSolved = {
+                                strictRepo.grantTemporarySettingsUnlock(durationMinutes = 5)
+                                showAuthDialog = false
+                                finish()
+                            },
+                            onDismissRequest = {
+                                showAuthDialog = false
+                            }
+                        )
+                    }
                 }
             }
         }
     }
-
-
 }
 
 @Composable
@@ -76,7 +101,9 @@ fun BlockShieldContent(
     appName: String,
     profileName: String,
     reason: String,
-    onGoHomeClick: () -> Unit
+    isSettingsShield: Boolean = false,
+    onGoHomeClick: () -> Unit,
+    onAuthenticateClick: () -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -89,13 +116,16 @@ fun BlockShieldContent(
             modifier = Modifier
                 .size(88.dp)
                 .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primaryContainer),
+                .background(
+                    if (isSettingsShield) MaterialTheme.colorScheme.errorContainer
+                    else MaterialTheme.colorScheme.primaryContainer
+                ),
             contentAlignment = Alignment.Center
         ) {
             Icon(
-                imageVector = Icons.Filled.Shield,
+                imageVector = if (isSettingsShield) Icons.Filled.Lock else Icons.Filled.Shield,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
+                tint = if (isSettingsShield) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(48.dp)
             )
         }
@@ -103,7 +133,7 @@ fun BlockShieldContent(
         Spacer(modifier = Modifier.height(28.dp))
 
         Text(
-            text = "$appName is Paused",
+            text = if (isSettingsShield) "Settings Access Locked" else "$appName is Paused",
             style = MaterialTheme.typography.displayMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground,
@@ -113,14 +143,16 @@ fun BlockShieldContent(
         Spacer(modifier = Modifier.height(10.dp))
 
         Badge(
-            containerColor = MaterialTheme.colorScheme.secondaryContainer
+            containerColor = if (isSettingsShield) MaterialTheme.colorScheme.errorContainer
+            else MaterialTheme.colorScheme.secondaryContainer
         ) {
             Text(
                 text = "GUARDED BY: $profileName",
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSecondaryContainer
+                color = if (isSettingsShield) MaterialTheme.colorScheme.onErrorContainer
+                else MaterialTheme.colorScheme.onSecondaryContainer
             )
         }
 
@@ -161,7 +193,7 @@ fun BlockShieldContent(
             }
         }
 
-        Spacer(modifier = Modifier.height(36.dp))
+        Spacer(modifier = Modifier.height(32.dp))
 
         Button(
             onClick = onGoHomeClick,
@@ -175,6 +207,19 @@ fun BlockShieldContent(
             )
         ) {
             Text("Return to Home Screen", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+
+        if (isSettingsShield) {
+            Spacer(modifier = Modifier.height(14.dp))
+            OutlinedButton(
+                onClick = onAuthenticateClick,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text("Authenticate for Settings Access", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            }
         }
     }
 }

@@ -28,6 +28,7 @@ import com.vr.takeback.data.repository.StrictModeRepository
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
 import com.vr.takeback.domain.model.Profile
 import com.vr.takeback.domain.model.Schedule
+import com.vr.takeback.domain.security.MutationType
 import com.vr.takeback.presentation.ui.components.AppPickerDialog
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 import java.time.LocalDate
@@ -50,17 +51,25 @@ fun ProfilesScreen(
     var newProfileName by remember { mutableStateOf("") }
     var editingProfileForApps by remember { mutableStateOf<Profile?>(null) }
     var editingProfileForSchedule by remember { mutableStateOf<Profile?>(null) }
-    var pendingStrictAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var pendingStrictAction by remember { mutableStateOf<((token: String?) -> Unit)?>(null) }
+    var pendingMutationType by remember { mutableStateOf(MutationType.SAVE_PROFILE) }
+    var pendingTargetId by remember { mutableStateOf<String?>(null) }
 
     val engine = remember { CentralRestrictionEngine() }
     val nowTime = LocalTime.now()
     val today = LocalDate.now().dayOfWeek
 
-    fun executeWithStrictCheck(action: () -> Unit) {
+    fun executeWithStrictCheck(
+        mutationType: MutationType = MutationType.SAVE_PROFILE,
+        targetId: String? = null,
+        action: (token: String?) -> Unit
+    ) {
         if (strictState.isCurrentlyLocked) {
+            pendingMutationType = mutationType
+            pendingTargetId = targetId
             pendingStrictAction = action
         } else {
-            action()
+            action(null)
         }
     }
 
@@ -234,8 +243,8 @@ fun ProfilesScreen(
                                     if (isChecked && !permissionStatus.hasAccessibility) {
                                         showAccessibilityRequiredDialog = true
                                     } else {
-                                        executeWithStrictCheck {
-                                            profileRepository.toggleProfile(profile.id)
+                                        executeWithStrictCheck(MutationType.TOGGLE_PROFILE, profile.id) { token ->
+                                            profileRepository.toggleProfile(profile.id, token = token)
                                         }
                                     }
                                 }
@@ -259,9 +268,7 @@ fun ProfilesScreen(
                             )
                             TextButton(
                                 onClick = {
-                                    executeWithStrictCheck {
-                                        editingProfileForApps = profile
-                                    }
+                                    editingProfileForApps = profile
                                 }
                             ) {
                                 Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -296,9 +303,9 @@ fun ProfilesScreen(
                                                 modifier = Modifier
                                                     .size(16.dp)
                                                     .clickable {
-                                                        executeWithStrictCheck {
+                                                        executeWithStrictCheck(MutationType.SAVE_PROFILE, profile.id) { token ->
                                                             val updated = profile.targetApps.filter { it.packageName != app.packageName }
-                                                            profileRepository.saveProfile(profile.copy(targetApps = updated))
+                                                            profileRepository.saveProfile(profile.copy(targetApps = updated), token = token)
                                                         }
                                                     }
                                             )
@@ -359,9 +366,7 @@ fun ProfilesScreen(
 
                             FilledTonalButton(
                                 onClick = {
-                                    executeWithStrictCheck {
-                                        editingProfileForSchedule = profile
-                                    }
+                                    editingProfileForSchedule = profile
                                 },
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                             ) {
@@ -375,13 +380,17 @@ fun ProfilesScreen(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.End
                         ) {
-                            IconButton(onClick = { profileRepository.duplicateProfile(profile.id) }) {
+                            IconButton(onClick = {
+                                executeWithStrictCheck(MutationType.DUPLICATE_PROFILE, profile.id) { token ->
+                                    profileRepository.duplicateProfile(profile.id, token = token)
+                                }
+                            }) {
                                 Icon(Icons.Outlined.ContentCopy, contentDescription = "Duplicate Profile", modifier = Modifier.size(18.dp))
                             }
                             if (!profile.isPreset) {
                                 IconButton(onClick = {
-                                    executeWithStrictCheck {
-                                        profileRepository.deleteProfile(profile.id)
+                                    executeWithStrictCheck(MutationType.DELETE_PROFILE, profile.id) { token ->
+                                        profileRepository.deleteProfile(profile.id, token = token)
                                     }
                                 }) {
                                     Icon(Icons.Outlined.Delete, contentDescription = "Delete Profile", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
@@ -424,9 +433,11 @@ fun ProfilesScreen(
                                     colorHex = "#10B981",
                                     isEnabled = false
                                 )
-                                profileRepository.saveProfile(newProfile)
-                                newProfileName = ""
-                                showCreateDialog = false
+                                executeWithStrictCheck(MutationType.CREATE_PROFILE, newProfile.id) { token ->
+                                    profileRepository.saveProfile(newProfile, token = token)
+                                    newProfileName = ""
+                                    showCreateDialog = false
+                                }
                             }
                         }
                     ) {
@@ -517,8 +528,10 @@ fun ProfilesScreen(
                         if (existingSchedule != null) {
                             TextButton(
                                 onClick = {
-                                    profileRepository.saveProfile(profile.copy(schedules = emptyList()))
-                                    editingProfileForSchedule = null
+                                    executeWithStrictCheck(MutationType.SAVE_PROFILE, profile.id) { token ->
+                                        profileRepository.saveProfile(profile.copy(schedules = emptyList()), token = token)
+                                        editingProfileForSchedule = null
+                                    }
                                 },
                                 colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
                             ) {
@@ -538,8 +551,10 @@ fun ProfilesScreen(
                                 endTimeSeconds = endHour * 3600 + endMin * 60,
                                 isEnabled = true
                             )
-                            profileRepository.saveProfile(profile.copy(schedules = listOf(newSchedule)))
-                            editingProfileForSchedule = null
+                            executeWithStrictCheck(MutationType.SAVE_PROFILE, profile.id) { token ->
+                                profileRepository.saveProfile(profile.copy(schedules = listOf(newSchedule)), token = token)
+                                editingProfileForSchedule = null
+                            }
                         }
                     ) {
                         Text("Save Schedule")
@@ -559,8 +574,10 @@ fun ProfilesScreen(
                 initialSelectedPackages = profile.targetApps.map { it.packageName }.toSet(),
                 onDismissRequest = { editingProfileForApps = null },
                 onConfirmSelection = { updatedList ->
-                    profileRepository.saveProfile(profile.copy(targetApps = updatedList))
-                    editingProfileForApps = null
+                    executeWithStrictCheck(MutationType.SAVE_PROFILE, profile.id) { token ->
+                        profileRepository.saveProfile(profile.copy(targetApps = updatedList), token = token)
+                        editingProfileForApps = null
+                    }
                 }
             )
         }
@@ -603,10 +620,12 @@ fun ProfilesScreen(
                 mechanism = strictState.mechanism,
                 saltBase64 = strictState.saltBase64,
                 expectedHash = strictState.passwordHash,
-                onChallengeSolved = {
+                mutationType = pendingMutationType,
+                targetId = pendingTargetId,
+                onTokenIssued = { token ->
                     val action = pendingStrictAction
                     pendingStrictAction = null
-                    action?.invoke()
+                    action?.invoke(token)
                 },
                 onDismissRequest = { pendingStrictAction = null }
             )

@@ -14,7 +14,6 @@ import android.view.accessibility.AccessibilityNodeInfo
 import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.data.repository.ValidatedUsageSnapshot
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
-import com.vr.takeback.domain.engine.DnsBlockMatcher
 import com.vr.takeback.domain.engine.SystemContextSnapshot
 import com.vr.takeback.domain.model.BlockDecision
 import com.vr.takeback.domain.model.BlockReason
@@ -41,6 +40,17 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         var isServiceRunning = false
             private set
+
+        @Volatile
+        private var activeServiceInstance: TakeBackAccessibilityService? = null
+
+        /**
+         * Called by ScheduleAlarmReceiver or ProfileRepository to immediately re-evaluate
+         * the current foreground application when a schedule boundary triggers.
+         */
+        fun notifyScheduleBoundary(context: Context) {
+            activeServiceInstance?.reEvaluateCurrentForegroundApp()
+        }
 
         private const val MIN_REFRESH_INTERVAL_MILLIS = 30_000L
         private const val INITIAL_RETRY_BACKOFF_MILLIS = 10_000L
@@ -150,6 +160,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         isServiceRunning = true
+        activeServiceInstance = this
         Log.i(TAG, "TakeBack Accessibility Service connected and active")
 
         // Build 8 Issue 4: Query actual device state from PowerManager and KeyguardManager
@@ -194,6 +205,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
+        if (activeServiceInstance == this) {
+            activeServiceInstance = null
+        }
         screenReceiver?.let {
             try {
                 unregisterReceiver(it)
@@ -207,6 +221,53 @@ class TakeBackAccessibilityService : AccessibilityService() {
         drainAndDeliverCallbacks(fallback)
         serviceScope.cancel()
         Log.i(TAG, "TakeBack Accessibility Service destroyed")
+    }
+
+    /**
+     * Immediately re-evaluates active restrictions against the currently visible foreground application.
+     * Invoked at schedule boundaries so restrictions begin/end immediately without waiting for app switch.
+     */
+    fun reEvaluateCurrentForegroundApp() {
+        val currentPkg = sessionTracker.currentPackage ?: return
+        if (currentPkg == applicationContext.packageName ||
+            currentPkg == "com.android.systemui" ||
+            currentPkg.contains("launcher", ignoreCase = true)
+        ) {
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val localTime = LocalTime.now()
+        val dayOfWeek = LocalDate.now().dayOfWeek
+
+        val activeProfiles = try {
+            TakeBackApplication.profileRepository.profiles.value
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        val activeSnapshot = TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
+        val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
+
+        val snapshot = SystemContextSnapshot(
+            timestampMillis = now,
+            localTime = localTime,
+            dayOfWeek = dayOfWeek,
+            foregroundPackageName = currentPkg,
+            accumulatedForegroundTimeMillis = activeSnapshot.foregroundUsageByPackage,
+            hourlyForegroundTimeMillis = activeSnapshot.hourlyUsageByPackage,
+            currentSessionDurationMillis = currentSessionDuration,
+            isUsageDataAvailable = activeSnapshot.isAvailable,
+            usageDataQuality = activeSnapshot.quality
+        )
+
+        val decision = engine.evaluate(activeProfiles, snapshot)
+        if (decision is BlockDecision.Blocked) {
+            Log.i(TAG, "Schedule boundary immediate block for $currentPkg: ${decision.reason} (Profile: ${decision.triggeringProfileName})")
+            lastBlockedPackage = currentPkg
+            lastBlockedTimestamp = now
+            handleBlockDecision(decision)
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -236,21 +297,22 @@ class TakeBackAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Strict Mode Anti-Tamper: Protect against Force Stop / Uninstall through Settings
+        // Strict Mode Anti-Tamper: Restrict Android Settings, App Info, Device Admin, and Uninstall screens
         val strictState = try {
             TakeBackApplication.strictModeRepository.protectionState.value
         } catch (e: Exception) {
             null
         }
 
-        if (strictState?.isCurrentlyLocked == true && packageName == "com.android.settings") {
-            if (isTakeBackSettingsScreen(rootInActiveWindow)) {
+        if (strictState?.isSettingsLocked == true) {
+            if (isRestrictedSettingsDestination(packageName, rootInActiveWindow)) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
                 val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                    putExtra("EXTRA_APP_NAME", "Settings Protection")
+                    putExtra("EXTRA_APP_NAME", "Android Settings")
                     putExtra("EXTRA_PROFILE_NAME", "Strict Mode")
-                    putExtra("EXTRA_REASON", "Settings modification and uninstallation are locked by Strict Mode")
+                    putExtra("EXTRA_REASON", "Access to TakeBack settings, device administrator, and uninstall controls is locked by Strict Mode.")
+                    putExtra("EXTRA_IS_SETTINGS_SHIELD", true)
                 }
                 startActivity(shieldIntent)
                 return
@@ -313,24 +375,6 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val browserUrl = if (SUPPORTED_BROWSERS.contains(packageName)) {
             extractBrowserUrl(rootInActiveWindow)
         } else null
-
-        // Web Shield Adult Content & Domain Inspection
-        if (!browserUrl.isNullOrBlank()) {
-            val isWebShieldOn = LocalDnsVpnService.isFilterRunning
-            if (isWebShieldOn && DnsBlockMatcher.isAdultContent(browserUrl)) {
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                lastBlockedPackage = packageName
-                lastBlockedTimestamp = now
-                val decision = BlockDecision.Blocked(
-                    target = BlockTarget.Website(browserUrl),
-                    triggeringProfileId = "web_shield",
-                    triggeringProfileName = "Web Shield",
-                    reason = BlockReason.AdultContentFilter
-                )
-                handleBlockDecision(decision)
-                return
-            }
-        }
 
         val quickBlockExpiry = if (isQuickBlockActive) {
             quickBlockState!!.startEpochMillis + (quickBlockState.durationMinutes * 60 * 1000L)
@@ -447,7 +491,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             is BlockReason.HourlyQuotaExceeded -> "Hourly allowance exhausted"
             is BlockReason.FocusSessionActive -> "Deep Focus sprint in progress"
             is BlockReason.QuickBlockActive -> "Quick Block active"
-            is BlockReason.AdultContentFilter -> "Filtered by Web Shield content protection"
+            is BlockReason.AdultContentFilter -> "Content blocked by filter"
             is BlockReason.KeywordMatch -> "Blocked by keyword '${decision.reason.keyword}'"
             is BlockReason.GeofenceActive -> "Restricted at this location"
             is BlockReason.GoalNotMet -> "Productivity goal required first"
@@ -488,26 +532,86 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun isTakeBackSettingsScreen(rootNode: AccessibilityNodeInfo?): Boolean {
+    private fun isRestrictedSettingsDestination(packageName: String, rootNode: AccessibilityNodeInfo?): Boolean {
         if (rootNode == null) return false
-        return try {
-            findTakeBackInNode(rootNode)
-        } catch (e: Exception) {
-            false
+
+        // Invariant: Do not obstruct Device Administrator initial activation confirmation screen!
+        if (isDeviceAdminActivationConfirmation(rootNode)) {
+            return false
         }
+
+        // Package installer uninstallation screen targeting TakeBack
+        if (packageName.contains("packageinstaller", ignoreCase = true)) {
+            return containsTextInNode(rootNode, "TakeBack")
+        }
+
+        val isSettingsPackage = packageName == "com.android.settings" ||
+                packageName == "com.samsung.android.settings" ||
+                packageName.contains(".settings")
+
+        if (isSettingsPackage) {
+            val hasTakeBack = containsTextInNode(rootNode, "TakeBack")
+
+            // 1. App Info / Details for TakeBack
+            val isAppManagement = containsTextInNode(rootNode, "Uninstall") ||
+                    containsTextInNode(rootNode, "Force stop") ||
+                    containsTextInNode(rootNode, "Disable") ||
+                    containsTextInNode(rootNode, "App info") ||
+                    containsTextInNode(rootNode, "Storage") ||
+                    containsTextInNode(rootNode, "Permissions")
+
+            if (hasTakeBack && isAppManagement) {
+                return true
+            }
+
+            // 2. Device Admin Settings
+            val isDeviceAdmin = containsTextInNode(rootNode, "Device admin") ||
+                    containsTextInNode(rootNode, "Device administrators") ||
+                    containsTextInNode(rootNode, "Device admin apps")
+            if (isDeviceAdmin && hasTakeBack) {
+                return true
+            }
+
+            // 3. Accessibility Settings for TakeBack
+            val isAccessibility = containsTextInNode(rootNode, "Accessibility") ||
+                    containsTextInNode(rootNode, "Installed apps") ||
+                    containsTextInNode(rootNode, "Installed services")
+            if (isAccessibility && hasTakeBack) {
+                return true
+            }
+
+            // 4. Special App Access
+            val isSpecialAccess = containsTextInNode(rootNode, "Usage access") ||
+                    containsTextInNode(rootNode, "Appear on top") ||
+                    containsTextInNode(rootNode, "Display over other apps") ||
+                    containsTextInNode(rootNode, "Special app access")
+            if (isSpecialAccess && hasTakeBack) {
+                return true
+            }
+        }
+
+        return false
     }
 
-    private fun findTakeBackInNode(node: AccessibilityNodeInfo): Boolean {
-        val text = node.text?.toString() ?: ""
-        val desc = node.contentDescription?.toString() ?: ""
+    private fun isDeviceAdminActivationConfirmation(rootNode: AccessibilityNodeInfo): Boolean {
+        val hasActivate = containsTextInNode(rootNode, "Activate this device admin app") ||
+                containsTextInNode(rootNode, "Activate")
+        val hasTakeBack = containsTextInNode(rootNode, "TakeBack")
+        val hasDeactivate = containsTextInNode(rootNode, "Deactivate")
+        return hasActivate && hasTakeBack && !hasDeactivate
+    }
 
-        if (text.contains("TakeBack", ignoreCase = true) || desc.contains("TakeBack", ignoreCase = true)) {
+    private fun containsTextInNode(node: AccessibilityNodeInfo, text: String): Boolean {
+        val nodeText = node.text?.toString() ?: ""
+        val nodeDesc = node.contentDescription?.toString() ?: ""
+
+        if (nodeText.contains(text, ignoreCase = true) || nodeDesc.contains(text, ignoreCase = true)) {
             return true
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findTakeBackInNode(child)
+            val found = containsTextInNode(child, text)
             if (found) return true
         }
         return false

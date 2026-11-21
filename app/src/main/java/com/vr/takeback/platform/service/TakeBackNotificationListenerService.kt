@@ -12,7 +12,7 @@ import java.time.LocalTime
 class TakeBackNotificationListenerService : NotificationListenerService() {
 
     private val engine = CentralRestrictionEngine()
-    private val profileRepository = ProfileRepository()
+    private val profileRepository by lazy { ProfileRepository(applicationContext) }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return

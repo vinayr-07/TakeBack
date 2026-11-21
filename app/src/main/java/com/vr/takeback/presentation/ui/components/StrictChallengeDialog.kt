@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,7 +17,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.domain.model.StrictMechanism
+import com.vr.takeback.domain.security.MutationType
 import com.vr.takeback.domain.security.StrictModeManager
 
 @Composable
@@ -26,7 +27,10 @@ fun StrictChallengeDialog(
     mechanism: StrictMechanism,
     saltBase64: String? = null,
     expectedHash: String? = null,
-    onChallengeSolved: () -> Unit,
+    mutationType: MutationType = MutationType.SAVE_PROFILE,
+    targetId: String? = null,
+    onChallengeSolved: () -> Unit = {},
+    onTokenIssued: (token: String) -> Unit = {},
     onDismissRequest: () -> Unit
 ) {
     var pinInput by remember { mutableStateOf("") }
@@ -77,7 +81,7 @@ fun StrictChallengeDialog(
 
                 Text(
                     text = if (mechanism == StrictMechanism.PIN) {
-                        "Enter your secure PIN to open a 10-minute maintenance window."
+                        "Enter your secure PIN to authorize this restriction change."
                     } else {
                         "Type the exact verification challenge below to ensure this change is deliberate."
                     },
@@ -162,25 +166,28 @@ fun StrictChallengeDialog(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            if (mechanism == StrictMechanism.PIN) {
-                                val salt = saltBase64
-                                val hash = expectedHash
-                                if (salt != null && hash != null && StrictModeManager.verifyPin(pinInput, salt, hash)) {
-                                    onChallengeSolved()
-                                } else {
-                                    errorMessage = "Incorrect PIN. Please try again."
-                                }
+                            val input = if (mechanism == StrictMechanism.PIN) pinInput else textChallengeInput
+                            val token = TakeBackApplication.strictModeRepository.verifyAndIssueToken(
+                                input = input,
+                                mutationType = mutationType,
+                                targetId = targetId,
+                                expectedChallenge = if (mechanism == StrictMechanism.TEXT_CHALLENGE) challengeText else null
+                            )
+
+                            if (token != null) {
+                                onTokenIssued(token)
+                                onChallengeSolved()
                             } else {
-                                if (StrictModeManager.verifyTextChallenge(textChallengeInput, challengeText)) {
-                                    onChallengeSolved()
+                                errorMessage = if (mechanism == StrictMechanism.PIN) {
+                                    "Incorrect PIN. Please try again."
                                 } else {
-                                    errorMessage = "Challenge does not match. Please verify character by character."
+                                    "Challenge does not match. Please verify character by character."
                                 }
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                     ) {
-                        Text("Verify & Unlock")
+                        Text("Verify & Authorize")
                     }
                 }
             }

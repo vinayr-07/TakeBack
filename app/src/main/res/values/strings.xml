@@ -3,4 +3,6 @@
     <string name="accessibility_service_description">TakeBack Accessibility Service detects when restricted applications or distracting websites are opened and displays your custom focus shield.</string>
     <string name="notification_channel_name">TakeBack Protection</string>
     <string name="notification_channel_description">Shows active distraction protection and scheduled focus state.</string>
+    <string name="device_admin_description">Enables TakeBack to deter unauthorized changes, settings tampering, and casual uninstallation while Strict Mode is active.</string>
+    <string name="device_admin_warning">Warning: Deactivating TakeBack Device Administrator compromises your active Strict Mode protections, allowing profiles and restrictions to be bypassed. Are you sure you want to proceed?</string>
 </resources>

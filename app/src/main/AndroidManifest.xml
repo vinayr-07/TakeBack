@@ -92,6 +92,8 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
             </intent-filter>
         </receiver>
 
@@ -99,6 +101,21 @@
         <receiver
             android:name=".platform.receiver.ScheduleAlarmReceiver"
             android:exported="false" />
+
+        <!-- Standard Android Device Administrator -->
+        <receiver
+            android:name=".platform.receiver.TakeBackDeviceAdminReceiver"
+            android:label="@string/app_name"
+            android:description="@string/device_admin_description"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/takeback_device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Full-Screen Strict Alarm Activity with Keyguard Wakeup -->
         <activity
@@ -124,20 +141,6 @@
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
-        </service>
-
-        <!-- Local DNS VPN Service for On-Device Domain and Adult Filtering -->
-        <service
-            android:name=".platform.service.LocalDnsVpnService"
-            android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.net.VpnService" />
-            </intent-filter>
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="On-device local DNS distraction and adult filtering" />
         </service>
 
     </application>

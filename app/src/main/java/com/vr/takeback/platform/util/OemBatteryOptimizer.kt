@@ -36,6 +36,8 @@ object OemBatteryOptimizer {
         }
     }
 
+    fun openAutoStartSettings(context: Context): Boolean = launchOptimizationSettings(context)
+
     /**
      * Tries manufacturer-specific intent first, then falls back to standard Android battery settings.
      */

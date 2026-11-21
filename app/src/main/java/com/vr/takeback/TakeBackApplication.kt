@@ -25,5 +25,13 @@ class TakeBackApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+
+        // Safe migration: Clear any obsolete Web Shield DNS preferences from earlier versions
+        try {
+            val dnsPrefs = getSharedPreferences("takeback_dns_prefs", MODE_PRIVATE)
+            dnsPrefs.edit().clear().apply()
+        } catch (e: Exception) {
+            // Ignore
+        }
     }
 }
