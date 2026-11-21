@@ -288,15 +288,32 @@ class CentralRestrictionEngine {
             }
             if (!isTargeted) continue
 
-            // Defect 1: If data is absent, only block if the accumulated map shows usage >= limit
-            // (last-known state carried forward). If the map is also empty, allow (safe default).
+            // Defect 1 & Build 7 Issue 2: If data is absent or stale, only block if the
+            // corresponding measurement already exceeds the limit (last-known state carried forward).
+            // Uses distinct measurements:
+            // - FULL_DAY: last-known daily usage from accumulatedForegroundTimeMillis
+            // - PER_HOUR: last-known hourly usage from hourlyForegroundTimeMillis
+            // - PER_SESSION: last-known session duration from currentSessionDurationMillis
+            // Never compares daily usage against hourly or session thresholds!
             if (dataAbsent) {
                 val poolPackages = if (limit.targetPackageName == null) {
                     profile.targetApps.filter { !it.isAllowlist }.map { it.packageName }
                 } else {
                     listOf(packageName)
                 }
-                val lastKnownMillis = poolPackages.sumOf { snapshot.accumulatedForegroundTimeMillis[it] ?: 0L }
+
+                val lastKnownMillis: Long = when (limit.windowType) {
+                    LimitWindowType.FULL_DAY -> {
+                        poolPackages.sumOf { snapshot.accumulatedForegroundTimeMillis[it] ?: 0L }
+                    }
+                    LimitWindowType.PER_HOUR -> {
+                        poolPackages.sumOf { snapshot.hourlyForegroundTimeMillis[it] ?: 0L }
+                    }
+                    LimitWindowType.PER_SESSION -> {
+                        snapshot.currentSessionDurationMillis
+                    }
+                }
+
                 val lastKnownMinutes = (lastKnownMillis / (1000 * 60)).toInt()
                 if (lastKnownMinutes < limit.dailyLimitMinutes) {
                     // Cannot verify limit is exceeded → allow (do not penalise due to data absence)

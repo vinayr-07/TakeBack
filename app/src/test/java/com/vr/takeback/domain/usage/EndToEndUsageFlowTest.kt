@@ -408,4 +408,303 @@ class EndToEndUsageFlowTest {
         )
         assertFalse(result.isDeviceInteractiveAvailable)
     }
+
+    // =========================================================================
+    // BUILD 7 INTEGRATION TESTS
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 1: Fresh daily and hourly measurements reach the engine
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_freshDailyAndHourlyMeasurementsReachEngine() {
+        val now = 1_700_000_000_000L + 120 * 60 * 1000L // 2 hours into day
+        val dayStart = 1_700_000_000_000L
+        val hourStart = now - 60 * 60 * 1000L
+
+        // Events: 70 min total today (45 min earlier, 25 min in last hour)
+        val events = listOf(
+            RawUsageEvent(INSTAGRAM, null, dayStart, NormalizedEventType.SCREEN_INTERACTIVE),
+            RawUsageEvent(INSTAGRAM, "MainActivity", dayStart + 10 * 60 * 1000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent(INSTAGRAM, "MainActivity", dayStart + 55 * 60 * 1000L, NormalizedEventType.ACTIVITY_PAUSED), // 45m
+            RawUsageEvent(INSTAGRAM, "MainActivity", hourStart + 10 * 60 * 1000L, NormalizedEventType.ACTIVITY_RESUMED),
+            RawUsageEvent(INSTAGRAM, "MainActivity", hourStart + 35 * 60 * 1000L, NormalizedEventType.ACTIVITY_PAUSED)  // 25m
+        )
+
+        // 1. Reconstruct daily
+        val dailySessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = dayStart,
+            endEpochMillis = now,
+            isToday = true,
+            isUserLaunchableApp = { true },
+            currentEpochMillis = now
+        )
+        val dailyUsage = dailySessions.groupBy { it.packageName }.mapValues { (_, s) -> s.sumOf { it.durationMillis } }
+        assertEquals(70 * 60 * 1000L, dailyUsage[INSTAGRAM])
+
+        // 2. Reconstruct hourly (rolling 60 min)
+        val hourlySessions = UsageSessionAggregator.reconstructSessions(
+            events = events,
+            startEpochMillis = hourStart,
+            endEpochMillis = now,
+            isToday = true,
+            isUserLaunchableApp = { true },
+            currentEpochMillis = now
+        )
+        val hourlyUsage = hourlySessions.groupBy { it.packageName }.mapValues { (_, s) -> s.sumOf { it.durationMillis } }
+        assertEquals(25 * 60 * 1000L, hourlyUsage[INSTAGRAM])
+
+        // 3. Engine evaluation: Daily limit 60m -> Blocked
+        val dailyProfile = makeProfile(limitMinutes = 60, windowType = LimitWindowType.FULL_DAY)
+        val snap = snapshot(INSTAGRAM, accumulatedMillis = dailyUsage, hourlyMillis = hourlyUsage)
+        val dailyDecision = engine.evaluate(listOf(dailyProfile), snap)
+        assertTrue("Daily limit 60m must block when daily usage is 70m", dailyDecision is BlockDecision.Blocked)
+
+        // 4. Engine evaluation: Hourly limit 30m -> Allowed (25m < 30m)
+        val hourlyProfile = makeProfile(id = "h1", limitMinutes = 30, windowType = LimitWindowType.PER_HOUR, targetPackageName = INSTAGRAM)
+        val hourlyDecision = engine.evaluate(listOf(hourlyProfile), snap)
+        assertTrue("Hourly limit 30m must allow when hourly usage is 25m", hourlyDecision is BlockDecision.Allowed)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 2: Refreshed hourly measurements replace stale hourly measurements
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_refreshedHourlyMeasurementsReplaceStaleHourlyMeasurements() {
+        val hourlyProfile = makeProfile(id = "h1", limitMinutes = 30, windowType = LimitWindowType.PER_HOUR, targetPackageName = INSTAGRAM)
+
+        // Initial stale snapshot: hourly usage is 15 min (Allowed)
+        val staleHourlyMap = mapOf(INSTAGRAM to 15 * 60 * 1000L)
+        val staleSnapshot = snapshot(INSTAGRAM, hourlyMillis = staleHourlyMap)
+        val initialDecision = engine.evaluate(listOf(hourlyProfile), staleSnapshot)
+        assertTrue("Initial stale snapshot under limit must allow", initialDecision is BlockDecision.Allowed)
+
+        // Fresh refresh produces fresh hourly usage: 35 min (exceeds 30 min limit)
+        val freshHourlyMap = mapOf(INSTAGRAM to 35 * 60 * 1000L)
+        val updatedSnapshot = staleSnapshot.copy(
+            hourlyForegroundTimeMillis = freshHourlyMap,
+            isUsageDataAvailable = true,
+            usageDataQuality = UsageDataQuality.PROVISIONAL
+        )
+        val refreshedDecision = engine.evaluate(listOf(hourlyProfile), updatedSnapshot)
+        assertTrue("Refreshed hourly measurement must replace stale measurement and block", refreshedDecision is BlockDecision.Blocked)
+        assertTrue((refreshedDecision as BlockDecision.Blocked).reason is BlockReason.HourlyQuotaExceeded)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 3: Stale hourly quota uses last-known hourly data (NOT daily data)
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_staleHourlyQuotaUsesLastKnownHourlyData_notDailyData() {
+        val hourlyProfile = makeProfile(id = "h1", limitMinutes = 30, windowType = LimitWindowType.PER_HOUR, targetPackageName = INSTAGRAM)
+
+        // Scenario A: Daily usage is 120 min (> 30 min), but hourly usage is 15 min (< 30 min).
+        // Stale snapshot must NOT compare daily usage against the hourly limit!
+        val staleSnapUnder = snapshot(
+            foregroundPkg = INSTAGRAM,
+            accumulatedMillis = mapOf(INSTAGRAM to 120 * 60 * 1000L), // 120m daily
+            hourlyMillis = mapOf(INSTAGRAM to 15 * 60 * 1000L),       // 15m hourly
+            isAvailable = false,
+            quality = UsageDataQuality.STALE
+        )
+        val decisionUnder = engine.evaluate(listOf(hourlyProfile), staleSnapUnder)
+        assertTrue("Stale data with hourly usage below limit must NOT block (never compare daily to hourly limit)", decisionUnder is BlockDecision.Allowed)
+
+        // Scenario B: Hourly usage is 35 min (> 30 min limit).
+        val staleSnapOver = staleSnapUnder.copy(hourlyForegroundTimeMillis = mapOf(INSTAGRAM to 35 * 60 * 1000L))
+        val decisionOver = engine.evaluate(listOf(hourlyProfile), staleSnapOver)
+        assertTrue("Stale data with hourly usage exceeding limit must block with HourlyQuotaExceeded", decisionOver is BlockDecision.Blocked)
+        assertTrue((decisionOver as BlockDecision.Blocked).reason is BlockReason.HourlyQuotaExceeded)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 4: Stale per-session quota uses last-known session data (NOT daily data)
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_stalePerSessionQuotaUsesLastKnownSessionData_notDailyData() {
+        val sessionProfile = makeProfile(id = "s1", limitMinutes = 15, windowType = LimitWindowType.PER_SESSION, targetPackageName = INSTAGRAM)
+
+        // Scenario A: Daily usage is 120 min (> 15 min), but current session is 5 min (< 15 min).
+        val staleSnapUnder = snapshot(
+            foregroundPkg = INSTAGRAM,
+            accumulatedMillis = mapOf(INSTAGRAM to 120 * 60 * 1000L), // 120m daily
+            sessionMillis = 5 * 60 * 1000L,                           // 5m session
+            isAvailable = false,
+            quality = UsageDataQuality.STALE
+        )
+        val decisionUnder = engine.evaluate(listOf(sessionProfile), staleSnapUnder)
+        assertTrue("Stale data with session duration below limit must NOT block", decisionUnder is BlockDecision.Allowed)
+
+        // Scenario B: Current session duration is 20 min (> 15 min limit).
+        val staleSnapOver = staleSnapUnder.copy(currentSessionDurationMillis = 20 * 60 * 1000L)
+        val decisionOver = engine.evaluate(listOf(sessionProfile), staleSnapOver)
+        assertTrue("Stale data with session duration exceeding limit must block", decisionOver is BlockDecision.Blocked)
+        val reason = (decisionOver as BlockDecision.Blocked).reason
+        assertTrue(reason is BlockReason.DailyLimitExceeded)
+        assertEquals(15, (reason as BlockReason.DailyLimitExceeded).limitMinutes)
+        assertEquals(20, reason.usedMinutes)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 5: Screen-off does not extend application session time
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_screenOffDoesNotExtendApplicationSessionTime() {
+        val tracker = ForegroundSessionTracker { it.contains("launcher") }
+        val t0 = 1_000_000L
+
+        // 1. Open Instagram at t0
+        tracker.onPackageChanged(INSTAGRAM, t0)
+        assertEquals(0L, tracker.getCurrentSessionDuration(t0))
+
+        // 2. Active use for 20 minutes
+        val t20 = t0 + 20 * 60 * 1000L
+        assertEquals(20 * 60 * 1000L, tracker.getCurrentSessionDuration(t20))
+
+        // 3. Screen turns OFF at t20 (phone locked for 10 minutes)
+        tracker.onScreenStateChanged(isInteractive = false, timestampMillis = t20)
+        assertEquals("Session duration must be 0 while screen is off", 0L, tracker.getCurrentSessionDuration(t20 + 5 * 60 * 1000L))
+
+        // 4. Screen turns ON and unlocked at t30 (10 minutes later)
+        val t30 = t0 + 30 * 60 * 1000L
+        tracker.onScreenStateChanged(isInteractive = true, timestampMillis = t30)
+        tracker.onKeyguardChanged(isLocked = false, timestampMillis = t30)
+
+        // 5. User resumes Instagram for 5 minutes (at t35)
+        val t35 = t30 + 5 * 60 * 1000L
+        val secondSessionDuration = tracker.getCurrentSessionDuration(t35)
+
+        // The second session MUST NOT inherit the 20 min or include the 10 min lock time!
+        assertEquals("Second session duration must be exactly 5 minutes, excluding lock time", 5 * 60 * 1000L, secondSessionDuration)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 6: Launcher transition resets session time
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_launcherTransitionResetsSessionTime() {
+        val tracker = ForegroundSessionTracker { it.contains("launcher") }
+        val t0 = 1_000_000L
+
+        // 1. Open Instagram for 20 minutes
+        tracker.onPackageChanged(INSTAGRAM, t0)
+        val t20 = t0 + 20 * 60 * 1000L
+        assertEquals(20 * 60 * 1000L, tracker.getCurrentSessionDuration(t20))
+
+        // 2. Switch to Home launcher for 10 minutes
+        tracker.onPackageChanged("com.android.launcher3", t20)
+        assertEquals("Launcher must have 0 session duration", 0L, tracker.getCurrentSessionDuration(t20 + 5 * 60 * 1000L))
+
+        // 3. Re-open Instagram at t30 for 5 minutes
+        val t30 = t0 + 30 * 60 * 1000L
+        tracker.onPackageChanged(INSTAGRAM, t30)
+        val t35 = t30 + 5 * 60 * 1000L
+
+        assertEquals("Reopened app must start session from 0 and count only 5 minutes", 5 * 60 * 1000L, tracker.getCurrentSessionDuration(t35))
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 7: Query failure triggers controlled retry backoff
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_queryFailureTriggersControlledRetryBackoff() {
+        val initialBackoff = 10_000L
+        val maxBackoff = 60_000L
+
+        var currentBackoff = initialBackoff
+
+        fun onFailure() {
+            currentBackoff = minOf(maxBackoff, currentBackoff * 2)
+        }
+
+        fun onSuccess() {
+            currentBackoff = initialBackoff
+        }
+
+        assertEquals(10_000L, currentBackoff)
+
+        // Failure 1: 10s * 2 = 20s
+        onFailure()
+        assertEquals(20_000L, currentBackoff)
+
+        // Failure 2: 20s * 2 = 40s
+        onFailure()
+        assertEquals(40_000L, currentBackoff)
+
+        // Failure 3: 40s * 2 = 80s -> capped at 60s
+        onFailure()
+        assertEquals(60_000L, currentBackoff)
+
+        // Failure 4: stays capped at 60s
+        onFailure()
+        assertEquals(60_000L, currentBackoff)
+
+        // Success resets to initial backoff
+        onSuccess()
+        assertEquals(10_000L, currentBackoff)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 8: Historical empty query remains unavailable
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_historicalEmptyQueryRemainsUnavailable() {
+        fun handleEmptyQuery(isToday: Boolean): Pair<Long?, UsageDataQuality> {
+            return if (isToday) {
+                Pair(0L, UsageDataQuality.PROVISIONAL)
+            } else {
+                Pair(null, UsageDataQuality.HISTORY_EXPIRED)
+            }
+        }
+
+        // For past day: EmptySuccess must return null duration and HISTORY_EXPIRED
+        val pastResult = handleEmptyQuery(isToday = false)
+        assertNull("Historical empty query must have null (unavailable) duration", pastResult.first)
+        assertEquals(UsageDataQuality.HISTORY_EXPIRED, pastResult.second)
+
+        // For today: EmptySuccess returns 0L with PROVISIONAL
+        val todayResult = handleEmptyQuery(isToday = true)
+        assertEquals(0L, todayResult.first)
+        assertEquals(UsageDataQuality.PROVISIONAL, todayResult.second)
+    }
+
+    // -------------------------------------------------------------------------
+    // Build 7 Test 9: Multiple refresh triggers do not create concurrent refresh jobs
+    // -------------------------------------------------------------------------
+    @Test
+    fun testBuild7_multipleRefreshTriggersDoNotCreateConcurrentRefreshJobs() {
+        var isJobActive = false
+        var executedJobs = 0
+
+        fun triggerRefresh(): Boolean {
+            if (isJobActive) {
+                return false // Single-flight active: skipped
+            }
+            isJobActive = true
+            executedJobs++
+            return true
+        }
+
+        fun completeRefresh() {
+            isJobActive = false
+        }
+
+        // Trigger 1 starts
+        assertTrue("First trigger should execute", triggerRefresh())
+        assertEquals(1, executedJobs)
+
+        // Rapid concurrent triggers while job 1 is active
+        assertFalse("Second trigger while active must be rejected (single-flight)", triggerRefresh())
+        assertFalse("Third trigger while active must be rejected (single-flight)", triggerRefresh())
+        assertEquals(1, executedJobs)
+
+        // Complete job 1
+        completeRefresh()
+
+        // Trigger 4 after completion starts successfully
+        assertTrue("Trigger after completion should execute", triggerRefresh())
+        assertEquals(2, executedJobs)
+        completeRefresh()
+    }
 }

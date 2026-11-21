@@ -126,6 +126,9 @@ class UsageStatsRepository(private val context: Context) {
     @Volatile
     private var cachedLaunchablePackages: Set<String>? = null
 
+    // Build 7 Issue 6: Cache resolved package labels to avoid repeated PackageManager IPC
+    private val appLabelCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     @Volatile
     private var latestDiagnostics: UsageDiagnostics? = null
 
@@ -179,6 +182,7 @@ class UsageStatsRepository(private val context: Context) {
 
     fun invalidatePackageCache() {
         cachedLaunchablePackages = null
+        appLabelCache.clear()
     }
 
     fun isUserLaunchableApp(packageName: String): Boolean {
@@ -315,6 +319,9 @@ class UsageStatsRepository(private val context: Context) {
             else -> emptyMap()
         }
 
+        // Build 7 Issue 6: Calculate ReconstructionResult once and reuse for snapshot and checkpoint persistence.
+        var dailyReconstruction: ReconstructionResult? = null
+
         val snapshot = when (queryResult) {
             is UsageEventsQueryResult.Success -> {
                 val reconstruction = UsageSessionAggregator.reconstructFull(
@@ -325,6 +332,8 @@ class UsageStatsRepository(private val context: Context) {
                     isUserLaunchableApp = ::isUserLaunchableApp,
                     currentEpochMillis = now
                 )
+                dailyReconstruction = reconstruction
+
                 val usageMap = reconstruction.appSessions
                     .groupBy { it.packageName }
                     .mapValues { (_, list) -> list.sumOf { it.durationMillis } }
@@ -382,18 +391,9 @@ class UsageStatsRepository(private val context: Context) {
 
         lastValidatedSnapshot = snapshot
 
-        // Defect 6: Save checkpoint with actual reconstruction data, not hardcoded 0L.
-        // Reuse the already-computed reconstruction from above (no second full pass).
-        if (snapshot.isAvailable && queryResult is UsageEventsQueryResult.Success) {
-            val reconstruction = UsageSessionAggregator.reconstructFull(
-                events = queryResult.events,
-                startEpochMillis = startOfDay,
-                endEpochMillis = now,
-                isToday = true,
-                isUserLaunchableApp = ::isUserLaunchableApp,
-                currentEpochMillis = now
-            )
-            saveProvisionalIntradayCheckpoint(today, now, startOfDay, snapshot, reconstruction)
+        // Build 7 Issue 6: Controlled idempotent checkpoint persistence reusing dailyReconstruction (no second full pass)
+        if (snapshot.isAvailable && dailyReconstruction != null) {
+            saveProvisionalIntradayCheckpoint(today, now, startOfDay, snapshot, dailyReconstruction)
         }
 
         snapshot
@@ -879,7 +879,15 @@ class UsageStatsRepository(private val context: Context) {
         val queryResult = fetchRawUsageEvents(queryStart, end)
         val events = when (queryResult) {
             is UsageEventsQueryResult.Success -> queryResult.events
-            is UsageEventsQueryResult.EmptySuccess -> return Pair(0L, if (isToday) UsageDataQuality.PROVISIONAL else UsageDataQuality.RECONSTRUCTED_COMPLETE)
+            is UsageEventsQueryResult.EmptySuccess -> {
+                // Build 7 Issue 5: Represent historical empty queries as unavailable.
+                // Do not silently display zero for missing history!
+                return if (isToday) {
+                    Pair(0L, UsageDataQuality.PROVISIONAL)
+                } else {
+                    Pair(null, UsageDataQuality.HISTORY_EXPIRED)
+                }
+            }
             is UsageEventsQueryResult.SecurityError -> return Pair(null, UsageDataQuality.PERMISSION_DENIED)
             else -> return Pair(null, UsageDataQuality.QUERY_FAILED)
         }
@@ -1136,11 +1144,15 @@ class UsageStatsRepository(private val context: Context) {
     }
 
     fun resolveAppLabel(packageName: String): String {
-        return try {
+        val cached = appLabelCache[packageName]
+        if (cached != null) return cached
+        val label = try {
             val appInfo = packageManager.getApplicationInfo(packageName, 0)
             packageManager.getApplicationLabel(appInfo).toString()
         } catch (e: Exception) {
             packageName.substringAfterLast('.')
         }
+        appLabelCache[packageName] = label
+        return label
     }
 }

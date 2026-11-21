@@ -1,11 +1,15 @@
 package com.vr.takeback.platform.service
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.vr.takeback.TakeBackApplication
+import com.vr.takeback.data.repository.ValidatedUsageSnapshot
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
 import com.vr.takeback.domain.engine.DnsBlockMatcher
 import com.vr.takeback.domain.engine.SystemContextSnapshot
@@ -13,6 +17,7 @@ import com.vr.takeback.domain.model.BlockDecision
 import com.vr.takeback.domain.model.BlockReason
 import com.vr.takeback.domain.model.BlockTarget
 import com.vr.takeback.domain.model.EventType
+import com.vr.takeback.domain.usage.ForegroundSessionTracker
 import com.vr.takeback.presentation.ui.shield.BlockShieldActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +38,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
         var isServiceRunning = false
             private set
 
+        private const val MIN_REFRESH_INTERVAL_MILLIS = 30_000L
+        private const val INITIAL_RETRY_BACKOFF_MILLIS = 10_000L
+        private const val MAX_RETRY_BACKOFF_MILLIS = 60_000L
+
         private val SUPPORTED_BROWSERS = setOf(
             "com.android.chrome",
             "com.sec.android.app.sbrowser",
@@ -49,32 +58,103 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private val engine = CentralRestrictionEngine()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var lastUsageSnapshotRefreshTime: Long = 0L
+    private var currentBackoffMillis: Long = INITIAL_RETRY_BACKOFF_MILLIS
     private var lastBlockedPackage: String? = null
     private var lastBlockedTimestamp: Long = 0
-    @Volatile
-    private var currentForegroundPackage: String? = null
-    @Volatile
-    private var currentSessionStartTime: Long = 0L
-    // Defect 4: Single-flight refresh guard – prevents stacking concurrent refresh coroutines.
+
+    // Build 7 Issue 3: Coherent foreground session tracker
+    val sessionTracker = ForegroundSessionTracker { pkg ->
+        pkg == applicationContext.packageName ||
+                pkg == "com.android.systemui" ||
+                pkg.contains("launcher", ignoreCase = true)
+    }
+
+    // Build 7 Issue 4: Single-flight refresh job
     @Volatile
     private var refreshJob: Job? = null
+
+    private var screenReceiver: BroadcastReceiver? = null
+
+    /**
+     * Build 7 Issue 4: Real refresh throttling.
+     * Enforces minimum refresh interval, single-flight execution, and exponential failure retry backoff.
+     */
+    fun triggerUsageSnapshotRefresh(
+        force: Boolean = false,
+        onFreshAvailable: ((ValidatedUsageSnapshot) -> Unit)? = null
+    ) {
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastUsageSnapshotRefreshTime
+
+        if (!force && elapsed < MIN_REFRESH_INTERVAL_MILLIS) {
+            return
+        }
+        if (!force && elapsed < currentBackoffMillis) {
+            return
+        }
+
+        if (refreshJob?.isActive == true) {
+            return // Single-flight guard
+        }
+
+        refreshJob = serviceScope.launch {
+            try {
+                val fresh = TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
+                lastUsageSnapshotRefreshTime = System.currentTimeMillis()
+                currentBackoffMillis = INITIAL_RETRY_BACKOFF_MILLIS // Reset backoff on success
+                onFreshAvailable?.invoke(fresh)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed usage snapshot refresh", e)
+                lastUsageSnapshotRefreshTime = System.currentTimeMillis()
+                // Failure retry backoff: exponential backoff doubling up to MAX_RETRY_BACKOFF_MILLIS
+                currentBackoffMillis = minOf(MAX_RETRY_BACKOFF_MILLIS, currentBackoffMillis * 2)
+            }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         isServiceRunning = true
         Log.i(TAG, "TakeBack Accessibility Service connected and active")
-        serviceScope.launch {
-            try {
-                TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
-            } catch (e: Exception) {
-                // ignore
+
+        // Build 7 Issue 3: Register broadcast receiver for screen state transitions
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val now = System.currentTimeMillis()
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> sessionTracker.onScreenStateChanged(true, now)
+                    Intent.ACTION_SCREEN_OFF -> sessionTracker.onScreenStateChanged(false, now)
+                    Intent.ACTION_USER_PRESENT -> sessionTracker.onKeyguardChanged(false, now)
+                }
             }
         }
+        screenReceiver = receiver
+        try {
+            registerReceiver(receiver, filter)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register screen state receiver", e)
+        }
+
+        // Build 7 Issue 4: Initial refresh using the same throttled / single-flight guard
+        triggerUsageSnapshotRefresh(force = true)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
+        screenReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (e: Exception) {
+                // ignore
+            }
+            screenReceiver = null
+        }
         serviceScope.cancel()
         Log.i(TAG, "TakeBack Accessibility Service destroyed")
     }
@@ -89,16 +169,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         val now = System.currentTimeMillis()
 
-        // Defect 3: Update foreground tracking BEFORE early-return for launchers/systemUI.
-        // This ensures that when the user next opens an app, currentSessionStartTime is
-        // reset relative to the moment they left that app (not relative to the previous app).
+        // Build 7 Issue 3: Update coherent foreground session tracker before early-return
+        sessionTracker.onPackageChanged(packageName, now)
+
         val isLauncherOrSystemUi = packageName == "com.android.systemui" ||
                 packageName.contains("launcher", ignoreCase = true)
-
-        if (packageName != currentForegroundPackage) {
-            currentForegroundPackage = packageName
-            currentSessionStartTime = now
-        }
 
         // Now that session state is updated, early-return for launcher/systemUI packages.
         // These cannot be blocked by profiles.
@@ -242,7 +317,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         }
 
-        val currentSessionDuration = maxOf(0L, now - currentSessionStartTime)
+        val currentSessionDuration = sessionTracker.getCurrentSessionDuration(now)
 
         // Build current context snapshot
         val snapshot = SystemContextSnapshot(
@@ -252,7 +327,6 @@ class TakeBackAccessibilityService : AccessibilityService() {
             foregroundPackageName = packageName,
             activeBrowserUrl = browserUrl,
             accumulatedForegroundTimeMillis = activeSnapshot?.foregroundUsageByPackage ?: emptyMap(),
-            // Defect 2: Populate hourlyForegroundTimeMillis from the validated snapshot.
             hourlyForegroundTimeMillis = activeSnapshot?.hourlyUsageByPackage ?: emptyMap(),
             currentSessionDurationMillis = currentSessionDuration,
             isUsageDataAvailable = activeSnapshot?.isAvailable ?: false,
@@ -272,35 +346,31 @@ class TakeBackAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Requirement 4: If usage limits apply and the snapshot is stale/unloaded,
-        // refresh in background without blocking the main thread, and re-evaluate only if
-        // the package is STILL foreground before executing any delayed block!
-        // Defect 4: Single-flight guard – skip if a refresh coroutine is already active.
+        // Build 7 Issue 1 & Issue 4: Controlled refresh triggers.
+        // Refresh only on window state changes (not on scrolling or content-changes).
+        val isWindowTransition = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+
         val isSnapshotFresh = activeSnapshot?.isAvailable == true && (now - activeSnapshot.capturedAtMillis <= 30_000L)
-        if (hasUsageLimitForApp && !isSnapshotFresh) {
-            if (refreshJob?.isActive != true) {
-                refreshJob = serviceScope.launch {
-                    try {
-                        val fresh = TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
-                        lastUsageSnapshotRefreshTime = System.currentTimeMillis()
-                        if (currentForegroundPackage == packageName) {
-                            val updatedSnapshot = snapshot.copy(
-                                timestampMillis = System.currentTimeMillis(),
-                                accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
-                                currentSessionDurationMillis = System.currentTimeMillis() - currentSessionStartTime,
-                                isUsageDataAvailable = fresh.isAvailable,
-                                usageDataQuality = fresh.quality
-                            )
-                            val delayedDecision = engine.evaluate(activeProfiles, updatedSnapshot)
-                            if (delayedDecision is BlockDecision.Blocked && currentForegroundPackage == packageName) {
-                                android.util.Log.i(TAG, "Delayed block on fresh snapshot for $packageName: ${delayedDecision.reason}")
-                                lastBlockedPackage = packageName
-                                lastBlockedTimestamp = System.currentTimeMillis()
-                                handleBlockDecision(delayedDecision)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        android.util.Log.w(TAG, "Failed background refresh for usage limits", e)
+        if (hasUsageLimitForApp && !isSnapshotFresh && isWindowTransition) {
+            triggerUsageSnapshotRefresh(force = false) { fresh ->
+                if (sessionTracker.currentPackage == packageName) {
+                    val freshSessionDuration = sessionTracker.getCurrentSessionDuration(System.currentTimeMillis())
+                    val updatedSnapshot = snapshot.copy(
+                        timestampMillis = System.currentTimeMillis(),
+                        accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
+                        // Build 7 Issue 1: Propagate fresh hourlyForegroundTimeMillis to delayed evaluation
+                        hourlyForegroundTimeMillis = fresh.hourlyUsageByPackage,
+                        currentSessionDurationMillis = freshSessionDuration,
+                        isUsageDataAvailable = fresh.isAvailable,
+                        usageDataQuality = fresh.quality
+                    )
+                    val delayedDecision = engine.evaluate(activeProfiles, updatedSnapshot)
+                    if (delayedDecision is BlockDecision.Blocked && sessionTracker.currentPackage == packageName) {
+                        Log.i(TAG, "Delayed block on fresh snapshot for $packageName: ${delayedDecision.reason}")
+                        lastBlockedPackage = packageName
+                        lastBlockedTimestamp = System.currentTimeMillis()
+                        handleBlockDecision(delayedDecision)
                     }
                 }
             }
@@ -309,6 +379,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         Log.w(TAG, "Accessibility service interrupted by system")
+        sessionTracker.reset()
     }
 
     private fun handleBlockDecision(decision: BlockDecision.Blocked) {
