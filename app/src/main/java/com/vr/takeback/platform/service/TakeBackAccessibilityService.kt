@@ -14,6 +14,11 @@ import com.vr.takeback.domain.model.BlockReason
 import com.vr.takeback.domain.model.BlockTarget
 import com.vr.takeback.domain.model.EventType
 import com.vr.takeback.presentation.ui.shield.BlockShieldActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalTime
@@ -40,6 +45,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
     }
 
     private val engine = CentralRestrictionEngine()
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var lastUsageSnapshotRefreshTime: Long = 0L
     private var lastBlockedPackage: String? = null
     private var lastBlockedTimestamp: Long = 0
 
@@ -47,11 +54,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         isServiceRunning = true
         Log.i(TAG, "TakeBack Accessibility Service connected and active")
+        serviceScope.launch {
+            try {
+                TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
+        serviceScope.cancel()
         Log.i(TAG, "TakeBack Accessibility Service destroyed")
     }
 
@@ -67,6 +82,16 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
 
         val now = System.currentTimeMillis()
+        if (now - lastUsageSnapshotRefreshTime > 30_000L) {
+            lastUsageSnapshotRefreshTime = now
+            serviceScope.launch {
+                try {
+                    TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
+                } catch (e: Exception) {
+                    // ignore
+                }
+            }
+        }
 
         // Strict Mode Anti-Tamper: Protect against Force Stop / Uninstall through Settings
         val strictState = try {
@@ -192,6 +217,12 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         } else emptySet()
 
+        val usageSnapshot = try {
+            TakeBackApplication.usageStatsRepository.getCachedUsageSnapshot()
+        } catch (e: Exception) {
+            emptyMap()
+        }
+
         // Build current context snapshot
         val snapshot = SystemContextSnapshot(
             timestampMillis = now,
@@ -199,6 +230,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             dayOfWeek = dayOfWeek,
             foregroundPackageName = packageName,
             activeBrowserUrl = browserUrl,
+            accumulatedForegroundTimeMillis = usageSnapshot,
             isQuickBlockActive = isQuickBlockActive,
             quickBlockExpirationEpochMillis = quickBlockExpiry,
             quickBlockTargetPackages = quickBlockPackages

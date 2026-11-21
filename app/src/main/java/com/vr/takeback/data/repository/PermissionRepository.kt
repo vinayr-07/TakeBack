@@ -74,16 +74,7 @@ class PermissionRepository(private val context: Context) {
                 context.packageName
             )
         }
-        if (mode == AppOpsManager.MODE_ALLOWED) return true
-
-        return try {
-            val now = System.currentTimeMillis()
-            val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as? android.app.usage.UsageStatsManager
-            val list = usageStatsManager?.queryUsageStats(android.app.usage.UsageStatsManager.INTERVAL_DAILY, now - 60_000, now)
-            !list.isNullOrEmpty()
-        } catch (e: Exception) {
-            false
-        }
+        return mode == AppOpsManager.MODE_ALLOWED
     }
 
     private fun checkAccessibilityPermission(): Boolean {
