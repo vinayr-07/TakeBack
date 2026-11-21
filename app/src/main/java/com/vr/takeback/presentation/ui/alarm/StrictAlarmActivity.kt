@@ -6,6 +6,7 @@ import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.*
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -53,6 +54,12 @@ class StrictAlarmActivity : ComponentActivity() {
         }
 
         startAlarmAudioAndVibration()
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                // Prevent dismissing alarm with back button - user must solve math challenge
+            }
+        })
 
         setContent {
             TakeBackTheme(darkTheme = true) {
@@ -123,10 +130,7 @@ class StrictAlarmActivity : ComponentActivity() {
         stopAlarmAudioAndVibration()
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        // Prevent dismissing alarm with back button
-    }
+
 }
 
 @Composable

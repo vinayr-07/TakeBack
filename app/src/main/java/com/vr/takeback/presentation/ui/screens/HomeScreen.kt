@@ -433,7 +433,7 @@ fun HomeScreen(
                                 )
                             }
                         } else {
-                            val totalMillis = usageSummary!!.totalTimeMillis
+                            val totalMillis = usageSummary!!.deviceScreenTimeMillis
                             val usedHours = totalMillis / (1000 * 3600)
                             val usedMins = (totalMillis % (1000 * 3600)) / (1000 * 60)
                             val allowanceMillis = dailyAllowanceMinutes * 60 * 1000L

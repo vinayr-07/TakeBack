@@ -42,7 +42,8 @@ import java.time.format.DateTimeFormatter
 @Composable
 fun InsightsScreen(
     usageStatsRepository: UsageStatsRepository,
-    timelineRepository: TimelineRepository
+    timelineRepository: TimelineRepository,
+    onNavigateToDiagnostics: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var selectedDate by remember { mutableStateOf(LocalDate.now()) }
@@ -72,7 +73,8 @@ fun InsightsScreen(
     val timelineEvents by timelineRepository.events.collectAsState()
 
     val hasPermission = usageStatsRepository.hasUsagePermission()
-    val totalMinutes = (usageSummary?.totalTimeMillis ?: 0L) / (1000 * 60)
+    val screenTimeMillis = usageSummary?.deviceScreenTimeMillis ?: 0L
+    val totalMinutes = screenTimeMillis / (1000 * 60)
     val hours = totalMinutes / 60
     val minutes = totalMinutes % 60
     val formattedScreenTime = if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
@@ -97,6 +99,15 @@ fun InsightsScreen(
                             text = "Current Week & 24h Chronological Usage",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onNavigateToDiagnostics) {
+                        Icon(
+                            imageVector = Icons.Filled.Analytics,
+                            contentDescription = "Usage Diagnostics",
+                            tint = MaterialTheme.colorScheme.primary
                         )
                     }
                 },
@@ -360,10 +371,23 @@ fun InsightsScreen(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "total screen time (from 00:00)",
+                                text = "device screen-on time (from 00:00)",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                        }
+
+                        val appSumMinutes = (usageSummary?.totalTimeMillis ?: 0L) / (1000 * 60)
+                        if (appSumMinutes > totalMinutes) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            val appHours = appSumMinutes / 60
+                            val appMins = appSumMinutes % 60
+                            val appSumFormatted = if (appHours > 0) "${appHours}h ${appMins}m" else "${appMins}m"
+                            Text(
+                                text = "Sum of tracked app usage: $appSumFormatted (includes split-screen/multi-window overlap)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -448,7 +472,7 @@ fun InsightsScreen(
                                             style = MaterialTheme.typography.bodyMedium
                                         )
                                         Text(
-                                            text = "${app.launchCount} launch${if (app.launchCount != 1) "es" else ""} • Tap for launch log",
+                                            text = if (app.launchCount > 0) "${app.launchCount} launch${if (app.launchCount != 1) "es" else ""} • Tap for launch log" else "0 launches • Tap for details",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
@@ -754,23 +778,8 @@ fun InsightsScreen(
         val appMins = appMinutes % 60
         val totalTimeFormatted = if (appHours > 0) "${appHours}h ${appMins}m" else "${appMins}m"
 
-        // If no discrete sessions were captured by events but total usage exists, synthesize from lastTimeUsed
-        val displaySessions = if (appSessions.isNotEmpty()) {
-            appSessions
-        } else if (app.usageTimeMillis > 0) {
-            val startTime = if (app.lastTimeUsedMillis > 0) maxOf(0L, app.lastTimeUsedMillis - app.usageTimeMillis) else 0L
-            listOf(
-                AppUsageSession(
-                    packageName = app.packageName,
-                    appName = app.appName,
-                    startTimeEpochMillis = startTime,
-                    endTimeEpochMillis = if (app.lastTimeUsedMillis > 0) app.lastTimeUsedMillis else (startTime + app.usageTimeMillis),
-                    durationMillis = app.usageTimeMillis
-                )
-            )
-        } else {
-            emptyList()
-        }
+        // Reconstructed chronological sessions (never synthesize fictitious sessions)
+        val displaySessions = appSessions
 
         ModalBottomSheet(
             onDismissRequest = { selectedAppForHistory = null },

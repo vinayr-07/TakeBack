@@ -17,4 +17,5 @@ sealed class Screen(
     object Insights : Screen("insights", "Insights", Icons.Filled.BarChart, Icons.Outlined.BarChart)
     object Settings : Screen("settings", "Settings", Icons.Filled.Settings, Icons.Outlined.Settings)
     object PermissionCenter : Screen("permission_center", "Permissions", Icons.Filled.Security, Icons.Outlined.Security)
+    object UsageDiagnostics : Screen("usage_diagnostics", "Diagnostics", Icons.Filled.Analytics, Icons.Filled.Analytics)
 }

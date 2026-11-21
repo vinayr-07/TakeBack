@@ -35,7 +35,8 @@ import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 fun SettingsScreen(
     permissionRepository: PermissionRepository,
     strictModeRepository: StrictModeRepository,
-    onNavigateToPermissions: () -> Unit
+    onNavigateToPermissions: () -> Unit,
+    onNavigateToDiagnostics: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val permissionStatus by permissionRepository.permissionStatus.collectAsState()
@@ -245,6 +246,50 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
                             text = "Blocks distracting websites and adult content at the DNS level. Runs 100% locally on your device without routing through external proxy servers.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // Usage Tracking & Diagnostics Card
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Icon(Icons.Filled.Analytics, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(
+                                        text = "Usage Diagnostics",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = "Compare OS raw stats vs reconstructed screen time",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            FilledTonalButton(onClick = onNavigateToDiagnostics) {
+                                Text("Inspect")
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "Examine raw Android UsageStatsManager queries, interval file rotation, active filters, and exact session boundaries.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

@@ -3,6 +3,7 @@ package com.vr.takeback.presentation.ui.shield
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -32,6 +33,17 @@ class BlockShieldActivity : ComponentActivity() {
         val profileName = intent.getStringExtra("EXTRA_PROFILE_NAME") ?: "Focus Profile"
         val reason = intent.getStringExtra("EXTRA_REASON") ?: "Restricted Focus Window"
 
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                    addCategory(Intent.CATEGORY_HOME)
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                startActivity(homeIntent)
+                finish()
+            }
+        })
+
         setContent {
             TakeBackTheme(darkTheme = true) {
                 Surface(
@@ -56,16 +68,7 @@ class BlockShieldActivity : ComponentActivity() {
         }
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        // Redirect cleanly to home launcher on back press
-        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_HOME)
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        startActivity(homeIntent)
-        finish()
-    }
+
 }
 
 @Composable

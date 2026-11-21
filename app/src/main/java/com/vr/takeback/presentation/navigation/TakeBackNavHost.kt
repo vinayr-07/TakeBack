@@ -43,7 +43,7 @@ fun TakeBackNavHost(
 
     Scaffold(
         bottomBar = {
-            // Hide bottom bar on nested screens like permission center
+            // Hide bottom bar on nested screens like permission center or usage diagnostics
             if (currentRoute in navItems.map { it.route }) {
                 NavigationBar(
                     containerColor = MaterialTheme.colorScheme.surface
@@ -118,19 +118,27 @@ fun TakeBackNavHost(
             composable(Screen.Insights.route) {
                 InsightsScreen(
                     usageStatsRepository = usageStatsRepository,
-                    timelineRepository = timelineRepository
+                    timelineRepository = timelineRepository,
+                    onNavigateToDiagnostics = { navController.navigate(Screen.UsageDiagnostics.route) }
                 )
             }
             composable(Screen.Settings.route) {
                 SettingsScreen(
                     permissionRepository = permissionRepository,
                     strictModeRepository = strictModeRepository,
-                    onNavigateToPermissions = { navController.navigate(Screen.PermissionCenter.route) }
+                    onNavigateToPermissions = { navController.navigate(Screen.PermissionCenter.route) },
+                    onNavigateToDiagnostics = { navController.navigate(Screen.UsageDiagnostics.route) }
                 )
             }
             composable(Screen.PermissionCenter.route) {
                 PermissionCenterScreen(
                     permissionRepository = permissionRepository,
+                    onNavigateBack = { navController.popBackStack() }
+                )
+            }
+            composable(Screen.UsageDiagnostics.route) {
+                UsageDiagnosticsScreen(
+                    usageStatsRepository = usageStatsRepository,
                     onNavigateBack = { navController.popBackStack() }
                 )
             }
