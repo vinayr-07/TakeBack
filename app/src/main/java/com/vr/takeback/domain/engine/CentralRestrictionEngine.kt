@@ -249,6 +249,13 @@ class CentralRestrictionEngine {
     /**
      * Evaluates daily, hourly, and per-session usage limits.
      * Enforces strict shared pool aggregation when targetPackageName is null.
+     *
+     * Data-availability policy (Defect 1):
+     * - PERMISSION_DENIED / QUERY_FAILED / UNKNOWN → data is completely absent; allow the app
+     *   UNLESS the accumulated map already contains a value >= limit for this package (which means
+     *   it was supplied from a last-known state before availability was lost).
+     * - STALE → allow ONLY if no prior exceeded-limit signal exists in the accumulated map.
+     * - RECONSTRUCTED_PARTIAL / PROVISIONAL / RECONSTRUCTED_COMPLETE → enforce normally.
      */
     private fun evaluateUsageLimits(
         profile: Profile,
@@ -256,6 +263,18 @@ class CentralRestrictionEngine {
         snapshot: SystemContextSnapshot
     ): BlockDecision {
         if (profile.usageLimits.isEmpty()) return BlockDecision.Allowed
+
+        // Defect 1: Check data availability before evaluating usage limits.
+        // When data is genuinely absent (not merely stale), we must not silently treat
+        // missing entries as zero usage – that would allow bypassing limits.
+        // However, we must also not block an app simply because a query failed.
+        val dataAbsent = !snapshot.isUsageDataAvailable && when (snapshot.usageDataQuality) {
+            UsageDataQuality.PERMISSION_DENIED,
+            UsageDataQuality.QUERY_FAILED,
+            UsageDataQuality.UNKNOWN -> true
+            UsageDataQuality.STALE -> true
+            else -> false // PROVISIONAL, RECONSTRUCTED_PARTIAL, RECONSTRUCTED_COMPLETE are present
+        }
 
         for (limit in profile.usageLimits) {
             if (!limit.isEnabled) continue
@@ -268,6 +287,43 @@ class CentralRestrictionEngine {
                 limit.targetPackageName == packageName
             }
             if (!isTargeted) continue
+
+            // Defect 1: If data is absent, only block if the accumulated map shows usage >= limit
+            // (last-known state carried forward). If the map is also empty, allow (safe default).
+            if (dataAbsent) {
+                val poolPackages = if (limit.targetPackageName == null) {
+                    profile.targetApps.filter { !it.isAllowlist }.map { it.packageName }
+                } else {
+                    listOf(packageName)
+                }
+                val lastKnownMillis = poolPackages.sumOf { snapshot.accumulatedForegroundTimeMillis[it] ?: 0L }
+                val lastKnownMinutes = (lastKnownMillis / (1000 * 60)).toInt()
+                if (lastKnownMinutes < limit.dailyLimitMinutes) {
+                    // Cannot verify limit is exceeded → allow (do not penalise due to data absence)
+                    continue
+                }
+                // Last-known data shows limit was already exceeded; block conservatively.
+                val reason = when (limit.windowType) {
+                    LimitWindowType.FULL_DAY -> BlockReason.DailyLimitExceeded(
+                        limitMinutes = limit.dailyLimitMinutes,
+                        usedMinutes = lastKnownMinutes
+                    )
+                    LimitWindowType.PER_HOUR -> BlockReason.HourlyQuotaExceeded(
+                        limitMinutes = limit.dailyLimitMinutes
+                    )
+                    LimitWindowType.PER_SESSION -> BlockReason.DailyLimitExceeded(
+                        limitMinutes = limit.dailyLimitMinutes,
+                        usedMinutes = lastKnownMinutes
+                    )
+                }
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(packageName),
+                    triggeringProfileId = profile.id,
+                    triggeringProfileName = profile.name,
+                    reason = reason,
+                    remainingDurationMillis = 0L
+                )
+            }
 
             val usedMillis: Long = when (limit.windowType) {
                 LimitWindowType.FULL_DAY -> {

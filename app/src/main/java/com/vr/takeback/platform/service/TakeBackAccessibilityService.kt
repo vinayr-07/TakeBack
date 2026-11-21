@@ -16,8 +16,10 @@ import com.vr.takeback.domain.model.EventType
 import com.vr.takeback.presentation.ui.shield.BlockShieldActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.DayOfWeek
 import java.time.LocalDate
@@ -53,6 +55,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private var currentForegroundPackage: String? = null
     @Volatile
     private var currentSessionStartTime: Long = 0L
+    // Defect 4: Single-flight refresh guard – prevents stacking concurrent refresh coroutines.
+    @Volatile
+    private var refreshJob: Job? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -79,16 +84,26 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         val packageName = event.packageName?.toString() ?: return
 
-        // Ignore TakeBack itself, system UI, and home launchers
+        // Ignore TakeBack itself
         if (packageName == applicationContext.packageName) return
-        if (packageName == "com.android.systemui" || packageName.contains("launcher", ignoreCase = true)) {
-            return
-        }
 
         val now = System.currentTimeMillis()
+
+        // Defect 3: Update foreground tracking BEFORE early-return for launchers/systemUI.
+        // This ensures that when the user next opens an app, currentSessionStartTime is
+        // reset relative to the moment they left that app (not relative to the previous app).
+        val isLauncherOrSystemUi = packageName == "com.android.systemui" ||
+                packageName.contains("launcher", ignoreCase = true)
+
         if (packageName != currentForegroundPackage) {
             currentForegroundPackage = packageName
             currentSessionStartTime = now
+        }
+
+        // Now that session state is updated, early-return for launcher/systemUI packages.
+        // These cannot be blocked by profiles.
+        if (isLauncherOrSystemUi) {
+            return
         }
 
         // Strict Mode Anti-Tamper: Protect against Force Stop / Uninstall through Settings
@@ -237,6 +252,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
             foregroundPackageName = packageName,
             activeBrowserUrl = browserUrl,
             accumulatedForegroundTimeMillis = activeSnapshot?.foregroundUsageByPackage ?: emptyMap(),
+            // Defect 2: Populate hourlyForegroundTimeMillis from the validated snapshot.
+            hourlyForegroundTimeMillis = activeSnapshot?.hourlyUsageByPackage ?: emptyMap(),
             currentSessionDurationMillis = currentSessionDuration,
             isUsageDataAvailable = activeSnapshot?.isAvailable ?: false,
             usageDataQuality = activeSnapshot?.quality ?: com.vr.takeback.domain.usage.UsageDataQuality.UNKNOWN,
@@ -258,29 +275,33 @@ class TakeBackAccessibilityService : AccessibilityService() {
         // Requirement 4: If usage limits apply and the snapshot is stale/unloaded,
         // refresh in background without blocking the main thread, and re-evaluate only if
         // the package is STILL foreground before executing any delayed block!
+        // Defect 4: Single-flight guard – skip if a refresh coroutine is already active.
         val isSnapshotFresh = activeSnapshot?.isAvailable == true && (now - activeSnapshot.capturedAtMillis <= 30_000L)
         if (hasUsageLimitForApp && !isSnapshotFresh) {
-            serviceScope.launch {
-                try {
-                    val fresh = TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
-                    if (currentForegroundPackage == packageName) {
-                        val updatedSnapshot = snapshot.copy(
-                            timestampMillis = System.currentTimeMillis(),
-                            accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
-                            currentSessionDurationMillis = System.currentTimeMillis() - currentSessionStartTime,
-                            isUsageDataAvailable = fresh.isAvailable,
-                            usageDataQuality = fresh.quality
-                        )
-                        val delayedDecision = engine.evaluate(activeProfiles, updatedSnapshot)
-                        if (delayedDecision is BlockDecision.Blocked && currentForegroundPackage == packageName) {
-                            Log.i(TAG, "Delayed block on fresh snapshot for $packageName: ${delayedDecision.reason}")
-                            lastBlockedPackage = packageName
-                            lastBlockedTimestamp = System.currentTimeMillis()
-                            handleBlockDecision(delayedDecision)
+            if (refreshJob?.isActive != true) {
+                refreshJob = serviceScope.launch {
+                    try {
+                        val fresh = TakeBackApplication.usageStatsRepository.refreshUsageSnapshot()
+                        lastUsageSnapshotRefreshTime = System.currentTimeMillis()
+                        if (currentForegroundPackage == packageName) {
+                            val updatedSnapshot = snapshot.copy(
+                                timestampMillis = System.currentTimeMillis(),
+                                accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
+                                currentSessionDurationMillis = System.currentTimeMillis() - currentSessionStartTime,
+                                isUsageDataAvailable = fresh.isAvailable,
+                                usageDataQuality = fresh.quality
+                            )
+                            val delayedDecision = engine.evaluate(activeProfiles, updatedSnapshot)
+                            if (delayedDecision is BlockDecision.Blocked && currentForegroundPackage == packageName) {
+                                android.util.Log.i(TAG, "Delayed block on fresh snapshot for $packageName: ${delayedDecision.reason}")
+                                lastBlockedPackage = packageName
+                                lastBlockedTimestamp = System.currentTimeMillis()
+                                handleBlockDecision(delayedDecision)
+                            }
                         }
+                    } catch (e: Exception) {
+                        android.util.Log.w(TAG, "Failed background refresh for usage limits", e)
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed background refresh for usage limits", e)
                 }
             }
         }

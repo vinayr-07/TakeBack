@@ -59,6 +59,12 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
         const val TABLE_DEVICE_LEDGER = "daily_device_ledger"
         const val TABLE_APP_LEDGER = "daily_app_usage_ledger"
 
+        /**
+         * Defect 6: Sentinel value written to device_interactive_ms when interactive time
+         * is genuinely unknown / unavailable. Must never be shown to the user as 0.
+         */
+        const val DEVICE_INTERACTIVE_UNAVAILABLE_SENTINEL = Long.MIN_VALUE
+
         private const val CREATE_TABLE_DEVICE_LEDGER = """
             CREATE TABLE IF NOT EXISTS $TABLE_DEVICE_LEDGER (
                 date_iso TEXT PRIMARY KEY,
@@ -180,6 +186,9 @@ class UsageLedgerDatabase(context: Context) : SQLiteOpenHelper(
 
     /**
      * Reads the persisted daily device record for a given date if present.
+     * Defect 6: Long.MIN_VALUE stored in device_interactive_ms is interpreted as "unavailable"
+     * (not genuine 0). Callers should check PersistedDeviceRecord.deviceInteractiveMillis against
+     * DEVICE_INTERACTIVE_UNAVAILABLE_SENTINEL.
      */
     fun getDeviceRecord(date: LocalDate): PersistedDeviceRecord? {
         val db = readableDatabase

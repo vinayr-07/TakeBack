@@ -47,8 +47,15 @@ data class ReconstructionResult(
     val deviceInteractiveTimeMillis: Long?,
     val isDeviceInteractiveAvailable: Boolean,
     val totalTrackedAppUsageMillis: Long,
+    /** True when device-interactive initial state was UNKNOWN (screen state boundary incomplete). */
     val hasIncompleteStartBoundary: Boolean,
-    val hasIncompleteEndBoundary: Boolean
+    val hasIncompleteEndBoundary: Boolean,
+    /**
+     * Defect 7: True when at least one app session started exactly at [startEpochMillis]
+     * due to being active in the lookback but its original ACTIVITY_RESUMED event fell
+     * before the lookback start (meaning the actual session start is unknown).
+     */
+    val hasIncompleteAppSessionStart: Boolean = false
 )
 
 /**
@@ -432,6 +439,11 @@ object UsageSessionAggregator {
 
     /**
      * Computes full reconstruction output with explicit boundary completeness detection.
+     *
+     * Defect 7: Tracks hasIncompleteAppSessionStart separately from hasIncompleteStartBoundary
+     * (screen state). An app session is "incomplete start" when it was active in the lookback
+     * window and its recorded start in the lookback was before the lookback begin (i.e., the
+     * activity had been running for an unknown duration before our lookback window).
      */
     fun reconstructFull(
         events: List<RawUsageEvent>,
@@ -481,8 +493,6 @@ object UsageSessionAggregator {
         val totalTrackedAppUsage = appSessions.sumOf { it.durationMillis }
 
         // Ending boundary completeness analysis:
-        // For past days, did any session or interactive interval remain open at endEpochMillis
-        // without an observed closing event in subsequent lookahead?
         var hasIncompleteEnd = false
         if (!isToday) {
             val openAppAtEnd = appSessions.any { it.endEpochMillis >= endEpochMillis }
@@ -492,6 +502,35 @@ object UsageSessionAggregator {
             }
         }
 
+        // Defect 7: Detect app sessions whose start was clamped to startEpochMillis because
+        // the activity was already running at the beginning of our query window. Such sessions
+        // started at or before the lookback begin, so their true duration is unknown.
+        // We detect this by checking whether any ACTIVITY_RESUMED in the lookback for a session
+        // that starts at exactly startEpochMillis occurred before the lookback start.
+        val lookbackStart = maxOf(0L, startEpochMillis - 24L * 60L * 60L * 1000L)
+        val hasIncompleteAppSessionStart: Boolean = run {
+            // Collect packages that have sessions starting exactly at startEpochMillis
+            val clampedPackages = appSessions
+                .filter { it.startEpochMillis == startEpochMillis }
+                .map { it.packageName }
+                .toSet()
+
+            if (clampedPackages.isEmpty()) return@run false
+
+            // For those packages, check if there are preceding ACTIVITY_RESUMED events before
+            // lookbackStart — meaning the original start predates our entire query window.
+            clampedPackages.any { pkg ->
+                events.any { e ->
+                    e.packageName == pkg &&
+                    e.type == NormalizedEventType.ACTIVITY_RESUMED &&
+                    e.timestampMillis < lookbackStart
+                }
+            }
+            // If no such preceding event exists but the session starts at startEpochMillis,
+            // the activity was opened within the lookback (which is fine — the start is known).
+            // Only flag incomplete if the event predates our window entirely.
+        }
+
         return ReconstructionResult(
             appSessions = appSessions,
             interactiveIntervals = interactiveIntervals,
@@ -499,7 +538,8 @@ object UsageSessionAggregator {
             isDeviceInteractiveAvailable = (deviceInteractiveTime != null),
             totalTrackedAppUsageMillis = totalTrackedAppUsage,
             hasIncompleteStartBoundary = hasIncompleteInteractiveStart,
-            hasIncompleteEndBoundary = hasIncompleteEnd
+            hasIncompleteEndBoundary = hasIncompleteEnd,
+            hasIncompleteAppSessionStart = hasIncompleteAppSessionStart
         )
     }
 }

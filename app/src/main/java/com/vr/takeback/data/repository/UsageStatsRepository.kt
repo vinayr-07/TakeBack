@@ -91,7 +91,9 @@ data class ValidatedUsageSnapshot(
     val foregroundUsageByPackage: Map<String, Long>,
     val quality: UsageDataQuality,
     val isAvailable: Boolean,
-    val dataSource: String
+    val dataSource: String,
+    /** Defect 2: Rolling 60-minute foreground usage per package. Empty when unavailable. */
+    val hourlyUsageByPackage: Map<String, Long> = emptyMap()
 )
 
 class UsageStatsRepository(private val context: Context) {
@@ -270,6 +272,8 @@ class UsageStatsRepository(private val context: Context) {
      * Refreshes the active today usage snapshot for CentralRestrictionEngine.
      * Uses 24-hour lookback before midnight to ensure preceding app states (e.g. apps
      * active across midnight) are accurately established and bounded to today's start.
+     *
+     * Defect 2: Also computes a rolling 60-minute foreground usage map for PER_HOUR limits.
      */
     suspend fun refreshUsageSnapshot(): ValidatedUsageSnapshot = withContext(Dispatchers.IO) {
         val zone = ZoneId.systemDefault()
@@ -292,6 +296,25 @@ class UsageStatsRepository(private val context: Context) {
         val queryStart = maxOf(0L, startOfDay - 24L * 60L * 60L * 1000L)
         val queryResult = fetchRawUsageEvents(queryStart, now)
 
+        // Defect 2: Compute rolling 60-minute hourly usage from the same event buffer.
+        val hourlyWindowStart = maxOf(queryStart, now - 60L * 60L * 1000L)
+        val hourlyUsageMap: Map<String, Long> = when (queryResult) {
+            is UsageEventsQueryResult.Success -> {
+                val hourlySessions = UsageSessionAggregator.reconstructSessions(
+                    events = queryResult.events,
+                    startEpochMillis = hourlyWindowStart,
+                    endEpochMillis = now,
+                    isToday = true,
+                    isUserLaunchableApp = ::isUserLaunchableApp,
+                    currentEpochMillis = now
+                )
+                hourlySessions
+                    .groupBy { it.packageName }
+                    .mapValues { (_, list) -> list.sumOf { it.durationMillis } }
+            }
+            else -> emptyMap()
+        }
+
         val snapshot = when (queryResult) {
             is UsageEventsQueryResult.Success -> {
                 val reconstruction = UsageSessionAggregator.reconstructFull(
@@ -306,7 +329,7 @@ class UsageStatsRepository(private val context: Context) {
                     .groupBy { it.packageName }
                     .mapValues { (_, list) -> list.sumOf { it.durationMillis } }
 
-                val quality = if (reconstruction.hasIncompleteStartBoundary || reconstruction.hasIncompleteEndBoundary) {
+                val quality = if (reconstruction.hasIncompleteStartBoundary || reconstruction.hasIncompleteEndBoundary || reconstruction.hasIncompleteAppSessionStart) {
                     UsageDataQuality.RECONSTRUCTED_PARTIAL
                 } else {
                     UsageDataQuality.PROVISIONAL
@@ -318,16 +341,19 @@ class UsageStatsRepository(private val context: Context) {
                     foregroundUsageByPackage = usageMap,
                     quality = quality,
                     isAvailable = true,
-                    dataSource = "UsageEvents"
+                    dataSource = "UsageEvents",
+                    hourlyUsageByPackage = hourlyUsageMap
                 )
             }
             is UsageEventsQueryResult.EmptySuccess -> {
+                // Defect 5: Empty events for today is PROVISIONAL (device may simply be idle so far).
+                // It is NOT a verified zero; we cannot confirm the event buffer is not simply empty early.
                 ValidatedUsageSnapshot(
                     date = today,
                     capturedAtMillis = now,
                     foregroundUsageByPackage = emptyMap(),
                     quality = UsageDataQuality.PROVISIONAL,
-                    isAvailable = true,
+                    isAvailable = true, // plausible: genuinely no use yet today
                     dataSource = "UsageEvents (0 events)"
                 )
             }
@@ -356,29 +382,50 @@ class UsageStatsRepository(private val context: Context) {
 
         lastValidatedSnapshot = snapshot
 
-        // Requirement 7: Controlled idempotent checkpoint persistence
+        // Defect 6: Save checkpoint with actual reconstruction data, not hardcoded 0L.
+        // Reuse the already-computed reconstruction from above (no second full pass).
         if (snapshot.isAvailable && queryResult is UsageEventsQueryResult.Success) {
-            saveProvisionalIntradayCheckpoint(today, now, startOfDay, snapshot)
+            val reconstruction = UsageSessionAggregator.reconstructFull(
+                events = queryResult.events,
+                startEpochMillis = startOfDay,
+                endEpochMillis = now,
+                isToday = true,
+                isUserLaunchableApp = ::isUserLaunchableApp,
+                currentEpochMillis = now
+            )
+            saveProvisionalIntradayCheckpoint(today, now, startOfDay, snapshot, reconstruction)
         }
 
         snapshot
     }
 
+    /**
+     * Defect 6: Save provisional intraday checkpoint using real reconstruction data.
+     * - deviceInteractiveMillis: use actual reconstruction result (Long.MIN_VALUE = unavailable sentinel)
+     * - lastTimeUsedMillis: use the last session end time for each app (not System.currentTimeMillis())
+     */
     private fun saveProvisionalIntradayCheckpoint(
         today: LocalDate,
         now: Long,
         startOfDay: Long,
-        snapshot: ValidatedUsageSnapshot
+        snapshot: ValidatedUsageSnapshot,
+        reconstruction: com.vr.takeback.domain.usage.ReconstructionResult
     ) {
         try {
+            // Build per-package last-used timestamps from reconstruction sessions
+            val lastUsedByPackage: Map<String, Long> = reconstruction.appSessions
+                .groupBy { it.packageName }
+                .mapValues { (_, sessions) -> sessions.maxOf { it.endEpochMillis } }
+
             val appRecords = snapshot.foregroundUsageByPackage.map { (pkg, duration) ->
                 PersistedAppRecord(
                     dateIso = today.toString(),
                     packageName = pkg,
                     appLabel = resolveAppLabel(pkg),
                     foregroundDurationMillis = duration,
-                    reconstructedSessionCount = 0,
-                    lastTimeUsedMillis = now,
+                    reconstructedSessionCount = reconstruction.appSessions.count { it.packageName == pkg },
+                    // Defect 6 fix: use actual last-session-end timestamp, not System.currentTimeMillis()
+                    lastTimeUsedMillis = lastUsedByPackage[pkg] ?: now,
                     dataSource = snapshot.dataSource,
                     qualityStatus = snapshot.quality,
                     queryTimestamp = now,
@@ -386,9 +433,14 @@ class UsageStatsRepository(private val context: Context) {
                     deviceTimezone = ZoneId.systemDefault().id
                 )
             }
+
+            // Defect 6 fix: Use Long.MIN_VALUE as sentinel for "unavailable" interactive time.
+            // The database schema stores it as INTEGER; callers must check for Long.MIN_VALUE.
+            val deviceInteractiveSentinel = reconstruction.deviceInteractiveTimeMillis ?: Long.MIN_VALUE
+
             val deviceRecord = PersistedDeviceRecord(
                 dateIso = today.toString(),
-                deviceInteractiveMillis = 0L,
+                deviceInteractiveMillis = deviceInteractiveSentinel,
                 totalTrackedAppMillis = snapshot.foregroundUsageByPackage.values.sum(),
                 dataSource = snapshot.dataSource,
                 qualityStatus = snapshot.quality,
@@ -447,13 +499,18 @@ class UsageStatsRepository(private val context: Context) {
                     )
                 }
 
-                val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, persistedDevice.deviceInteractiveMillis, persistedDevice.qualityStatus)
+                // Defect 6: Treat sentinel as unavailable interactive time
+                val persistedInteractive = persistedDevice.deviceInteractiveMillis
+                val interactiveAvailable = persistedInteractive != UsageLedgerDatabase.DEVICE_INTERACTIVE_UNAVAILABLE_SENTINEL
+                val interactiveMillis: Long? = if (interactiveAvailable) persistedInteractive else null
+
+                val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, interactiveMillis, persistedDevice.qualityStatus)
 
                 return@withContext DailyUsageSummary(
                     selectedDate = targetDate,
                     totalTimeMillis = persistedDevice.totalTrackedAppMillis,
-                    deviceScreenTimeMillis = persistedDevice.deviceInteractiveMillis,
-                    isDeviceInteractiveAvailable = true,
+                    deviceScreenTimeMillis = interactiveMillis,
+                    isDeviceInteractiveAvailable = interactiveAvailable,
                     topApps = topApps,
                     sessions = emptyList(),
                     weeklyOverview = weeklyOverview,
@@ -564,21 +621,30 @@ class UsageStatsRepository(private val context: Context) {
                         diagnostics = buildErrorDiagnostics(targetDate, "System UsageEvents for $targetDate have been purged by OS")
                     )
                 } else {
-                    // Valid verified zero-usage day
-                    val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, 0L, if (isTargetToday) UsageDataQuality.PROVISIONAL else UsageDataQuality.RECONSTRUCTED_COMPLETE)
+                    // Defect 5: Empty events within 7 days is NOT a verified zero.
+                    // For today: PROVISIONAL (device may not have been used yet today).
+                    // For yesterday or older within 7 days: RECONSTRUCTED_PARTIAL / UNKNOWN —
+                    // the buffer could have expired early or the day genuinely had no use.
+                    // We NEVER call this RECONSTRUCTED_COMPLETE (which asserts verified zero).
+                    val (quality, isAvailable) = when {
+                        isTargetToday -> Pair(UsageDataQuality.PROVISIONAL, true)
+                        daysAgo == 1L -> Pair(UsageDataQuality.RECONSTRUCTED_PARTIAL, false) // Cannot verify
+                        else -> Pair(UsageDataQuality.UNKNOWN, false)
+                    }
+                    val weeklyOverview = buildWeeklyOverview(targetDate, today, zone, if (isAvailable) 0L else null, quality)
                     return@withContext DailyUsageSummary(
                         selectedDate = targetDate,
                         totalTimeMillis = 0L,
-                        deviceScreenTimeMillis = 0L,
-                        isDeviceInteractiveAvailable = true,
+                        deviceScreenTimeMillis = if (isAvailable) 0L else null,
+                        isDeviceInteractiveAvailable = isAvailable,
                         topApps = emptyList(),
                         sessions = emptyList(),
                         weeklyOverview = weeklyOverview,
-                        isRealDataAvailable = true,
-                        dataQuality = if (isTargetToday) UsageDataQuality.PROVISIONAL else UsageDataQuality.RECONSTRUCTED_COMPLETE,
-                        dataSourceDescription = "UsageEvents Reconstructed (0 events observed)",
+                        isRealDataAvailable = isAvailable,
+                        dataQuality = quality,
+                        dataSourceDescription = "UsageEvents (0 events observed; cannot confirm verified zero)",
                         completeThroughTimestampMillis = endExclusive,
-                        diagnostics = null
+                        diagnostics = if (!isAvailable) buildErrorDiagnostics(targetDate, "No UsageEvents within retention window; cannot verify zero usage") else null
                     )
                 }
             }
@@ -634,7 +700,10 @@ class UsageStatsRepository(private val context: Context) {
         // Determine data quality
         val lastEventTimestamp = rawEvents.maxOfOrNull { it.timestampMillis } ?: 0L
         val dataQuality = when {
-            reconstruction.hasIncompleteStartBoundary || reconstruction.hasIncompleteEndBoundary -> UsageDataQuality.RECONSTRUCTED_PARTIAL
+            // Defect 7: treat incomplete app-session start boundary same as incomplete screen boundary
+            reconstruction.hasIncompleteStartBoundary ||
+            reconstruction.hasIncompleteEndBoundary ||
+            reconstruction.hasIncompleteAppSessionStart -> UsageDataQuality.RECONSTRUCTED_PARTIAL
             isTargetToday && (now - lastEventTimestamp > 180_000L) -> UsageDataQuality.PROVISIONAL
             isTargetToday -> UsageDataQuality.PROVISIONAL
             else -> UsageDataQuality.RECONSTRUCTED_COMPLETE
@@ -773,11 +842,13 @@ class UsageStatsRepository(private val context: Context) {
                         persisted.qualityStatus
                     }
                 }
+                val isInteractiveAvailable = persisted.deviceInteractiveMillis != UsageLedgerDatabase.DEVICE_INTERACTIVE_UNAVAILABLE_SENTINEL
+                val interactiveTime: Long? = if (isInteractiveAvailable) persisted.deviceInteractiveMillis else null
                 DayUsageOverview(
                     date = day,
                     dayName = day.dayOfWeek.name.take(3),
-                    totalTimeMillis = persisted.deviceInteractiveMillis,
-                    isAvailable = true,
+                    totalTimeMillis = interactiveTime,
+                    isAvailable = isInteractiveAvailable,
                     isToday = isDayToday,
                     isSelected = false,
                     dataQuality = quality
