@@ -15,7 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-class PermissionRepository(private val context: Context) {
+class PermissionRepository(private val context: Context? = null) {
 
     private val _permissionStatus = MutableStateFlow(checkPermissions())
     val permissionStatus: StateFlow<PermissionStatus> = _permissionStatus.asStateFlow()
@@ -27,21 +27,22 @@ class PermissionRepository(private val context: Context) {
     }
 
     private fun checkPermissions(): PermissionStatus {
-        val hasUsage = checkUsageStatsPermission()
+        val ctx = context ?: return PermissionStatus()
+        val hasUsage = checkUsageStatsPermission(ctx)
         val hasOverlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Settings.canDrawOverlays(context)
+            Settings.canDrawOverlays(ctx)
         } else true
 
-        val hasAccessibility = checkAccessibilityPermission()
-        val hasNotificationListener = checkNotificationListenerPermission()
-        val hasPostNotif = NotificationManagerCompat.from(context).areNotificationsEnabled()
+        val hasAccessibility = checkAccessibilityPermission(ctx)
+        val hasNotificationListener = checkNotificationListenerPermission(ctx)
+        val hasPostNotif = NotificationManagerCompat.from(ctx).areNotificationsEnabled()
 
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val powerManager = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val isBatteryIgnored = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && powerManager != null) {
-            powerManager.isIgnoringBatteryOptimizations(context.packageName)
+            powerManager.isIgnoringBatteryOptimizations(ctx.packageName)
         } else true
 
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+        val alarmManager = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
         val hasExactAlarm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarmManager != null) {
             alarmManager.canScheduleExactAlarms()
         } else true
@@ -58,44 +59,45 @@ class PermissionRepository(private val context: Context) {
         )
     }
 
-    private fun checkUsageStatsPermission(): Boolean {
-        val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
+    private fun checkUsageStatsPermission(ctx: Context): Boolean {
+        val appOps = ctx.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
         val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             appOps.unsafeCheckOpNoThrow(
                 AppOpsManager.OPSTR_GET_USAGE_STATS,
                 android.os.Process.myUid(),
-                context.packageName
+                ctx.packageName
             )
         } else {
             @Suppress("DEPRECATION")
             appOps.checkOpNoThrow(
                 AppOpsManager.OPSTR_GET_USAGE_STATS,
                 android.os.Process.myUid(),
-                context.packageName
+                ctx.packageName
             )
         }
         return mode == AppOpsManager.MODE_ALLOWED
     }
 
-    private fun checkAccessibilityPermission(): Boolean {
-        val expectedService = "${context.packageName}/com.vr.takeback.platform.service.TakeBackAccessibilityService"
+    private fun checkAccessibilityPermission(ctx: Context): Boolean {
+        val expectedService = "${ctx.packageName}/com.vr.takeback.platform.service.TakeBackAccessibilityService"
         val enabledServices = Settings.Secure.getString(
-            context.contentResolver,
+            ctx.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
         return enabledServices.contains(expectedService, ignoreCase = true)
     }
 
-    private fun checkNotificationListenerPermission(): Boolean {
-        val enabledListeners = NotificationManagerCompat.getEnabledListenerPackages(context)
-        return enabledListeners.contains(context.packageName)
+    private fun checkNotificationListenerPermission(ctx: Context): Boolean {
+        val enabledListeners = NotificationManagerCompat.getEnabledListenerPackages(ctx)
+        return enabledListeners.contains(ctx.packageName)
     }
 
     // Intents for direct deep-linking into Android Settings
     fun getUsageAccessIntent(): Intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
 
     fun getOverlayIntent(): Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
+        val pkg = context?.packageName ?: "com.vr.takeback"
+        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$pkg"))
     } else Intent(Settings.ACTION_SETTINGS)
 
     fun getAccessibilityIntent(): Intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
@@ -105,10 +107,12 @@ class PermissionRepository(private val context: Context) {
     } else Intent(Settings.ACTION_SETTINGS)
 
     fun getBatteryOptimizationIntent(): Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
+        val pkg = context?.packageName ?: "com.vr.takeback"
+        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$pkg"))
     } else Intent(Settings.ACTION_SETTINGS)
 
     fun getExactAlarmIntent(): Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:${context.packageName}"))
+        val pkg = context?.packageName ?: "com.vr.takeback"
+        Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$pkg"))
     } else Intent(Settings.ACTION_SETTINGS)
 }

@@ -1,5 +1,6 @@
 package com.vr.takeback.presentation.ui.screens
 
+import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -24,20 +25,21 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.vr.takeback.TakeBackApplication
-import com.vr.takeback.data.repository.DailyUsageSummary
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vr.takeback.data.repository.PermissionRepository
 import com.vr.takeback.data.repository.ProfileRepository
 import com.vr.takeback.data.repository.QuickBlockRepository
 import com.vr.takeback.data.repository.UsageStatsRepository
-import com.vr.takeback.domain.engine.CentralRestrictionEngine
-import com.vr.takeback.domain.model.Profile
 import com.vr.takeback.domain.security.MutationType
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
-import java.time.LocalDate
-import java.time.LocalTime
+import com.vr.takeback.presentation.viewmodel.HomeUiEvent
+import com.vr.takeback.presentation.viewmodel.HomeUiState
+import com.vr.takeback.presentation.viewmodel.HomeViewModel
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+/**
+ * State-aware entry point for HomeScreen.
+ * Connects HomeViewModel to the stateless HomeScreenContent.
+ */
 @Composable
 fun HomeScreen(
     profileRepository: ProfileRepository,
@@ -47,21 +49,16 @@ fun HomeScreen(
     onNavigateToFocus: () -> Unit,
     onNavigateToProfiles: () -> Unit,
     onNavigateToPermissions: () -> Unit,
-    onNavigateToInsights: () -> Unit
+    onNavigateToInsights: () -> Unit,
+    viewModel: HomeViewModel = viewModel(factory = HomeViewModel.Factory)
 ) {
-    val context = LocalContext.current
-    val profiles by profileRepository.profiles.collectAsState()
-    val quickBlockState by quickBlockRepository.state.collectAsState()
-    val permissionStatus by permissionRepository.permissionStatus.collectAsState()
-
+    val uiState by viewModel.uiState.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
-    var refreshTrigger by remember { mutableIntStateOf(0) }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                permissionRepository.refreshPermissions()
-                refreshTrigger++
+                viewModel.onEvent(HomeUiEvent.Refresh)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -70,41 +67,33 @@ fun HomeScreen(
         }
     }
 
-    // Real screen time query - re-queries on resume or permission change
-    val usageSummary by produceState<DailyUsageSummary?>(
-        initialValue = null,
-        key1 = permissionStatus.hasUsageStats,
-        key2 = refreshTrigger
-    ) {
-        value = usageStatsRepository.getTodayUsageSummary()
-    }
+    HomeScreenContent(
+        uiState = uiState,
+        onEvent = viewModel::onEvent,
+        getAccessibilityIntent = { permissionRepository.getAccessibilityIntent() },
+        onNavigateToFocus = onNavigateToFocus,
+        onNavigateToProfiles = onNavigateToProfiles,
+        onNavigateToPermissions = onNavigateToPermissions,
+        onNavigateToInsights = onNavigateToInsights
+    )
+}
 
-    // Persistent daily screen time allowance
-    var dailyAllowanceMinutes by remember { mutableStateOf(usageStatsRepository.getDailyAllowanceMinutes()) }
-    LaunchedEffect(refreshTrigger) {
-        dailyAllowanceMinutes = usageStatsRepository.getDailyAllowanceMinutes()
-    }
-    var showAllowanceDialog by remember { mutableStateOf(false) }
-
-    // Strict Mode Protection for Home Profile Toggling
-    val strictRepo = TakeBackApplication.strictModeRepository
-    val strictState by strictRepo.protectionState.collectAsState()
-    var pendingToggleProfileId by remember { mutableStateOf<String?>(null) }
-
-    // Evaluate active blocking status dynamically
-    val engine = remember { CentralRestrictionEngine() }
-    val nowTime = LocalTime.now()
-    val today = LocalDate.now().dayOfWeek
-
-    val activelyEnforcingProfiles = profiles.filter { profile ->
-        profile.isEnabled && engine.isProfileCurrentlyEnforcing(profile, nowTime, today)
-    }
-
-    val isQuickBlockActive = quickBlockState.isActive
-    val hasEnabledProfile = profiles.any { it.isEnabled }
-    val isProtectionConfigured = isQuickBlockActive || activelyEnforcingProfiles.isNotEmpty() || hasEnabledProfile
-    val isProtectionActive = isQuickBlockActive || activelyEnforcingProfiles.isNotEmpty()
-    val isAccessibilityMissing = !permissionStatus.hasAccessibility
+/**
+ * Pure, stateless, declarative UI implementation of HomeScreen.
+ * Easily previewable and decoupled from repository singletons.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HomeScreenContent(
+    uiState: HomeUiState,
+    onEvent: (HomeUiEvent) -> Unit,
+    getAccessibilityIntent: () -> Intent,
+    onNavigateToFocus: () -> Unit,
+    onNavigateToProfiles: () -> Unit,
+    onNavigateToPermissions: () -> Unit,
+    onNavigateToInsights: () -> Unit
+) {
+    val context = LocalContext.current
 
     Scaffold(
         topBar = {
@@ -137,8 +126,8 @@ fun HomeScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Persistent Missing Permissions Alert Banner
-            if (isAccessibilityMissing) {
+            // 1. Missing Permissions Alert Banner
+            if (uiState.isAccessibilityMissing) {
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -185,7 +174,7 @@ fun HomeScreen(
                                 Button(
                                     onClick = {
                                         try {
-                                            context.startActivity(permissionRepository.getAccessibilityIntent())
+                                            context.startActivity(getAccessibilityIntent())
                                         } catch (e: Exception) {
                                             onNavigateToPermissions()
                                         }
@@ -209,7 +198,7 @@ fun HomeScreen(
                         }
                     }
                 }
-            } else if (!permissionStatus.hasUsageStats) {
+            } else if (uiState.isUsageStatsMissing) {
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -253,27 +242,27 @@ fun HomeScreen(
                 }
             }
 
-            // Master Protection Status Indicator
+            // 2. Master Protection Status Indicator
             item {
-                val isPausedDueToPermission = isAccessibilityMissing && isProtectionConfigured
+                val isPausedDueToPermission = uiState.isAccessibilityMissing && uiState.isProtectionConfigured
                 val cardBgColor = when {
-                    isPausedDueToPermission -> Color(0xFF78350F) // Amber/Brown warning
-                    isProtectionActive && !isAccessibilityMissing -> Color(0xFF064E3B) // Emerald active
-                    else -> Color(0xFF450A0A) // Red idle
+                    isPausedDueToPermission -> Color(0xFF78350F)
+                    uiState.isProtectionActive && !uiState.isAccessibilityMissing -> Color(0xFF064E3B)
+                    else -> Color(0xFF450A0A)
                 }
                 val iconBgColor = when {
-                    isPausedDueToPermission -> Color(0xFFF59E0B) // Amber
-                    isProtectionActive && !isAccessibilityMissing -> Color(0xFF10B981) // Green
-                    else -> Color(0xFFEF4444) // Red
+                    isPausedDueToPermission -> Color(0xFFF59E0B)
+                    uiState.isProtectionActive && !uiState.isAccessibilityMissing -> Color(0xFF10B981)
+                    else -> Color(0xFFEF4444)
                 }
                 val titleColor = when {
                     isPausedDueToPermission -> Color(0xFFFEF3C7)
-                    isProtectionActive && !isAccessibilityMissing -> Color(0xFFA7F3D0)
+                    uiState.isProtectionActive && !uiState.isAccessibilityMissing -> Color(0xFFA7F3D0)
                     else -> Color(0xFFFECACA)
                 }
                 val subtitleColor = when {
                     isPausedDueToPermission -> Color(0xFFFDE68A)
-                    isProtectionActive && !isAccessibilityMissing -> Color(0xFFD1FAE5)
+                    uiState.isProtectionActive && !uiState.isAccessibilityMissing -> Color(0xFFD1FAE5)
                     else -> Color(0xFFFEE2E2)
                 }
 
@@ -298,7 +287,7 @@ fun HomeScreen(
                                 Icon(
                                     imageVector = when {
                                         isPausedDueToPermission -> Icons.Filled.Warning
-                                        isProtectionActive && !isAccessibilityMissing -> Icons.Filled.Shield
+                                        uiState.isProtectionActive && !uiState.isAccessibilityMissing -> Icons.Filled.Shield
                                         else -> Icons.Filled.ShieldMoon
                                     },
                                     contentDescription = null,
@@ -311,7 +300,7 @@ fun HomeScreen(
                                 Text(
                                     text = when {
                                         isPausedDueToPermission -> "BLOCKER PAUSED (PERMISSION OFF)"
-                                        isProtectionActive && !isAccessibilityMissing -> "PROTECTION ACTIVE"
+                                        uiState.isProtectionActive && !uiState.isAccessibilityMissing -> "PROTECTION ACTIVE"
                                         else -> "PROTECTION INACTIVE (IDLE)"
                                     },
                                     style = MaterialTheme.typography.titleMedium,
@@ -324,14 +313,14 @@ fun HomeScreen(
                                         isPausedDueToPermission -> {
                                             "Protection is configured/on, but TakeBack CANNOT block apps because Accessibility permission is OFF. Tap below to enable."
                                         }
-                                        isQuickBlockActive -> {
-                                            val mins = quickBlockState.remainingSeconds / 60
-                                            val secs = quickBlockState.remainingSeconds % 60
+                                        uiState.isQuickBlockActive -> {
+                                            val mins = uiState.quickBlockState.remainingSeconds / 60
+                                            val secs = uiState.quickBlockState.remainingSeconds % 60
                                             "Quick Block active (${mins}m ${secs}s left) • Guarding distractions"
                                         }
-                                        activelyEnforcingProfiles.isNotEmpty() -> {
-                                            val totalApps = activelyEnforcingProfiles.flatMap { it.targetApps }.distinctBy { it.packageName }.size
-                                            "${activelyEnforcingProfiles.size} profile(s) actively blocking $totalApps app(s)"
+                                        uiState.activelyEnforcingProfiles.isNotEmpty() -> {
+                                            val totalApps = uiState.activelyEnforcingProfiles.flatMap { it.targetApps }.distinctBy { it.packageName }.size
+                                            "${uiState.activelyEnforcingProfiles.size} profile(s) actively blocking $totalApps app(s)"
                                         }
                                         else -> {
                                             "No restrictions running. Blocker is idle. Enable a profile below or start Quick Block."
@@ -348,7 +337,7 @@ fun HomeScreen(
                             Button(
                                 onClick = {
                                     try {
-                                        context.startActivity(permissionRepository.getAccessibilityIntent())
+                                        context.startActivity(getAccessibilityIntent())
                                     } catch (e: Exception) {
                                         onNavigateToPermissions()
                                     }
@@ -368,7 +357,7 @@ fun HomeScreen(
                 }
             }
 
-            // Real Screen Time Overview & User-Configured Daily Allowance
+            // 3. Screen Time Overview & Daily Allowance
             item {
                 Card(
                     modifier = Modifier
@@ -390,10 +379,10 @@ fun HomeScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
 
-                            if (usageSummary?.isRealDataAvailable == true) {
+                            if (uiState.usageSummary?.isRealDataAvailable == true) {
                                 Badge(containerColor = MaterialTheme.colorScheme.secondaryContainer) {
                                     Text(
-                                        text = usageSummary?.dataQuality?.displayLabel ?: "Usage Data",
+                                        text = uiState.usageSummary.dataQuality.displayLabel,
                                         color = MaterialTheme.colorScheme.onSecondaryContainer,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                                         fontSize = 11.sp
@@ -404,7 +393,7 @@ fun HomeScreen(
 
                         Spacer(modifier = Modifier.height(10.dp))
 
-                        if (!permissionStatus.hasUsageStats) {
+                        if (uiState.isUsageStatsMissing) {
                             Text(
                                 text = "Usage Access Required",
                                 style = MaterialTheme.typography.titleMedium,
@@ -421,7 +410,7 @@ fun HomeScreen(
                             OutlinedButton(onClick = onNavigateToPermissions) {
                                 Text("Grant Permission")
                             }
-                        } else if (usageSummary == null) {
+                        } else if (uiState.isUsageLoading && uiState.usageSummary == null) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -440,15 +429,16 @@ fun HomeScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                        } else {
-                            val isInteractiveAvailable = usageSummary!!.isDeviceInteractiveAvailable && usageSummary!!.deviceScreenTimeMillis != null
-                            val deviceMillis = usageSummary!!.deviceScreenTimeMillis
-                            val totalAppMillis = usageSummary!!.totalTimeMillis
+                        } else if (uiState.usageSummary != null) {
+                            val summary = uiState.usageSummary
+                            val isInteractiveAvailable = summary.isDeviceInteractiveAvailable && summary.deviceScreenTimeMillis != null
+                            val deviceMillis = summary.deviceScreenTimeMillis
+                            val totalAppMillis = summary.totalTimeMillis
 
                             val totalMillis = deviceMillis ?: totalAppMillis
                             val usedHours = totalMillis / (1000 * 3600)
                             val usedMins = (totalMillis % (1000 * 3600)) / (1000 * 60)
-                            val allowanceMillis = dailyAllowanceMinutes * 60 * 1000L
+                            val allowanceMillis = uiState.dailyAllowanceMinutes * 60 * 1000L
                             val progress = if (allowanceMillis > 0) (totalMillis.toFloat() / allowanceMillis).coerceIn(0f, 1f) else 0f
                             val remainingMinutes = maxOf(0L, (allowanceMillis - totalMillis) / (1000 * 60))
 
@@ -459,7 +449,7 @@ fun HomeScreen(
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
-                            } else if (usageSummary!!.isRealDataAvailable && totalAppMillis > 0L) {
+                            } else if (summary.isRealDataAvailable && totalAppMillis > 0L) {
                                 Column {
                                     Text(
                                         text = "${usedHours}h ${usedMins}m",
@@ -506,13 +496,13 @@ fun HomeScreen(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { showAllowanceDialog = true },
+                                    .clickable { onEvent(HomeUiEvent.SetAllowanceDialogVisible(true)) },
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = "Daily Allowance: ${dailyAllowanceMinutes / 60}h ${if (dailyAllowanceMinutes % 60 > 0) "${dailyAllowanceMinutes % 60}m" else "00m"}",
+                                        text = "Daily Allowance: ${uiState.dailyAllowanceMinutes / 60}h ${if (uiState.dailyAllowanceMinutes % 60 > 0) "${uiState.dailyAllowanceMinutes % 60}m" else "00m"}",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -536,13 +526,13 @@ fun HomeScreen(
                 }
             }
 
-            // Quick Block Card
+            // 4. Quick Block Card
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(20.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = if (quickBlockState.isActive) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface
+                        containerColor = if (uiState.isQuickBlockActive) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface
                     ),
                     elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
                 ) {
@@ -556,20 +546,20 @@ fun HomeScreen(
                                 Icon(
                                     imageVector = Icons.Outlined.Timer,
                                     contentDescription = null,
-                                    tint = if (quickBlockState.isActive) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.secondary,
+                                    tint = if (uiState.isQuickBlockActive) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.secondary,
                                     modifier = Modifier.size(20.dp)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = if (quickBlockState.isActive) "Quick Block Running" else "Quick Distraction Block",
+                                    text = if (uiState.isQuickBlockActive) "Quick Block Running" else "Quick Distraction Block",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.SemiBold,
-                                    color = if (quickBlockState.isActive) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurface
+                                    color = if (uiState.isQuickBlockActive) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurface
                                 )
                             }
-                            if (quickBlockState.isActive) {
+                            if (uiState.isQuickBlockActive) {
                                 Button(
-                                    onClick = { quickBlockRepository.cancelQuickBlock() },
+                                    onClick = { onEvent(HomeUiEvent.CancelQuickBlock) },
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                 ) {
                                     Text("Stop", color = Color.White)
@@ -577,10 +567,10 @@ fun HomeScreen(
                             }
                         }
 
-                        if (quickBlockState.isActive) {
+                        if (uiState.isQuickBlockActive) {
                             Spacer(modifier = Modifier.height(10.dp))
-                            val mins = quickBlockState.remainingSeconds / 60
-                            val secs = quickBlockState.remainingSeconds % 60
+                            val mins = uiState.quickBlockState.remainingSeconds / 60
+                            val secs = uiState.quickBlockState.remainingSeconds % 60
                             Text(
                                 text = String.format("%02d:%02d remaining", mins, secs),
                                 style = MaterialTheme.typography.displayMedium,
@@ -607,9 +597,7 @@ fun HomeScreen(
                                 listOf(15, 30, 60, 120).forEach { minutes ->
                                     FilterChip(
                                         selected = false,
-                                        onClick = {
-                                            quickBlockRepository.startQuickBlock(minutes)
-                                        },
+                                        onClick = { onEvent(HomeUiEvent.StartQuickBlock(minutes)) },
                                         label = {
                                             Text(if (minutes >= 60) "${minutes / 60}h" else "${minutes}m")
                                         },
@@ -624,7 +612,7 @@ fun HomeScreen(
                 }
             }
 
-            // Profiles Overview Section
+            // 5. Profiles Overview Section
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -642,9 +630,9 @@ fun HomeScreen(
                 }
             }
 
-            items(profiles.size) { index ->
-                val profile = profiles[index]
-                val isProfileEnforcingNow = profile.isEnabled && engine.isProfileCurrentlyEnforcing(profile, nowTime, today)
+            items(uiState.profiles.size) { index ->
+                val profile = uiState.profiles[index]
+                val isProfileEnforcingNow = uiState.activelyEnforcingProfiles.any { it.id == profile.id }
 
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -702,11 +690,7 @@ fun HomeScreen(
                             Switch(
                                 checked = profile.isEnabled,
                                 onCheckedChange = {
-                                    if (strictState.isCurrentlyLocked) {
-                                        pendingToggleProfileId = profile.id
-                                    } else {
-                                        profileRepository.toggleProfile(profile.id)
-                                    }
+                                    onEvent(HomeUiEvent.RequestToggleProfile(profile.id))
                                 }
                             )
                         }
@@ -729,10 +713,10 @@ fun HomeScreen(
             }
         }
 
-        // Daily Allowance Configuration Dialog
-        if (showAllowanceDialog) {
+        // Dialog: Daily Allowance Configuration
+        if (uiState.showAllowanceDialog) {
             AlertDialog(
-                onDismissRequest = { showAllowanceDialog = false },
+                onDismissRequest = { onEvent(HomeUiEvent.SetAllowanceDialogVisible(false)) },
                 title = { Text("Set Daily Screen Time Allowance") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -745,42 +729,38 @@ fun HomeScreen(
                             val hours = mins / 60
                             OutlinedButton(
                                 onClick = {
-                                    dailyAllowanceMinutes = mins
-                                    usageStatsRepository.setDailyAllowanceMinutes(mins)
-                                    showAllowanceDialog = false
+                                    onEvent(HomeUiEvent.SetDailyAllowance(mins))
                                 },
                                 modifier = Modifier.fillMaxWidth(),
-                                colors = if (dailyAllowanceMinutes == mins) ButtonDefaults.outlinedButtonColors(containerColor = MaterialTheme.colorScheme.primaryContainer) else ButtonDefaults.outlinedButtonColors()
+                                colors = if (uiState.dailyAllowanceMinutes == mins) ButtonDefaults.outlinedButtonColors(containerColor = MaterialTheme.colorScheme.primaryContainer) else ButtonDefaults.outlinedButtonColors()
                             ) {
-                                Text("$hours hours per day", fontWeight = if (dailyAllowanceMinutes == mins) FontWeight.Bold else FontWeight.Normal)
+                                Text("$hours hours per day", fontWeight = if (uiState.dailyAllowanceMinutes == mins) FontWeight.Bold else FontWeight.Normal)
                             }
                         }
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = { showAllowanceDialog = false }) {
+                    TextButton(onClick = { onEvent(HomeUiEvent.SetAllowanceDialogVisible(false)) }) {
                         Text("Close")
                     }
                 }
             )
         }
 
-        if (pendingToggleProfileId != null) {
+        // Strict Mode Challenge Dialog for Profile Toggle
+        if (uiState.pendingToggleProfileId != null) {
             StrictChallengeDialog(
-                mechanism = strictState.mechanism,
-                saltBase64 = strictState.saltBase64,
-                expectedHash = strictState.passwordHash,
+                mechanism = uiState.strictState.mechanism,
+                saltBase64 = uiState.strictState.saltBase64,
+                expectedHash = uiState.strictState.passwordHash,
                 mutationType = MutationType.TOGGLE_PROFILE,
-                targetId = pendingToggleProfileId,
+                targetId = uiState.pendingToggleProfileId,
                 onTokenIssued = { token ->
-                    val pid = pendingToggleProfileId
-                    if (pid != null) {
-                        profileRepository.toggleProfile(pid, token = token)
-                    }
-                    pendingToggleProfileId = null
+                    val pid = uiState.pendingToggleProfileId ?: return@StrictChallengeDialog
+                    onEvent(HomeUiEvent.ConfirmToggleProfileWithToken(pid, token))
                 },
                 onDismissRequest = {
-                    pendingToggleProfileId = null
+                    onEvent(HomeUiEvent.DismissToggleChallenge)
                 }
             )
         }
