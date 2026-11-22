@@ -42,12 +42,24 @@ data class SystemContextSnapshot(
     val foregroundPackageName: String?,
     val activeBrowserUrl: String? = null,
     val accumulatedForegroundTimeMillis: Map<String, Long> = emptyMap(),
+    val hourlyForegroundTimeMillis: Map<String, Long> = emptyMap(),
+    val currentSessionDurationMillis: Long = 0L,
+    val isUsageDataAvailable: Boolean = true,
+    val usageDataQuality: UsageDataQuality = UsageDataQuality.RECONSTRUCTED_COMPLETE,
     val activeGeofenceIds: Set<String> = emptySet(),
     val isFocusSessionActive: Boolean = false,
     val isBreakActive: Boolean = false,
     val activeFocusSessionProfileId: String? = null,
+    val breakWhitelistApps: Set<String> = emptySet(),
+    val isQuickBlockActive: Boolean = false,
+    val quickBlockExpirationEpochMillis: Long? = null,
+    val quickBlockTargetPackages: Set<String> = emptySet(),
     val isStrictModeActive: Boolean = false,
-    val strictModeExpirationMillis: Long? = null
+    val strictModeExpirationMillis: Long? = null,
+    val isEssentialModeActive: Boolean = false,
+    val essentialModeAllowanceMinutes: Int = 0,
+    val essentialModeTotalUsageMinutes: Int = 0,
+    val essentialModeExemptPackages: Set<String> = emptySet()
 )
 
 /**

@@ -109,13 +109,14 @@ flowchart TD
     SM_CONFIRM --> SM_ACTIVE[Strict Mode Armed & Encrypted in DataStore]
     
     SM_ACTIVE --> USER_EDIT[User Attempts to Edit Profile or Disable Restriction]
-    USER_EDIT --> EVAL_STRICT{Is Strict Mode Active?}
+    SM_ACTIVE --> USER_QB[User Attempts to Stop Active Quick Block]
+    USER_EDIT & USER_QB --> EVAL_STRICT{Is Strict Mode Active?}
     EVAL_STRICT -->|Yes| CHALLENGE[Present Configured Challenge UI]
     
     CHALLENGE --> VALIDATE{User Solves Challenge?}
-    VALIDATE -->|No / Cancel| ABORT[Operation Canceled, Settings remain locked]
-    VALIDATE -->|Yes| UNLOCK_TEMP[Temporary 10-Minute Maintenance Window Opened]
-    UNLOCK_TEMP --> USER_EDIT_OK[User Modifies Settings Safely]
+    VALIDATE -->|No / Cancel| ABORT[Operation Canceled, Restrictions remain enforced]
+    VALIDATE -->|Yes| UNLOCK_TEMP[Single-Use Mutation Token Issued and Consumed]
+    UNLOCK_TEMP --> USER_EDIT_OK[Modification or Quick Block Dismissal Approved]
 ```
 
 ---

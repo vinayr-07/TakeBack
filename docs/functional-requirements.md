@@ -83,16 +83,18 @@ This document specifies the complete, unambiguous functional requirements for **
 - **FR-QCK-001:** The system shall provide a one-tap Quick Block widget from the Home dashboard allowing instant restriction of all distracting applications for a selectable duration (15m, 30m, 1h, 2h, 4h).
 - **FR-QCK-002:** The system shall provide a Digital Detox mode that restricts all non-whitelisted communication apps for up to 48 hours.
 - **FR-QCK-003:** Quick Block and Digital Detox shall execute through the unified Central Restriction Engine without duplicating enforcement logic.
+- **FR-QCK-004:** When Strict Mode is armed, cancelling or prematurely dismissing an active Quick Block session shall require solving the configured Strict Mode verification challenge (`CANCEL_QUICK_BLOCK`).
+- **FR-QCK-005:** Active Quick Block timers shall persist across application restarts, Low Memory Killer (LMK) process terminations, and device reboots, automatically recalculating elapsed time.
 
 ### Module H: Pomodoro & Focus Sessions
 - **FR-POM-001:** The system shall include an integrated Pomodoro timer supporting custom focus durations (default: 25 mins) and short/long break durations (default: 5 mins / 15 mins).
 - **FR-POM-002:** Starting a focus session shall automatically activate the designated focus profile and enforce application/website restrictions.
 - **FR-POM-003:** During scheduled breaks, the system shall temporarily unlock designated break-whitelisted applications.
 - **FR-POM-004:** When a break period expires, the system shall immediately re-engage full restrictions with an auditory alert.
-- **FR-POM-005:** The focus timer state shall persist across application restarts and background process recreation using a foreground service and Room persistence.
+- **FR-POM-005:** The focus timer state, cycle count, and whitelist apps shall persist across application restarts and background process recreation using atomic SharedPreferences records.
 
 ### Module I: Focus Ambient Sounds
-- **FR-SND-001:** The system shall provide an offline ambient sound library containing at least: Rain, Ocean Waves, Wind, Stream, Brown Noise, and White Noise.
+- **FR-SND-001:** The system shall provide an offline, procedural ambient sound synthesizer generating at least: Rain, Ocean Waves, Forest Wind, Bubbling Stream, Brown Noise, and White Noise in real-time via PCM `AudioTrack` with zero external audio assets.
 - **FR-SND-002:** The system shall support multi-track audio mixing, allowing users to play up to three simultaneous ambient layers with individual volume sliders.
 - **FR-SND-003:** Audio playback shall continue in the background with the device screen off via an Android `MediaSession` compatible foreground service.
 - **FR-SND-004:** The audio service shall respect system audio focus, pausing or ducking automatically during phone calls or user-initiated media playback.

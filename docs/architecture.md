@@ -60,9 +60,17 @@ flowchart TD
 - **Invariant:** Absolute independence from Android framework classes (`android.*`), enabling fast, deterministic JUnit tests without Robolectric.
 
 ### 3. Data Layer (`com.vr.takeback.data`)
-- **Storage:** Room Database (`TakeBackDatabase`) for complex relational entities; Jetpack DataStore / `EncryptedSharedPreferences` for settings and secure credentials.
-- **Repositories:** `ProfileRepositoryImpl`, `UsageAnalyticsRepositoryImpl`, `RestrictionRepositoryImpl`, `SoundRepositoryImpl`.
-- **Offline Guarantee:** 100% local persistence. No cloud API endpoints or remote network clients.
+- **Storage:**
+  - Room SQLite Database (`takeback_usage_ledger.db`) for durable historical usage ledgers and application statistics.
+  - Dedicated, atomic `SharedPreferences` stores for state resilience surviving process death and device reboots:
+    - `takeback_profiles_prefs`: User-configured profiles, target apps, websites, and schedules.
+    - `takeback_alarms_prefs`: Custom strict wake-up alarms with difficulty and recurrence masks.
+    - `takeback_quickblock_prefs`: Active Quick Block start timestamps, durations, and targeted packages.
+    - `takeback_focus_session_prefs`: Active Pomodoro sprint cycles, durations, whitelist apps, and ambient audio selections.
+    - `takeback_strict_prefs`: PBKDF2 salt, password hashes, and protection locks.
+    - `takeback_essential_prefs`: Daily screen-time allowances, emergency exits, and Good Lock module exemptions.
+- **Repositories:** `ProfileRepository`, `QuickBlockRepository`, `FocusSessionRepository`, `AlarmRepository`, `StrictModeRepository`, `EssentialModeRepository`, `UsageStatsRepository`, `TimelineRepository`.
+- **Offline Guarantee:** 100% local persistence. No cloud API endpoints or remote network clients. Zero telemetry.
 
 ### 4. Platform & System Services Layer (`com.vr.takeback.platform`)
 - **Background Execution:**

@@ -148,6 +148,51 @@ Local-first activity log for audit and timeline visualization.
 ```sql
 CREATE TABLE IF NOT EXISTS `activity_timeline_events` (
     `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `event_type` TEXT NOT NULL,
+    `target_identifier` TEXT NOT NULL,
+    `profile_id` TEXT,
+    `timestamp_millis` INTEGER NOT NULL,
+    `extra_metadata` TEXT
+);
+
+---
+
+## 3. Dedicated Atomic Key-Value Stores (SharedPreferences)
+
+To guarantee that active restriction profiles, ongoing Pomodoro sprints, and strict wake-up alarms survive Android Low Memory Killer (LMK) process death and device reboots without migration friction, TakeBack maintains atomic local preference files:
+
+### Store 1: `takeback_alarms_prefs`
+- `alarms_json`: JSON-serialized array of `StrictAlarm` objects storing `id`, `hour`, `minute`, `daysOfWeekMask`, `isEnabled`, `difficulty`, and `label`.
+
+### Store 2: `takeback_quickblock_prefs`
+- `is_active` (`BOOLEAN`): Active digital detox flag.
+- `duration_minutes` (`INTEGER`): Original block duration.
+- `start_epoch_millis` (`LONG`): Epoch timestamp when Quick Block was initiated.
+- `target_packages` (`TEXT`): Comma-separated list of restricted package names.
+
+### Store 3: `takeback_focus_session_prefs`
+- `session_id` (`TEXT`): Unique UUID for the Pomodoro session.
+- `focus_duration_minutes` / `break_duration_minutes` (`INTEGER`): Configured cycle intervals.
+- `total_cycles` / `current_cycle` (`INTEGER`): Cycle count tracking.
+- `state` (`TEXT`): `IDLE`, `FOCUS_RUNNING`, `BREAK_RUNNING`, `PAUSED`, `COMPLETED`.
+- `active_profile_id` (`TEXT`): Profile applied during the focus sprint.
+- `current_period_start_epoch_millis` (`LONG`): Period start timestamp.
+- `current_period_duration_millis` (`LONG`): Active period duration.
+- `break_whitelist_apps` (`TEXT`): Whitelisted app packages during breaks.
+- `ambient_sound_key` (`TEXT`): Selected audio soundscape key.
+
+### Store 4: `takeback_strict_prefs`
+- `is_global_strict_active` (`BOOLEAN`): Global arming flag.
+- `mechanism` (`TEXT`): Verification challenge mechanism.
+- `salt_base64` (`TEXT`): 128-bit CSPRNG salt.
+- `password_hash` (`TEXT`): PBKDF2-HMAC-SHA256 hash.
+- `temp_unlock_epoch_ms` / `temp_settings_unlock_epoch_ms` (`LONG`): Cooldown timers.
+
+### Store 5: `takeback_essential_prefs`
+- `is_enabled` (`BOOLEAN`): Essential Mode activation toggle.
+- `daily_allowance_minutes` (`INTEGER`): Daily screen time threshold.
+- `selected_additional_package` (`TEXT`): Single user-whitelisted productivity app.
+- `custom_goodlock_modules` (`STRING_SET`): Allowlisted Samsung Good Lock package names.
     `event_type` TEXT NOT NULL, -- 'APP_OPENED', 'APP_BLOCKED', 'PROFILE_ACTIVATED', 'FOCUS_START', 'BREAK_START'
     `target_identifier` TEXT NOT NULL,
     `profile_id` TEXT,

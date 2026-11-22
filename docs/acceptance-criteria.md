@@ -96,6 +96,45 @@ Feature: Multi-Profile Union Rule
     When the user attempts to launch "com.youtube.android"
     Then the Central Restriction Engine evaluates the union of all active profiles
     And the decision is BLOCKED because Profile "Work" mandates restriction
+
+---
+
+## Scenario 6: Strict Mode Protected Quick Block Cancellation
+```gherkin
+Feature: Strict Quick Block Cancellation
+  As a user committed to deep focus
+  I want my active Quick Block detox session protected by Strict Mode
+  So that I cannot impulsively cancel my block during moments of weak discipline
+
+  Scenario: User taps Stop on active Quick Block while Strict Mode is armed
+    Given an active Quick Block of 30 minutes is running
+    And Strict Mode is armed with a PIN challenge
+    When the user taps "Stop" on the Quick Block dashboard card
+    Then the system displays the StrictChallengeDialog
+    And the Quick Block timer continues running in the background
+    When the user completes the PIN verification successfully
+    Then a one-time CANCEL_QUICK_BLOCK mutation token is issued and consumed
+    And the Quick Block is cleanly disarmed and settled
+```
+
+---
+
+## Scenario 7: Cold-Boot State Restoration
+```gherkin
+Feature: Cold-Boot State Resilience
+  As a user whose phone reboots or terminates apps under memory pressure
+  I want my active Quick Block timers and custom alarms restored
+  So that protection never silently drops
+
+  Scenario: Device reboots while Quick Block is active
+    Given a 30-minute Quick Block was initiated at 14:00:00 (target: 14:30:00)
+    And the device is turned off and rebooted at 14:10:00
+    When the system sends the ACTION_BOOT_COMPLETED broadcast
+    Then BootCompletedReceiver triggers state restoration
+    And QuickBlockRepository calculates elapsed time as 10 minutes
+    And QuickBlock resumes with exactly 20 minutes remaining
+    And active Strict Alarms are re-registered with system AlarmManager
+```
 ```
 
 ---

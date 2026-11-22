@@ -79,14 +79,15 @@ gantt
 
 ## Phase 5: Focus Sessions, Audio Mixer & Strict Alarm (COMPLETED)
 - [x] **Milestone 5.1:** Pomodoro Focus Session Engine:
-  - Coroutine state machine for Focus $\rightarrow$ Short Break $\rightarrow$ Long Break cycles.
+  - Coroutine state machine for Focus $\rightarrow$ Short Break $\rightarrow$ Long Break cycles with persistent cycle recovery across LMK termination.
   - Interactive circular progress visualizer and session history tracking.
 - [x] **Milestone 5.2:** Focus Sounds Ambient Player:
-  - Procedural real-time PCM audio synthesis using `AudioTrack` (Brown noise, White noise, Rain simulation).
-  - Background audio synthesis coroutine with zero disk footprint and independent volume control.
+  - Procedural real-time PCM audio synthesis using `AudioTrack` (Rain, Ocean Waves, Forest Wind, Bubbling Stream, Brown Noise, White Noise).
+  - Background audio synthesis coroutine with zero external audio assets, zero disk footprint, and independent volume control.
 - [x] **Milestone 5.3:** Strict Alarm Clock:
   - Full-screen keyguard-waking `StrictAlarmActivity` with high-priority audio and vibration.
   - Mathematical puzzle challenge verification before dismissal (`MathChallengeGenerator`).
+  - Durable JSON persistence and automatic alarm rescheduling on device reboot.
 
 ---
 
@@ -111,6 +112,7 @@ gantt
   - `OemBatteryOptimizer` providing targeted autostart & battery settings navigation for MIUI, Samsung, OnePlus, Huawei, and Vivo.
 - [x] **Milestone 7.3:** Google Play Billing Abstraction:
   - `BillingRepository` with subscription tiers, 30-day offline grace period, and permanent free core protection.
-- [x] **Milestone 7.4:** Final Regression & Build Verification:
-  - 27/27 automated unit tests passing across 7 test suites (100% pass rate).
-  - Debug APK compilation and verification (`app-debug.apk` 64.8 MB generated).
+- [x] **Milestone 7.4:** Final Regression, CI & Build Verification:
+  - 175/175 automated unit tests passing across all test suites (100% pass rate).
+  - Automated Continuous Integration pipeline configured via `.github/workflows/android.yml`.
+  - Debug APK compilation and verification (`app-debug.apk` 66.4 MB generated).

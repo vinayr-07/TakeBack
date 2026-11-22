@@ -71,7 +71,7 @@ OEM manufacturers (Xiaomi HyperOS/MIUI, OnePlus OxygenOS, Samsung OneUI, Huawei 
    - Xiaomi: `com.miui.securitycenter/com.miui.permcenter.autostart.AutoStartManagementActivity`
    - Samsung: `com.samsung.android.lool/com.samsung.android.sm.battery.ui.BatteryActivity`
    - OnePlus: `com.coloros.safecenter/com.coloros.safecenter.permission.startup.StartupAppListActivity`
-4. **AlarmManager.setAlarmClock():** Used for strict alarms and schedule boundary transitions; this API bypasses Doze mode restrictions and is exempt from standard exact alarm throttles.
+4. **AlarmManager.setAlarmClock():** Used for strict alarms and schedule boundary transitions; this API bypasses Doze mode restrictions and is exempt from standard exact alarm throttles. Defensive `try-catch (e: SecurityException)` guards handle Android 12+ (API 31+) exact alarm restrictions, falling back gracefully to `setAndAllowWhileIdle` when exact alarm scheduling is not granted.
 
 ---
 
