@@ -160,16 +160,34 @@ object SettingsProtectionManager {
             return SettingsDestination.DEVICE_ADMIN_SETTINGS
         }
 
-        // 6. Accessibility Details targeting TakeBack (Disabling destination)
-        val hasAccessibilityControls = containsText(rootNode, "Use TakeBack", MAX_SEARCH_DEPTH) ||
-                containsText(rootNode, "TakeBack shortcut", MAX_SEARCH_DEPTH) ||
-                containsText(rootNode, "Allow TakeBack", MAX_SEARCH_DEPTH) ||
-                (hasTakeBack && containsText(rootNode, "Turn off", MAX_SEARCH_DEPTH)) ||
-                (hasTakeBack && cls.contains("toggleaccessibilityservice"))
+        // 5b. General Accessibility main menu view (Samsung One UI / AOSP)
+        val isGeneralAccessibilityMenu = (containsText(rootNode, "Vision enhancements", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Visibility enhancements", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Hearing enhancements", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Interaction and dexterity", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Advanced settings", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Accessibility features", MAX_SEARCH_DEPTH)) &&
+                !cls.contains("toggleaccessibilityservice")
 
+        if (isGeneralAccessibilityMenu) {
+            return SettingsDestination.ACCESSIBILITY_SETTINGS
+        }
+
+        // 6. Accessibility Details targeting TakeBack (Disabling destination)
+        val hasAccessibilityControls = (containsText(rootNode, "Use TakeBack", MAX_SEARCH_DEPTH) ||
+                (hasTakeBack && containsText(rootNode, "TakeBack shortcut", MAX_SEARCH_DEPTH)) ||
+                (hasTakeBack && containsText(rootNode, "Turn off", MAX_SEARCH_DEPTH)) ||
+                (hasTakeBack && cls.contains("toggleaccessibilityservice"))) &&
+                !isGeneralAccessibilityMenu
+
+        if (hasAccessibilityControls) {
+            return SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS
+        }
+
+        // 6b. Installed accessibility services list view
         val isInstalledServicesList = (cls.contains("installedservice") ||
-                rootNode.text?.contains("Installed services", ignoreCase = true) == true ||
-                rootNode.text?.contains("Installed apps", ignoreCase = true) == true) &&
+                containsText(rootNode, "Installed services", MAX_SEARCH_DEPTH) ||
+                containsText(rootNode, "Installed apps", MAX_SEARCH_DEPTH)) &&
                 !hasAccessibilityControls
 
         if (isInstalledServicesList) {
@@ -181,10 +199,6 @@ object SettingsProtectionManager {
                 cls.contains("installedservice") ||
                 cls.contains("toggleaccessibilityservice") ||
                 containsText(rootNode, "Accessibility", MAX_SEARCH_DEPTH)
-
-        if (hasAccessibilityControls) {
-            return SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS
-        }
 
         // 7. General Accessibility settings list view
         if (isAccessibilityContext && !hasTakeBack) {

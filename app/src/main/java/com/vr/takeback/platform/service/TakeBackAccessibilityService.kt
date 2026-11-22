@@ -90,6 +90,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private var lastBlockedTimestamp: Long = 0
     private var lastBlockedSettingsDestination: SettingsDestination? = null
     private var lastBlockedSettingsTimestamp: Long = 0
+    private var serviceConnectedTimestamp: Long = 0L
 
     // Build 7 Issue 3 & Build 8 Issue 4: Monotonic elapsed realtime session tracker
     val sessionTracker = ForegroundSessionTracker(
@@ -201,6 +202,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         isServiceRunning = true
         activeServiceInstance = this
+        serviceConnectedTimestamp = SystemClock.elapsedRealtime()
         Log.i(TAG, "TakeBack Accessibility Service connected and active")
 
         // Build 8 Issue 4: Query actual device state from PowerManager and KeyguardManager
@@ -767,6 +769,13 @@ class TakeBackAccessibilityService : AccessibilityService() {
             return
         }
 
+        // If TakeBack's own shield or activity is currently the front active window,
+        // ignore background events to prevent recursive block loops.
+        val activeWindowRoot = rootInActiveWindow
+        if (activeWindowRoot?.packageName == applicationContext.packageName) {
+            return
+        }
+
         // Strict Mode Anti-Tamper: Restrict Android Settings, App Info, Device Admin, and Uninstall screens
         val strictState = try {
             TakeBackApplication.strictModeRepository.protectionState.value
@@ -774,7 +783,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
             null
         }
 
-        if (strictState?.isSettingsLocked == true) {
+        // Post-connection grace window (15s): user just toggled the accessibility permission ON in Settings
+        // and needs to navigate back out of Settings to TakeBack without being blocked.
+        val isWithinConnectionGracePeriod = (SystemClock.elapsedRealtime() - serviceConnectedTimestamp) < 15_000L
+
+        if (strictState?.isSettingsLocked == true && !isWithinConnectionGracePeriod) {
             val rootNode = rootInActiveWindow
             val snapshot = if (rootNode != null) RealAccessibilityNodeSnapshot(rootNode) else null
             val decision = SettingsProtectionManager.evaluate(
@@ -786,14 +799,13 @@ class TakeBackAccessibilityService : AccessibilityService() {
             )
 
             if (decision.isRestricted) {
-                // De-bounce rapid consecutive events for the same blocked settings destination (< 1.2s)
-                if (decision.destination == lastBlockedSettingsDestination && (now - lastBlockedSettingsTimestamp) < 1200) {
+                // De-bounce rapid consecutive events for the same blocked settings destination (< 3.0s)
+                if (decision.destination == lastBlockedSettingsDestination && (now - lastBlockedSettingsTimestamp) < 3000) {
                     return
                 }
                 lastBlockedSettingsDestination = decision.destination
                 lastBlockedSettingsTimestamp = now
 
-                performGlobalAction(GLOBAL_ACTION_HOME)
                 val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                     putExtra("EXTRA_APP_NAME", "Android Settings")
@@ -808,8 +820,13 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         }
 
-        // De-bounce rapid consecutive events for the same blocked package (< 1.2s)
-        if (packageName == lastBlockedPackage && (now - lastBlockedTimestamp) < 1200) {
+        // De-bounce rapid consecutive events for the same blocked package (< 10.0s)
+        if (packageName == lastBlockedPackage && (now - lastBlockedTimestamp) < 10000) {
+            return
+        }
+
+        // Only evaluate full blocking on true window transitions or user clicks to prevent background event storms
+        if (!isWindowTransition && eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) {
             return
         }
 
