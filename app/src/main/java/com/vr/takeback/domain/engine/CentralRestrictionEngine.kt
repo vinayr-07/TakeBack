@@ -28,7 +28,11 @@ data class SystemContextSnapshot(
     val quickBlockExpirationEpochMillis: Long? = null,
     val quickBlockTargetPackages: Set<String> = emptySet(),
     val isStrictModeActive: Boolean = false,
-    val strictModeExpirationMillis: Long? = null
+    val strictModeExpirationMillis: Long? = null,
+    val isEssentialModeActive: Boolean = false,
+    val essentialModeAllowanceMinutes: Int = 0,
+    val essentialModeTotalUsageMinutes: Int = 0,
+    val essentialModeExemptPackages: Set<String> = emptySet()
 )
 
 /**
@@ -89,6 +93,23 @@ class CentralRestrictionEngine {
         // Rule 0: Emergency Allowlist (Absolute Exemption)
         if (isEmergencyPackage(targetPackage)) {
             return BlockDecision.Allowed
+        }
+
+        // Rule 0.5: Essential Mode Global Allowlist Enforcement
+        if (snapshot.isEssentialModeActive) {
+            val isExempt = isEmergencyPackage(targetPackage) ||
+                    snapshot.essentialModeExemptPackages.contains(targetPackage)
+            if (!isExempt) {
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = "essential_mode",
+                    triggeringProfileName = "Essential Mode",
+                    reason = BlockReason.DailyAllowanceExceeded(
+                        allowanceMinutes = snapshot.essentialModeAllowanceMinutes,
+                        usedMinutes = snapshot.essentialModeTotalUsageMinutes
+                    )
+                )
+            }
         }
 
         // Rule 1: Break Whitelist during active Pomodoro Break

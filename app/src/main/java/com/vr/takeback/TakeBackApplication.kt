@@ -2,7 +2,9 @@ package com.vr.takeback
 
 import android.app.Application
 import com.vr.takeback.data.repository.*
+import com.vr.takeback.domain.security.EssentialModeExemptionResolver
 import com.vr.takeback.platform.alarm.ScheduleAlarmScheduler
+import com.vr.takeback.platform.util.AndroidPackageInfoProvider
 
 class TakeBackApplication : Application() {
 
@@ -20,11 +22,22 @@ class TakeBackApplication : Application() {
         val timelineRepository by lazy { TimelineRepository(instance.applicationContext) }
         val billingRepository by lazy { BillingRepository(instance.applicationContext) }
         val alarmScheduler by lazy { ScheduleAlarmScheduler(instance.applicationContext) }
+        val packageInfoProvider by lazy { AndroidPackageInfoProvider(instance.applicationContext) }
+        val essentialModeExemptionResolver by lazy { EssentialModeExemptionResolver(packageInfoProvider) }
+        val essentialModeRepository by lazy { EssentialModeRepository(instance.applicationContext) }
     }
 
     override fun onCreate() {
         super.onCreate()
         instance = this
+
+        // Reconcile saved custom Good Lock modules with exemption resolver
+        try {
+            val customModules = essentialModeRepository.state.value.customGoodLockModules
+            essentialModeExemptionResolver.setCustomGoodLockModules(customModules)
+        } catch (e: Exception) {
+            // Ignore
+        }
 
         // Safe migration: Clear any obsolete Web Shield DNS preferences from earlier versions
         try {

@@ -127,7 +127,8 @@ fun TakeBackNavHost(
                     permissionRepository = permissionRepository,
                     strictModeRepository = strictModeRepository,
                     onNavigateToPermissions = { navController.navigate(Screen.PermissionCenter.route) },
-                    onNavigateToDiagnostics = { navController.navigate(Screen.UsageDiagnostics.route) }
+                    onNavigateToDiagnostics = { navController.navigate(Screen.UsageDiagnostics.route) },
+                    onNavigateToEssentialDiagnostics = { navController.navigate(Screen.EssentialModeDiagnostics.route) }
                 )
             }
             composable(Screen.PermissionCenter.route) {
@@ -139,6 +140,11 @@ fun TakeBackNavHost(
             composable(Screen.UsageDiagnostics.route) {
                 UsageDiagnosticsScreen(
                     usageStatsRepository = usageStatsRepository,
+                    onNavigateBack = { navController.popBackStack() }
+                )
+            }
+            composable(Screen.EssentialModeDiagnostics.route) {
+                EssentialModeDiagnosticsScreen(
                     onNavigateBack = { navController.popBackStack() }
                 )
             }

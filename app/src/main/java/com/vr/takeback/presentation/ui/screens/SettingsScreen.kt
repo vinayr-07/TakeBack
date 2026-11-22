@@ -1,6 +1,7 @@
 package com.vr.takeback.presentation.ui.screens
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,6 +22,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import com.vr.takeback.TakeBackApplication
+import com.vr.takeback.data.repository.EssentialModeStatus
 import com.vr.takeback.data.repository.PermissionRepository
 import com.vr.takeback.data.repository.StrictModeRepository
 import com.vr.takeback.data.repository.StrictProtectionStatus
@@ -36,17 +39,43 @@ fun SettingsScreen(
     permissionRepository: PermissionRepository,
     strictModeRepository: StrictModeRepository,
     onNavigateToPermissions: () -> Unit,
-    onNavigateToDiagnostics: () -> Unit = {}
+    onNavigateToDiagnostics: () -> Unit = {},
+    onNavigateToEssentialDiagnostics: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val permissionStatus by permissionRepository.permissionStatus.collectAsState()
     val strictState by strictModeRepository.protectionState.collectAsState()
+
+    val essentialRepo = remember { TakeBackApplication.essentialModeRepository }
+    val exemptionResolver = remember { TakeBackApplication.essentialModeExemptionResolver }
+    val essentialState by essentialRepo.state.collectAsState()
 
     var showArmDialog by remember { mutableStateOf(false) }
     var showAdminRequiredDialog by remember { mutableStateOf(false) }
     var showDisarmChallenge by remember { mutableStateOf(false) }
     var selectedMechanism by remember { mutableStateOf(StrictMechanism.TEXT_CHALLENGE) }
     var pinToSet by remember { mutableStateOf("") }
+
+    // Essential Mode state & dialogs
+    var showAllowanceDialog by remember { mutableStateOf(false) }
+    var allowanceHoursInput by remember { mutableStateOf("") }
+    var allowanceMinutesInput by remember { mutableStateOf("") }
+
+    var showAdditionalAppDialog by remember { mutableStateOf(false) }
+    var additionalAppInput by remember { mutableStateOf("") }
+    var additionalAppError by remember { mutableStateOf<String?>(null) }
+
+    var pendingEssentialMutation by remember { mutableStateOf<((String?) -> Unit)?>(null) }
+    var showEssentialChallenge by remember { mutableStateOf(false) }
+
+    fun executeEssentialMutation(mutation: (String?) -> Unit) {
+        if (strictState.isGlobalStrictActive) {
+            pendingEssentialMutation = mutation
+            showEssentialChallenge = true
+        } else {
+            mutation(null)
+        }
+    }
 
     // Recheck actual DevicePolicyManager administrator status upon resume
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
@@ -228,6 +257,171 @@ fun SettingsScreen(
                             color = if (strictState.isGlobalStrictActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                             fontWeight = if (strictState.isGlobalStrictActive) FontWeight.SemiBold else FontWeight.Normal
                         )
+                    }
+                }
+            }
+
+            // Essential Mode Card
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Icon(
+                                    imageVector = Icons.Filled.HourglassBottom,
+                                    contentDescription = null,
+                                    tint = if (essentialState.isEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column {
+                                    Text(
+                                        text = "Essential Mode",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = "Daily limit & emergency allowlist",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            Switch(
+                                checked = essentialState.isEnabled,
+                                onCheckedChange = { targetState ->
+                                    executeEssentialMutation { token ->
+                                        val success = essentialRepo.setEnabled(targetState, token)
+                                        if (!success) {
+                                            Toast.makeText(context, "Action blocked by Strict Mode or invalid state", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            )
+                        }
+
+                        if (essentialState.isEnabled) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // Status Indicator
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Current State", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = when (essentialState.status) {
+                                        EssentialModeStatus.ACTIVE -> MaterialTheme.colorScheme.errorContainer
+                                        EssentialModeStatus.EMERGENCY_EXIT_ACTIVE -> MaterialTheme.colorScheme.tertiaryContainer
+                                        EssentialModeStatus.MONITORING -> MaterialTheme.colorScheme.primaryContainer
+                                        else -> MaterialTheme.colorScheme.surfaceVariant
+                                    }
+                                ) {
+                                    Text(
+                                        text = essentialState.status.name,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = when (essentialState.status) {
+                                            EssentialModeStatus.ACTIVE -> MaterialTheme.colorScheme.onErrorContainer
+                                            EssentialModeStatus.EMERGENCY_EXIT_ACTIVE -> MaterialTheme.colorScheme.onTertiaryContainer
+                                            EssentialModeStatus.MONITORING -> MaterialTheme.colorScheme.onPrimaryContainer
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Daily Allowance
+                            val hours = essentialState.dailyAllowanceMinutes / 60
+                            val mins = essentialState.dailyAllowanceMinutes % 60
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Daily Usage Allowance", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                                    Text("${hours}h ${mins}m (${essentialState.dailyAllowanceMinutes} mins)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                TextButton(
+                                    onClick = {
+                                        if (essentialState.status == EssentialModeStatus.ACTIVE) {
+                                            Toast.makeText(context, "Cannot modify allowance while Essential Mode is active", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            allowanceHoursInput = hours.toString()
+                                            allowanceMinutesInput = mins.toString()
+                                            showAllowanceDialog = true
+                                        }
+                                    }
+                                ) {
+                                    Text("Change")
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Additional Allowed Application
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Allowed App (User Selected)", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        text = essentialState.selectedAdditionalPackage ?: "None configured",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                TextButton(
+                                    onClick = {
+                                        if (essentialState.status == EssentialModeStatus.ACTIVE) {
+                                            Toast.makeText(context, "Cannot change allowed app while Essential Mode is active", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            additionalAppInput = essentialState.selectedAdditionalPackage ?: ""
+                                            additionalAppError = null
+                                            showAdditionalAppDialog = true
+                                        }
+                                    }
+                                ) {
+                                    Text("Select")
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            OutlinedButton(
+                                onClick = onNavigateToEssentialDiagnostics,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Filled.VerifiedUser, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Exemptions & Diagnostics")
+                            }
+                        } else {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Restricts non-essential phone access automatically once your total daily screen time exceeds the configured threshold. Dialer, SMS, Camera, WhatsApp, and Samsung Good Lock remain fully available.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
             }
@@ -454,6 +648,154 @@ fun SettingsScreen(
                     showDisarmChallenge = false
                 },
                 onDismissRequest = { showDisarmChallenge = false }
+            )
+        }
+
+        // Dialog: Edit Daily Allowance
+        if (showAllowanceDialog) {
+            AlertDialog(
+                onDismissRequest = { showAllowanceDialog = false },
+                title = { Text("Configure Daily Allowance") },
+                text = {
+                    Column {
+                        Text(
+                            text = "Set total daily phone screen time limit before Essential Mode restricts distracting apps:",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = allowanceHoursInput,
+                                onValueChange = { allowanceHoursInput = it.filter { ch -> ch.isDigit() } },
+                                label = { Text("Hours") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedTextField(
+                                value = allowanceMinutesInput,
+                                onValueChange = { allowanceMinutesInput = it.filter { ch -> ch.isDigit() } },
+                                label = { Text("Minutes") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val h = allowanceHoursInput.toIntOrNull() ?: 0
+                            val m = allowanceMinutesInput.toIntOrNull() ?: 0
+                            val totalMins = (h * 60) + m
+                            if (totalMins in 15..1440) {
+                                showAllowanceDialog = false
+                                executeEssentialMutation { token ->
+                                    val ok = essentialRepo.setDailyAllowanceMinutes(totalMins, token)
+                                    if (ok) {
+                                        Toast.makeText(context, "Allowance updated to ${h}h ${m}m", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        Toast.makeText(context, "Update failed: blocked by Strict Mode or invalid state", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            } else {
+                                Toast.makeText(context, "Allowance must be between 15 mins and 24 hours", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAllowanceDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        // Dialog: Select Additional Application
+        if (showAdditionalAppDialog) {
+            AlertDialog(
+                onDismissRequest = { showAdditionalAppDialog = false },
+                title = { Text("Select Allowed App") },
+                text = {
+                    Column {
+                        Text(
+                            text = "Enter the package name of exactly one additional productivity application to allow during Essential Mode (e.g. com.openai.chatgpt):",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = additionalAppInput,
+                            onValueChange = {
+                                additionalAppInput = it.trim()
+                                additionalAppError = null
+                            },
+                            label = { Text("Package Name") },
+                            singleLine = true,
+                            isError = additionalAppError != null,
+                            supportingText = additionalAppError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Games, social media, and entertainment streaming are strictly rejected.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val pkg = additionalAppInput.trim()
+                            if (pkg.isBlank()) {
+                                additionalAppError = "Package name cannot be blank"
+                                return@Button
+                            }
+                            if (!exemptionResolver.canSelectAsAdditionalApp(pkg)) {
+                                additionalAppError = "Application is ineligible (games, social media, or streaming cannot be selected)"
+                                return@Button
+                            }
+                            showAdditionalAppDialog = false
+                            executeEssentialMutation { token ->
+                                val ok = essentialRepo.setSelectedAdditionalPackage(pkg, token)
+                                if (ok) {
+                                    Toast.makeText(context, "Allowed application set to $pkg", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Update failed: blocked by Strict Mode or invalid state", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAdditionalAppDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        // Dialog: Strict Challenge for Essential Mode Mutation
+        if (showEssentialChallenge) {
+            StrictChallengeDialog(
+                mechanism = strictState.mechanism,
+                saltBase64 = strictState.saltBase64,
+                expectedHash = strictState.passwordHash,
+                mutationType = MutationType.UPDATE_ESSENTIAL_MODE,
+                onTokenIssued = { token ->
+                    showEssentialChallenge = false
+                    val action = pendingEssentialMutation
+                    pendingEssentialMutation = null
+                    action?.invoke(token)
+                },
+                onDismissRequest = {
+                    showEssentialChallenge = false
+                    pendingEssentialMutation = null
+                }
             )
         }
     }

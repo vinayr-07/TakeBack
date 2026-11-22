@@ -37,4 +37,5 @@ sealed class BlockReason {
     object QuickBlockActive : BlockReason()
     data class DomainBlock(val domain: String) : BlockReason()
     data class KeywordMatch(val keyword: String) : BlockReason()
+    data class DailyAllowanceExceeded(val allowanceMinutes: Int, val usedMinutes: Int) : BlockReason()
 }

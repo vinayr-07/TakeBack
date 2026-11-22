@@ -259,6 +259,16 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val activeSnapshot = TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
         val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
 
+        val essentialRepo = TakeBackApplication.essentialModeRepository
+        val essentialState = essentialRepo.state.value
+        val totalDailyUsageMinutes = (activeSnapshot.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+        val isEssentialActive = if (essentialState.isEnabled) {
+            essentialRepo.isCurrentlyActive(totalDailyUsageMinutes, true)
+        } else false
+        val exempt = if (isEssentialActive) {
+            TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+        } else emptySet()
+
         val snapshot = SystemContextSnapshot(
             timestampMillis = now,
             localTime = localTime,
@@ -268,7 +278,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
             hourlyForegroundTimeMillis = activeSnapshot.hourlyUsageByPackage,
             currentSessionDurationMillis = currentSessionDuration,
             isUsageDataAvailable = activeSnapshot.isAvailable,
-            usageDataQuality = activeSnapshot.quality
+            usageDataQuality = activeSnapshot.quality,
+            isEssentialModeActive = isEssentialActive,
+            essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
+            essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
+            essentialModeExemptPackages = exempt
         )
 
         val decision = engine.evaluate(activeProfiles, snapshot)
@@ -381,7 +395,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (!hasEnforcingProfiles && !isQuickBlockActive && !hasUsageLimitForApp) {
+        val essentialRepo = TakeBackApplication.essentialModeRepository
+        val essentialState = essentialRepo.state.value
+        val isEssentialEnabled = essentialState.isEnabled
+
+        if (!hasEnforcingProfiles && !isQuickBlockActive && !hasUsageLimitForApp && !isEssentialEnabled) {
             return
         }
 
@@ -444,6 +462,18 @@ class TakeBackAccessibilityService : AccessibilityService() {
             null
         }
 
+        val totalDailyUsageMinutes = ((activeSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / (60 * 1000L)).toInt()
+        val isEssentialModeActive = if (isEssentialEnabled) {
+            essentialRepo.isCurrentlyActive(
+                totalDailyUsageMinutes = totalDailyUsageMinutes,
+                isEnforcementAvailable = true
+            )
+        } else false
+
+        val essentialExemptPackages = if (isEssentialModeActive) {
+            TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+        } else emptySet()
+
         val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
 
         // Build current context snapshot
@@ -460,7 +490,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
             usageDataQuality = activeSnapshot?.quality ?: com.vr.takeback.domain.usage.UsageDataQuality.UNKNOWN,
             isQuickBlockActive = isQuickBlockActive,
             quickBlockExpirationEpochMillis = quickBlockExpiry,
-            quickBlockTargetPackages = quickBlockPackages
+            quickBlockTargetPackages = quickBlockPackages,
+            isEssentialModeActive = isEssentialModeActive,
+            essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
+            essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
+            essentialModeExemptPackages = essentialExemptPackages
         )
 
         val immediateDecision = engine.evaluate(activeProfiles, snapshot)
@@ -480,6 +514,14 @@ class TakeBackAccessibilityService : AccessibilityService() {
             triggerUsageSnapshotRefresh(force = false) { fresh ->
                 if (sessionTracker.currentPackage == packageName) {
                     val freshSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
+                    val freshTotalDailyMinutes = (fresh.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+                    val freshEssentialActive = if (isEssentialEnabled) {
+                        essentialRepo.isCurrentlyActive(freshTotalDailyMinutes, true)
+                    } else false
+                    val freshExempt = if (freshEssentialActive) {
+                        TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+                    } else emptySet()
+
                     val updatedSnapshot = snapshot.copy(
                         timestampMillis = System.currentTimeMillis(),
                         accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
@@ -487,7 +529,11 @@ class TakeBackAccessibilityService : AccessibilityService() {
                         hourlyForegroundTimeMillis = fresh.hourlyUsageByPackage,
                         currentSessionDurationMillis = freshSessionDuration,
                         isUsageDataAvailable = fresh.isAvailable,
-                        usageDataQuality = fresh.quality
+                        usageDataQuality = fresh.quality,
+                        isEssentialModeActive = freshEssentialActive,
+                        essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
+                        essentialModeTotalUsageMinutes = freshTotalDailyMinutes,
+                        essentialModeExemptPackages = freshExempt
                     )
                     val delayedDecision = engine.evaluate(activeProfiles, updatedSnapshot)
                     if (delayedDecision is BlockDecision.Blocked && sessionTracker.currentPackage == packageName) {
@@ -518,6 +564,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             is BlockReason.DailyLimitExceeded -> "Daily usage limit reached (${decision.reason.limitMinutes}m)"
             is BlockReason.HourlyQuotaExceeded -> "Hourly allowance exhausted"
             is BlockReason.SessionQuotaExceeded -> "Session limit reached (${decision.reason.limitMinutes}m)"
+            is BlockReason.DailyAllowanceExceeded -> "Daily allowance reached (${decision.reason.allowanceMinutes / 60}h ${decision.reason.allowanceMinutes % 60}m)"
             is BlockReason.FocusSessionActive -> "Deep Focus sprint in progress"
             is BlockReason.QuickBlockActive -> "Quick Block active"
             is BlockReason.DomainBlock -> "Restricted website (${decision.reason.domain})"
@@ -542,11 +589,13 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
 
         // Launch full-screen BlockShieldActivity
+        val isEssentialModeShield = decision.reason is BlockReason.DailyAllowanceExceeded
         val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("EXTRA_APP_NAME", appName)
             putExtra("EXTRA_PROFILE_NAME", decision.triggeringProfileName)
             putExtra("EXTRA_REASON", reasonText)
+            putExtra("EXTRA_IS_ESSENTIAL_SHIELD", isEssentialModeShield)
         }
         startActivity(shieldIntent)
     }

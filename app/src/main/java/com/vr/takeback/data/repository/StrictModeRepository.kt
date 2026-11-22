@@ -50,11 +50,11 @@ data class StrictProtectionState(
                 status == StrictProtectionStatus.RECOVERY_REQUIRED
 }
 
-class StrictModeRepository(private val context: Context? = null) {
+class StrictModeRepository(private val context: Context? = null, initialState: StrictProtectionState? = null) {
 
     private val prefs: SharedPreferences? = context?.getSharedPreferences("takeback_strict_prefs", Context.MODE_PRIVATE)
 
-    private val _protectionState = MutableStateFlow(loadPersistedState())
+    private val _protectionState = MutableStateFlow(initialState ?: loadPersistedState())
     val protectionState: StateFlow<StrictProtectionState> = _protectionState.asStateFlow()
 
     private fun loadPersistedState(): StrictProtectionState {
