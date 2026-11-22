@@ -369,4 +369,51 @@ class EssentialModeRepositoryTest {
         val mutationResult = failClosedRepo.setDailyAllowanceMinutes(180, token = null)
         assertFalse("STORAGE_ERROR in Strict Mode must fail-closed and block unauthenticated mutation", mutationResult)
     }
+
+    @Test
+    fun testStrictMode_ratchet_cannotIncreaseDailyAllowance() {
+        val repo = EssentialModeRepository(
+            context = null,
+            isStrictActiveProvider = { true }
+        )
+        // Default allowance is 360; attempt to increase to 420
+        val result = repo.setDailyAllowanceMinutes(420)
+        assertFalse("Increasing daily allowance in Strict Mode must be strictly rejected", result)
+        assertEquals(360, repo.state.value.dailyAllowanceMinutes)
+    }
+
+    @Test
+    fun testStrictMode_ratchet_canDecreaseDailyAllowance_withValidToken() {
+        val repo = EssentialModeRepository(
+            context = null,
+            isStrictActiveProvider = { true }
+        )
+        val token = com.vr.takeback.domain.security.StrictMutationGate.issueToken(
+            com.vr.takeback.domain.security.MutationType.UPDATE_ESSENTIAL_MODE
+        )
+        val result = repo.setDailyAllowanceMinutes(180, token = token)
+        assertTrue("Decreasing daily allowance with valid token in Strict Mode must be allowed", result)
+        assertEquals(180, repo.state.value.dailyAllowanceMinutes)
+    }
+
+    @Test
+    fun testStrictMode_ratchet_cannotDecreaseDailyAllowance_withoutToken() {
+        val repo = EssentialModeRepository(
+            context = null,
+            isStrictActiveProvider = { true }
+        )
+        val result = repo.setDailyAllowanceMinutes(180, token = null)
+        assertFalse("Decreasing daily allowance without token in Strict Mode must be rejected", result)
+        assertEquals(360, repo.state.value.dailyAllowanceMinutes)
+    }
+
+    @Test
+    fun testStrictMode_ratchet_cannotDisableEssentialMode() {
+        val repo = EssentialModeRepository(
+            context = null,
+            isStrictActiveProvider = { true }
+        )
+        val result = repo.setEnabled(false)
+        assertFalse("Disabling Essential Mode in Strict Mode must be rejected", result)
+    }
 }

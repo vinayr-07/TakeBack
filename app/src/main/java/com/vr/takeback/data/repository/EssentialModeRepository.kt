@@ -312,9 +312,13 @@ class EssentialModeRepository(
         }
 
         if (isStrictActive()) {
+            if (!enabled) {
+                safeLogW("Cannot disable Essential Mode while Strict Mode is active")
+                return false
+            }
             val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
             if (!valid) {
-                safeLogW("Attempted to toggle Essential Mode without valid Strict Mode authorization token")
+                safeLogW("Attempted to enable Essential Mode in Strict Mode without valid authorization token")
                 return false
             }
         }
@@ -348,10 +352,19 @@ class EssentialModeRepository(
         }
 
         if (isStrictActive()) {
-            val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
-            if (!valid) {
-                safeLogW("Attempted to modify daily allowance without valid Strict Mode authorization token")
+            // Ratchet rule: Cannot increase daily allowance under Strict Mode
+            if (minutes > current.dailyAllowanceMinutes) {
+                safeLogW("Rejected setDailyAllowanceMinutes: Cannot increase daily allowance from ${current.dailyAllowanceMinutes}m to ${minutes}m while Strict Mode is active")
                 return false
+            }
+
+            // Ratchet rule: Can decrease daily allowance, but requires confirmation token
+            if (minutes < current.dailyAllowanceMinutes) {
+                val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
+                if (!valid) {
+                    safeLogW("Attempted to decrease daily allowance without valid confirmation token")
+                    return false
+                }
             }
         }
 

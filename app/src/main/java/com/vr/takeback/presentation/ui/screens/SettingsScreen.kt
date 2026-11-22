@@ -394,8 +394,8 @@ fun SettingsScreen(
                             }
                             val deviceScreenTimeMillis = usageSnapshot?.deviceScreenTimeMillis
                             val isScreenTimeAvailable = usageSnapshot?.isDeviceScreenTimeAvailable == true && deviceScreenTimeMillis != null
-                            val measuredMinutes = if (isScreenTimeAvailable && deviceScreenTimeMillis != null) {
-                                (deviceScreenTimeMillis / 60000L).toInt()
+                            val measuredMinutes = if (isScreenTimeAvailable) {
+                                ((deviceScreenTimeMillis ?: 0L) / 60000L).toInt()
                             } else {
                                 ((usageSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / 60000L).toInt()
                             }
@@ -731,6 +731,14 @@ fun SettingsScreen(
                 title = { Text("Configure Daily Allowance") },
                 text = {
                     Column {
+                        if (strictState.isCurrentlyLocked) {
+                            Text(
+                                text = "Strict Mode active: You can decrease your allowance to tighten focus. Increasing allowance is locked.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                            )
+                        }
                         Text(
                             text = "Set total daily phone screen time limit before Essential Mode restricts distracting apps:",
                             style = MaterialTheme.typography.bodySmall
@@ -761,6 +769,12 @@ fun SettingsScreen(
                             val m = allowanceMinutesInput.toIntOrNull() ?: 0
                             val totalMins = (h * 60) + m
                             if (totalMins in 15..1440) {
+                                val currentAllowance = essentialState.dailyAllowanceMinutes
+                                val isStrict = strictState.isCurrentlyLocked
+                                if (isStrict && totalMins > currentAllowance) {
+                                    Toast.makeText(context, "Strict Mode is active: You cannot increase the daily allowance ($totalMins > $currentAllowance mins).", Toast.LENGTH_LONG).show()
+                                    return@Button
+                                }
                                 showAllowanceDialog = false
                                 executeEssentialMutation { token ->
                                     val ok = essentialRepo.setDailyAllowanceMinutes(totalMins, token)

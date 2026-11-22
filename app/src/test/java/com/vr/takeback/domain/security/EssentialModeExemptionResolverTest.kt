@@ -387,6 +387,58 @@ class EssentialModeExemptionResolverTest {
         assertFalse("System app with audio category must not be exempt", resolver.isExempt(customSysMediaPkg))
         assertFalse(resolver.isSystemApplication(customSysMediaPkg))
     }
+
+    // 29. Samsung Wallet / Pay is permanently exempt in Essential Mode
+    @Test
+    fun scenario29_samsungWallet_isExemptInEssentialMode() {
+        val spay = "com.samsung.android.spay"
+        fakeProvider.installed.add(spay)
+
+        val decision = resolver.resolveExemption(spay)
+        assertTrue("Samsung Wallet must be exempt under Essential Mode", decision.isExempt)
+        assertEquals("Must be categorized as CORE_PAYMENT", ExemptionCategory.CORE_PAYMENT, decision.category)
+        assertTrue(resolver.isExempt(spay))
+    }
+
+    // 30. PhonePe is permanently exempt in Essential Mode
+    @Test
+    fun scenario30_phonePe_isExemptInEssentialMode() {
+        val phonePe = "com.phonepe.app"
+        fakeProvider.installed.add(phonePe)
+
+        val decision = resolver.resolveExemption(phonePe)
+        assertTrue("PhonePe must be exempt under Essential Mode", decision.isExempt)
+        assertEquals("Must be categorized as CORE_PAYMENT", ExemptionCategory.CORE_PAYMENT, decision.category)
+        assertTrue(resolver.isExempt(phonePe))
+    }
+
+    // 31. Standard UPI / Digital wallet applications are exempt in Essential Mode
+    @Test
+    fun scenario31_standardPaymentApps_areExemptInEssentialMode() {
+        val paymentApps = listOf(
+            "com.google.android.apps.nbu.paisa.user",
+            "com.google.android.apps.walletnfcrel",
+            "net.one97.paytm",
+            "in.org.npci.upiapp"
+        )
+        fakeProvider.installed.addAll(paymentApps)
+
+        paymentApps.forEach { pkg ->
+            val decision = resolver.resolveExemption(pkg)
+            assertTrue("Payment app $pkg must be exempt", decision.isExempt)
+            assertEquals("Must be categorized as CORE_PAYMENT", ExemptionCategory.CORE_PAYMENT, decision.category)
+            assertTrue(resolver.isExempt(pkg))
+        }
+    }
+
+    // 32. Effective exempt packages include all essential payment packages
+    @Test
+    fun scenario32_effectiveExemptPackages_includesPaymentApps() {
+        val exempt = resolver.getEffectiveExemptPackages(null)
+        assertTrue("Effective exempt packages must include Samsung Wallet", exempt.contains("com.samsung.android.spay"))
+        assertTrue("Effective exempt packages must include PhonePe", exempt.contains("com.phonepe.app"))
+        assertTrue("Effective exempt packages must include Google Pay", exempt.contains("com.google.android.apps.nbu.paisa.user"))
+    }
 }
 
 class FakePackageInfoProvider : PackageInfoProvider {

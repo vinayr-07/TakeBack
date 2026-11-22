@@ -24,6 +24,7 @@ interface PackageInfoProvider {
  */
 enum class ExemptionCategory {
     CORE_COMMUNICATION,
+    CORE_PAYMENT,
     USER_SELECTED_ADDITIONAL,
     SAMSUNG_ONE_HAND_OPERATION,
     SAMSUNG_GOOD_LOCK,
@@ -154,6 +155,17 @@ class EssentialModeExemptionResolver(
             "android"
         )
 
+        // Essential payment and financial utility packages that must never be blocked in Essential Mode
+        val ESSENTIAL_PAYMENT_PACKAGES = setOf(
+            "com.samsung.android.spay",              // Samsung Wallet / Samsung Pay
+            "com.samsung.android.rapsp",             // Samsung Pay Mini
+            "com.phonepe.app",                       // PhonePe
+            "com.google.android.apps.nbu.paisa.user", // Google Pay (GPay India / Tez)
+            "com.google.android.apps.walletnfcrel",   // Google Wallet
+            "net.one97.paytm",                       // Paytm
+            "in.org.npci.upiapp"                     // BHIM UPI
+        )
+
         // Disqualified package substrings for automatic system application exemption.
         // Prevents OEM preinstalled bloatware (Gallery, Videos, File Managers, Browsers)
         // with FLAG_SYSTEM from evading Essential Mode restrictions.
@@ -232,6 +244,16 @@ class EssentialModeExemptionResolver(
             )
         }
 
+        // 3b. Essential payment & financial utility applications
+        if (isPaymentPackage(pkg)) {
+            return ExemptionDecision(
+                packageName = pkg,
+                isExempt = true,
+                category = ExemptionCategory.CORE_PAYMENT,
+                reason = "Essential payment/financial utility application is permanently exempt."
+            )
+        }
+
         // 4. User-selected additional application (exactly one)
         if (selectedAdditionalPackage != null && pkg == selectedAdditionalPackage) {
             return ExemptionDecision(
@@ -273,6 +295,17 @@ class EssentialModeExemptionResolver(
         if (packageName == GOOD_LOCK_HUB_PACKAGE) return true
         if (KNOWN_GOOD_LOCK_MODULES.containsKey(packageName)) return true
         return customGoodLockModules.contains(packageName)
+    }
+
+    /**
+     * Returns true if package is an essential payment/financial utility application
+     * (Samsung Wallet / Pay, PhonePe, Google Pay, UPI, Paytm).
+     */
+    fun isPaymentPackage(packageName: String): Boolean {
+        val trimmed = packageName.trim()
+        if (ESSENTIAL_PAYMENT_PACKAGES.contains(trimmed)) return true
+        val lower = trimmed.lowercase()
+        return lower == "com.phonepe.app" || lower == "com.samsung.android.spay" || lower == "com.samsung.android.rapsp"
     }
 
     /**
@@ -479,6 +512,9 @@ class EssentialModeExemptionResolver(
         exempt.addAll(setOf("com.google.android.dialer", "com.samsung.android.dialer", "com.android.dialer", "com.android.phone"))
         exempt.addAll(setOf("com.google.android.apps.messaging", "com.samsung.android.messaging", "com.android.mms"))
         exempt.addAll(setOf("com.sec.android.app.camera", "com.google.android.GoogleCamera", "com.android.camera"))
+
+        // 3b. Essential Payment packages
+        exempt.addAll(ESSENTIAL_PAYMENT_PACKAGES)
 
         // 4. User-selected additional
         if (selectedAdditionalPackage != null) {

@@ -162,8 +162,15 @@ class HomeViewModel(
             }
             is HomeUiEvent.RequestToggleProfile -> {
                 val isStrictLocked = strictModeRepository.protectionState.value.isCurrentlyLocked
+                val profile = profileRepository.getProfileById(event.profileId)
                 if (isStrictLocked) {
-                    _pendingToggleProfileId.value = event.profileId
+                    if (profile?.isEnabled == true) {
+                        // Cannot disable an enabled profile while Strict Mode is active
+                        _pendingToggleProfileId.value = null
+                    } else {
+                        // Enabling a disabled profile in Strict Mode is allowed immediately
+                        profileRepository.toggleProfile(event.profileId)
+                    }
                 } else {
                     profileRepository.toggleProfile(event.profileId)
                 }

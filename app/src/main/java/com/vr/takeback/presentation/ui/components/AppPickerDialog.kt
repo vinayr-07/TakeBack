@@ -21,6 +21,7 @@ import com.vr.takeback.domain.model.TargetApp
 @Composable
 fun AppPickerDialog(
     initialSelectedPackages: Set<String>,
+    lockedPackages: Set<String> = emptySet(),
     onDismissRequest: () -> Unit,
     onConfirmSelection: (List<TargetApp>) -> Unit
 ) {
@@ -28,7 +29,12 @@ fun AppPickerDialog(
     val appDiscoveryRepo = remember { AppDiscoveryRepository(context) }
     var installedApps by remember { mutableStateOf<List<TargetApp>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
-    val selectedPackages = remember { mutableStateListOf<String>().apply { addAll(initialSelectedPackages) } }
+    val selectedPackages = remember {
+        mutableStateListOf<String>().apply {
+            addAll(initialSelectedPackages)
+            addAll(lockedPackages)
+        }
+    }
     var isLoading by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
@@ -99,15 +105,18 @@ fun AppPickerDialog(
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         items(filteredApps, key = { it.packageName }) { app ->
-                            val isChecked = selectedPackages.contains(app.packageName)
+                            val isLocked = lockedPackages.contains(app.packageName)
+                            val isChecked = isLocked || selectedPackages.contains(app.packageName)
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        if (isChecked) {
-                                            selectedPackages.remove(app.packageName)
-                                        } else {
-                                            selectedPackages.add(app.packageName)
+                                        if (!isLocked) {
+                                            if (isChecked) {
+                                                selectedPackages.remove(app.packageName)
+                                            } else {
+                                                selectedPackages.add(app.packageName)
+                                            }
                                         }
                                     }
                                     .padding(vertical = 8.dp, horizontal = 4.dp),
@@ -115,16 +124,19 @@ fun AppPickerDialog(
                             ) {
                                 Checkbox(
                                     checked = isChecked,
+                                    enabled = !isLocked,
                                     onCheckedChange = { checked ->
-                                        if (checked) {
-                                            selectedPackages.add(app.packageName)
-                                        } else {
-                                            selectedPackages.remove(app.packageName)
+                                        if (!isLocked) {
+                                            if (checked) {
+                                                selectedPackages.add(app.packageName)
+                                            } else {
+                                                selectedPackages.remove(app.packageName)
+                                            }
                                         }
                                     }
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
                                         text = app.appName,
                                         style = MaterialTheme.typography.bodyLarge,
@@ -135,6 +147,19 @@ fun AppPickerDialog(
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
+                                }
+                                if (isLocked) {
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = MaterialTheme.colorScheme.tertiaryContainer
+                                    ) {
+                                        Text(
+                                            text = "Locked (Strict Mode)",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -153,7 +178,7 @@ fun AppPickerDialog(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            val selectedList = installedApps.filter { selectedPackages.contains(it.packageName) }
+                            val selectedList = installedApps.filter { selectedPackages.contains(it.packageName) || lockedPackages.contains(it.packageName) }
                             onConfirmSelection(selectedList)
                         }
                     ) {

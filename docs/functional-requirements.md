@@ -78,6 +78,10 @@ This document specifies the complete, unambiguous functional requirements for **
 - **FR-STR-002:** While Strict Mode is active, the system shall prevent deleting, pausing, or editing restricted profiles, adding allowlist entries, or modifying schedules.
 - **FR-STR-003:** The system shall require the user to complete the configured challenge before accessing TakeBack settings.
 - **FR-STR-004:** The system shall provide an explicit, transparent warning modal before arming Strict Mode, detailing the consequences and confirming the user's informed consent.
+- **FR-STR-005:** (The Ratchet Invariant — Asymmetric Daily Allowance): While Strict Mode is active, the system shall prohibit increasing the Essential Mode daily screen-time allowance. The user may only decrease the allowance to tighten restrictions, and only upon solving the configured verification challenge. Disabling Essential Mode while Strict Mode is active shall be strictly prohibited.
+- **FR-STR-006:** (The Ratchet Invariant — Asymmetric Profile State): While Strict Mode is active, the user shall be permitted to enable inactive profiles to increase focus, but shall be strictly prohibited from disabling active profiles. Deleting profiles while Strict Mode is active shall be prohibited.
+- **FR-STR-007:** (The Ratchet Invariant — Asymmetric App List): While Strict Mode is active, the user shall be permitted to add newly blocked apps or websites to any profile, but shall be strictly prohibited from removing existing blocked apps or websites.
+- **FR-PAY-001:** Essential payment and financial utility applications (Samsung Wallet/Pay, PhonePe, Google Pay, Paytm, BHIM UPI) shall be permanently exempt from Essential Mode daily allowance exhaustion restrictions to guarantee uninterrupted retail, transit, and emergency financial access.
 
 ### Module G: Quick Block & Digital Detox
 - **FR-QCK-001:** The system shall provide a one-tap Quick Block widget from the Home dashboard allowing instant restriction of all distracting applications for a selectable duration (15m, 30m, 1h, 2h, 4h).

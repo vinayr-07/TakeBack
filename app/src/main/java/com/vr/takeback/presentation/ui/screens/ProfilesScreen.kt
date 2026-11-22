@@ -22,6 +22,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.widget.Toast
 import com.vr.takeback.data.repository.PermissionRepository
 import com.vr.takeback.data.repository.ProfileRepository
 import com.vr.takeback.data.repository.StrictModeRepository
@@ -45,6 +46,7 @@ fun ProfilesScreen(
     val profiles by profileRepository.profiles.collectAsState()
     val strictState by strictModeRepository.protectionState.collectAsState()
     val permissionStatus by permissionRepository.permissionStatus.collectAsState()
+    val isStrict = strictState.isCurrentlyLocked
 
     var showCreateDialog by remember { mutableStateOf(false) }
     var showAccessibilityRequiredDialog by remember { mutableStateOf(false) }
@@ -242,10 +244,10 @@ fun ProfilesScreen(
                                 onCheckedChange = { isChecked ->
                                     if (isChecked && !permissionStatus.hasAccessibility) {
                                         showAccessibilityRequiredDialog = true
+                                    } else if (!isChecked && isStrict) {
+                                        Toast.makeText(context, "Strict Mode is active: Active profiles cannot be disabled.", Toast.LENGTH_SHORT).show()
                                     } else {
-                                        executeWithStrictCheck(MutationType.TOGGLE_PROFILE, profile.id) { token ->
-                                            profileRepository.toggleProfile(profile.id, token = token)
-                                        }
+                                        profileRepository.toggleProfile(profile.id)
                                     }
                                 }
                             )
@@ -297,18 +299,18 @@ fun ProfilesScreen(
                                         onClick = { /* Chip clicked */ },
                                         label = { Text(app.appName, fontSize = 12.sp) },
                                         trailingIcon = {
-                                            Icon(
-                                                imageVector = Icons.Outlined.Close,
-                                                contentDescription = "Remove app",
-                                                modifier = Modifier
-                                                    .size(16.dp)
-                                                    .clickable {
-                                                        executeWithStrictCheck(MutationType.SAVE_PROFILE, profile.id) { token ->
+                                            if (!isStrict) {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.Close,
+                                                    contentDescription = "Remove app",
+                                                    modifier = Modifier
+                                                        .size(16.dp)
+                                                        .clickable {
                                                             val updated = profile.targetApps.filter { it.packageName != app.packageName }
-                                                            profileRepository.saveProfile(profile.copy(targetApps = updated), token = token)
+                                                            profileRepository.saveProfile(profile.copy(targetApps = updated))
                                                         }
-                                                    }
-                                            )
+                                                )
+                                            }
                                         },
                                         colors = InputChipDefaults.inputChipColors(
                                             selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
@@ -572,12 +574,11 @@ fun ProfilesScreen(
         editingProfileForApps?.let { profile ->
             AppPickerDialog(
                 initialSelectedPackages = profile.targetApps.map { it.packageName }.toSet(),
+                lockedPackages = if (isStrict) profile.targetApps.map { it.packageName }.toSet() else emptySet(),
                 onDismissRequest = { editingProfileForApps = null },
                 onConfirmSelection = { updatedList ->
-                    executeWithStrictCheck(MutationType.SAVE_PROFILE, profile.id) { token ->
-                        profileRepository.saveProfile(profile.copy(targetApps = updatedList), token = token)
-                        editingProfileForApps = null
-                    }
+                    profileRepository.saveProfile(profile.copy(targetApps = updatedList))
+                    editingProfileForApps = null
                 }
             )
         }

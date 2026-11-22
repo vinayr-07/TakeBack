@@ -16,7 +16,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
-class ProfileRepository(context: Context? = null) {
+class ProfileRepository(
+    context: Context? = null,
+    private val isStrictActiveProvider: (() -> Boolean)? = null
+) {
 
     companion object {
         private const val TAG = "ProfileRepository"
@@ -38,21 +41,26 @@ class ProfileRepository(context: Context? = null) {
 
     /**
      * Toggles profile enabled state.
-     * Enforces StrictMutationGate when Strict Mode is active unless called from system origin.
+     * Enforces Strict Mode Ratchet Protocol: users can enable profiles in Strict Mode,
+     * but cannot disable active profiles.
      */
     fun toggleProfile(id: String, token: String? = null, isSystemOrigin: Boolean = false): Boolean {
+        val currentProfile = getProfileById(id) ?: return false
+        val willEnable = !currentProfile.isEnabled
         val isStrict = isStrictActive()
+
         if (isStrict && !isSystemOrigin) {
-            val valid = StrictMutationGate.consumeToken(token, MutationType.TOGGLE_PROFILE, id)
-            if (!valid) {
-                Log.w(TAG, "Rejected toggleProfile($id): Unauthorized under Strict Mode")
+            // Ratchet rule: Cannot disable active profiles in Strict Mode
+            if (!willEnable) {
+                Log.w(TAG, "Rejected toggleProfile($id): Cannot disable profile while Strict Mode is active")
                 return false
             }
+            // willEnable == true: Enabling profiles in Strict Mode is allowed!
         }
 
         val updated = _profiles.value.map { profile ->
             if (profile.id == id) {
-                profile.copy(isEnabled = !profile.isEnabled, updatedAtMillis = System.currentTimeMillis())
+                profile.copy(isEnabled = willEnable, updatedAtMillis = System.currentTimeMillis())
             } else profile
         }
         _profiles.value = updated
@@ -63,17 +71,35 @@ class ProfileRepository(context: Context? = null) {
 
     /**
      * Saves or creates a profile.
-     * Enforces StrictMutationGate when Strict Mode is active unless called from system origin.
+     * Enforces Strict Mode Ratchet Protocol: users can add apps/websites to a profile,
+     * but cannot remove existing apps or websites while Strict Mode is active.
      */
     fun saveProfile(profile: Profile, token: String? = null, isSystemOrigin: Boolean = false): Boolean {
         val isStrict = isStrictActive()
-        val isNew = getProfileById(profile.id) == null
+        val existing = getProfileById(profile.id)
+        val isNew = existing == null
+
         if (isStrict && !isSystemOrigin) {
-            val expectedMutation = if (isNew) MutationType.CREATE_PROFILE else MutationType.SAVE_PROFILE
-            val valid = StrictMutationGate.consumeToken(token, expectedMutation, profile.id)
-            if (!valid) {
-                Log.w(TAG, "Rejected saveProfile(${profile.id}): Unauthorized under Strict Mode")
-                return false
+            if (isNew) {
+                // Creating a new profile: Allowed! Adds restrictions.
+            } else {
+                // Ratchet rule: Cannot remove apps from profile while Strict Mode is active
+                val existingTargetPackages = existing.targetApps.map { it.packageName }.toSet()
+                val newTargetPackages = profile.targetApps.map { it.packageName }.toSet()
+                val removedPackages = existingTargetPackages - newTargetPackages
+                if (removedPackages.isNotEmpty()) {
+                    Log.w(TAG, "Rejected saveProfile(${profile.id}): Cannot remove apps ($removedPackages) while Strict Mode is active")
+                    return false
+                }
+
+                // Ratchet rule: Cannot remove websites from profile while Strict Mode is active
+                val existingWebsites = existing.targetWebsites.map { it.domainPattern }.toSet()
+                val newWebsites = profile.targetWebsites.map { it.domainPattern }.toSet()
+                val removedWebsites = existingWebsites - newWebsites
+                if (removedWebsites.isNotEmpty()) {
+                    Log.w(TAG, "Rejected saveProfile(${profile.id}): Cannot remove websites ($removedWebsites) while Strict Mode is active")
+                    return false
+                }
             }
         }
 
@@ -92,16 +118,13 @@ class ProfileRepository(context: Context? = null) {
 
     /**
      * Deletes a profile.
-     * Enforces StrictMutationGate when Strict Mode is active.
+     * Enforces Strict Mode Ratchet Protocol: profiles cannot be deleted while Strict Mode is active.
      */
     fun deleteProfile(id: String, token: String? = null): Boolean {
         val isStrict = isStrictActive()
         if (isStrict) {
-            val valid = StrictMutationGate.consumeToken(token, MutationType.DELETE_PROFILE, id)
-            if (!valid) {
-                Log.w(TAG, "Rejected deleteProfile($id): Unauthorized under Strict Mode")
-                return false
-            }
+            Log.w(TAG, "Rejected deleteProfile($id): Cannot delete profiles while Strict Mode is active")
+            return false
         }
 
         val updated = _profiles.value.filter { it.id != id }
@@ -151,6 +174,9 @@ class ProfileRepository(context: Context? = null) {
     }
 
     private fun isStrictActive(): Boolean {
+        if (isStrictActiveProvider != null) {
+            return isStrictActiveProvider.invoke()
+        }
         return try {
             TakeBackApplication.strictModeRepository.protectionState.value.isCurrentlyLocked
         } catch (e: Exception) {
