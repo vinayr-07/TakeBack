@@ -367,7 +367,7 @@ class EssentialModeExemptionResolver(
         }
 
         if (category == null || category == -1) {
-            return AppEligibility(false, "Unverified category: Application category is undefined. Only verified productivity applications are eligible.")
+            return AppEligibility(false, "Unknown application category (unclassified): Application category is undefined. Only verified productivity applications are eligible.")
         }
 
         return AppEligibility(false, "Non-productivity category: Category ($category) is not approved for Essential Mode.")
@@ -412,7 +412,8 @@ class EssentialModeExemptionResolver(
         }
 
         // Reject retail, marketing, or general e-commerce Samsung apps
-        if (pkg.contains("ecomm") || pkg.contains("shop") || pkg.contains("store") || pkg.contains("pay") || pkg.contains("billing")) {
+        if (pkg.contains("ecomm") || pkg.contains("shop") || pkg.contains("store") || pkg.contains("pay") || pkg.contains("billing") ||
+            pkg.contains("samsungapps") || pkg.contains("galaxyappstore") || pkg.contains("themestore") || pkg.contains("samsungshop")) {
             return false
         }
 

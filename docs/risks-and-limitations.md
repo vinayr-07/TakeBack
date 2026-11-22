@@ -94,3 +94,33 @@ If an aggressive blocking app erroneously blocks the phone dialer, messaging, or
      - Emergency SOS and system Settings
 2. **Absolute Priority in Decision Hierarchy:**
    - In the pure evaluation function, the Emergency Whitelist check occurs at Step 0, immediately short-circuiting all active profiles, strict modes, and Pomodoro sessions to guarantee 100% unimpeded emergency access.
+
+---
+
+## 6. Process Termination & Cold Boot State Recovery
+
+### Risk Description
+Android's Low Memory Killer (LMK) routinely terminates inactive or background application processes under memory pressure. If restriction state, strict wake-up alarms, or Pomodoro sessions are held solely in ephemeral memory (`MutableStateFlow`), all user progress and active locks vanish upon process restart.
+
+### Severity: High
+
+### Mitigation Strategy
+1. **Atomic SharedPreferences Persistence:**
+   - `AlarmRepository`, `QuickBlockRepository`, and `FocusSessionRepository` persist configuration, cycle state, start timestamps, and durations into dedicated local SharedPreferences records.
+2. **Elapsed Time Recalculation on Cold Start:**
+   - Rather than storing simple ticking counters, repositories persist absolute epoch timestamps (`startEpochMillis` + `durationMinutes`). Upon cold boot, repositories calculate elapsed wall-clock time and resume active timers with exact remaining seconds, or cleanly expire if the window elapsed.
+3. **Boot & Time Synchronization Receiver:**
+   - `BootCompletedReceiver` observes `ACTION_BOOT_COMPLETED`, `ACTION_TIME_CHANGED`, and `ACTION_TIMEZONE_CHANGED`, immediately re-registering scheduled profile boundaries and strict alarms with Android's system `AlarmManager`.
+
+---
+
+## 7. Zero-Battery Privacy-First Location Architecture
+
+### Risk Description
+Requesting continuous background location permissions (`ACCESS_BACKGROUND_LOCATION`) triggers heavy battery drain, requires intrusive user permission grants, and violates TakeBack's zero-telemetry privacy principles.
+
+### Severity: Low
+
+### Mitigation Strategy
+- TakeBack intentionally excludes location permissions from its Android Manifest.
+- The `CentralRestrictionEngine` supports geofence boundary rules via decoupled snapshot evaluation (`activeGeofenceIds`), allowing external, battery-efficient triggers without maintaining an always-on GPS daemon.

@@ -4,6 +4,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import com.vr.takeback.MainActivity
 import com.vr.takeback.domain.model.AlarmChallengeDifficulty
 import com.vr.takeback.domain.model.StrictAlarm
@@ -11,6 +12,8 @@ import com.vr.takeback.platform.alarm.StrictAlarmReceiver
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -20,9 +23,46 @@ import java.util.UUID
 class AlarmRepository(private val context: Context) {
 
     private val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+    private val prefs: SharedPreferences = context.getSharedPreferences("takeback_alarms_prefs", Context.MODE_PRIVATE)
 
-    private val _alarms = MutableStateFlow(
-        listOf(
+    private val _alarms = MutableStateFlow(loadPersistedAlarms())
+    val alarms: StateFlow<List<StrictAlarm>> = _alarms.asStateFlow()
+
+    init {
+        // Schedule active alarms upon initialization
+        scheduleActiveAlarms()
+    }
+
+    private fun loadPersistedAlarms(): List<StrictAlarm> {
+        val rawJson = prefs.getString("alarms_json", null)
+        if (!rawJson.isNullOrBlank()) {
+            try {
+                val array = JSONArray(rawJson)
+                val list = mutableListOf<StrictAlarm>()
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    list.add(
+                        StrictAlarm(
+                            id = obj.getString("id"),
+                            hour = obj.getInt("hour"),
+                            minute = obj.getInt("minute"),
+                            daysOfWeekMask = obj.optInt("daysOfWeekMask", 127),
+                            isEnabled = obj.optBoolean("isEnabled", true),
+                            difficulty = try {
+                                AlarmChallengeDifficulty.valueOf(obj.getString("difficulty"))
+                            } catch (e: Exception) {
+                                AlarmChallengeDifficulty.MEDIUM
+                            },
+                            label = obj.optString("label", "Morning Focus")
+                        )
+                    )
+                }
+                if (list.isNotEmpty()) return list
+            } catch (e: Exception) {
+                // Fallback to default
+            }
+        }
+        val defaultList = listOf(
             StrictAlarm(
                 id = "default_morning_alarm",
                 hour = 6,
@@ -33,12 +73,29 @@ class AlarmRepository(private val context: Context) {
                 label = "Morning Focus Awakening"
             )
         )
-    )
-    val alarms: StateFlow<List<StrictAlarm>> = _alarms.asStateFlow()
+        persistAlarms(defaultList)
+        return defaultList
+    }
 
-    init {
-        // Schedule active alarms upon initialization
-        scheduleActiveAlarms()
+    private fun persistAlarms(list: List<StrictAlarm>) {
+        try {
+            val array = JSONArray()
+            for (alarm in list) {
+                val obj = JSONObject().apply {
+                    put("id", alarm.id)
+                    put("hour", alarm.hour)
+                    put("minute", alarm.minute)
+                    put("daysOfWeekMask", alarm.daysOfWeekMask)
+                    put("isEnabled", alarm.isEnabled)
+                    put("difficulty", alarm.difficulty.name)
+                    put("label", alarm.label)
+                }
+                array.put(obj)
+            }
+            prefs.edit().putString("alarms_json", array.toString()).apply()
+        } catch (e: Exception) {
+            // Defensive handling
+        }
     }
 
     fun toggleAlarm(id: String) {
@@ -46,6 +103,7 @@ class AlarmRepository(private val context: Context) {
             if (it.id == id) it.copy(isEnabled = !it.isEnabled) else it
         }
         _alarms.value = updated
+        persistAlarms(updated)
         scheduleActiveAlarms()
     }
 
@@ -58,12 +116,19 @@ class AlarmRepository(private val context: Context) {
             current.add(alarm)
         }
         _alarms.value = current
+        persistAlarms(current)
         scheduleActiveAlarms()
     }
 
     fun deleteAlarm(id: String) {
-        _alarms.value = _alarms.value.filter { it.id != id }
+        val updated = _alarms.value.filter { it.id != id }
+        _alarms.value = updated
+        persistAlarms(updated)
         cancelAlarmIntent(id)
+    }
+
+    fun rescheduleAllAlarms() {
+        scheduleActiveAlarms()
     }
 
     private fun scheduleActiveAlarms() {
@@ -103,7 +168,16 @@ class AlarmRepository(private val context: Context) {
         )
 
         val alarmClockInfo = AlarmManager.AlarmClockInfo(triggerEpochMillis, showIntent)
-        alarmManager.setAlarmClock(alarmClockInfo, pendingIntent)
+        try {
+            alarmManager.setAlarmClock(alarmClockInfo, pendingIntent)
+        } catch (e: SecurityException) {
+            android.util.Log.w("AlarmRepository", "Missing exact alarm permission, falling back to setAndAllowWhileIdle", e)
+            try {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerEpochMillis, pendingIntent)
+            } catch (ex: Exception) {
+                android.util.Log.e("AlarmRepository", "Failed to schedule alarm", ex)
+            }
+        }
     }
 
     private fun cancelAlarmIntent(alarmId: String) {

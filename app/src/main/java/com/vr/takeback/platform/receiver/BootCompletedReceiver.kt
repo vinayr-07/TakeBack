@@ -34,8 +34,13 @@ class BootCompletedReceiver : BroadcastReceiver() {
                     Log.w(TAG, "Error refreshing admin status on boot", e)
                 }
 
-                // 3. Reschedule all alarms using ScheduleCoordinator
+                // 3. Reschedule all alarms using ScheduleCoordinator and AlarmRepository
                 ScheduleCoordinator.rescheduleAll(appContext)
+                try {
+                    TakeBackApplication.alarmRepository.rescheduleAllAlarms()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error rescheduling strict alarms on boot", e)
+                }
 
                 // 4. Notify running accessibility service
                 TakeBackAccessibilityService.notifyScheduleBoundary(appContext)

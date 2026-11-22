@@ -19,6 +19,7 @@ import com.vr.takeback.domain.model.BlockDecision
 import com.vr.takeback.domain.model.BlockReason
 import com.vr.takeback.domain.model.BlockTarget
 import com.vr.takeback.domain.model.EventType
+import com.vr.takeback.domain.model.FocusSessionState
 import com.vr.takeback.domain.security.RealAccessibilityNodeSnapshot
 import com.vr.takeback.domain.security.SettingsDestination
 import com.vr.takeback.domain.security.SettingsProtectionManager
@@ -295,13 +296,39 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         val essentialRepo = TakeBackApplication.essentialModeRepository
         val essentialState = essentialRepo.state.value
-        val totalDailyUsageMinutes = (activeSnapshot.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+        val isDeviceScreenTimeAvailable = activeSnapshot.isDeviceScreenTimeAvailable && activeSnapshot.deviceScreenTimeMillis != null
+        val totalDailyUsageMinutes = if (isDeviceScreenTimeAvailable) {
+            ((activeSnapshot.deviceScreenTimeMillis ?: 0L) / (60 * 1000L)).toInt()
+        } else {
+            (activeSnapshot.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+        }
         val isEssentialActive = if (essentialState.isEnabled) {
-            essentialRepo.isCurrentlyActive(totalDailyUsageMinutes, true)
+            essentialRepo.isCurrentlyActive(totalDailyUsageMinutes, true, isDeviceScreenTimeAvailable || activeSnapshot.isAvailable)
         } else false
         val exempt = if (isEssentialActive) {
             TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
         } else emptySet()
+
+        val quickBlockState = try {
+            TakeBackApplication.quickBlockRepository.state.value
+        } catch (e: Exception) {
+            null
+        }
+        val isQuickBlockActive = quickBlockState?.isActive == true
+        val quickBlockExpiry = if (isQuickBlockActive) {
+            (quickBlockState?.startEpochMillis ?: now) + ((quickBlockState?.durationMinutes ?: 0) * 60 * 1000L)
+        } else null
+        val quickBlockPackages = quickBlockState?.targetPackages ?: emptySet()
+
+        val focusSession = try {
+            TakeBackApplication.focusSessionRepository.session.value
+        } catch (e: Exception) {
+            null
+        }
+        val isFocusSessionActive = focusSession?.state == FocusSessionState.FOCUS_RUNNING
+        val isBreakActive = focusSession?.state == FocusSessionState.BREAK_RUNNING
+        val activeFocusProfileId = focusSession?.activeProfileId
+        val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
 
         val snapshot = SystemContextSnapshot(
             timestampMillis = now,
@@ -313,6 +340,13 @@ class TakeBackAccessibilityService : AccessibilityService() {
             currentSessionDurationMillis = currentSessionDuration,
             isUsageDataAvailable = activeSnapshot.isAvailable,
             usageDataQuality = activeSnapshot.quality,
+            isFocusSessionActive = isFocusSessionActive,
+            isBreakActive = isBreakActive,
+            activeFocusSessionProfileId = activeFocusProfileId,
+            breakWhitelistApps = breakWhitelistApps,
+            isQuickBlockActive = isQuickBlockActive,
+            quickBlockExpirationEpochMillis = quickBlockExpiry,
+            quickBlockTargetPackages = quickBlockPackages,
             isEssentialModeActive = isEssentialActive,
             essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
             essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
@@ -433,7 +467,17 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val essentialState = essentialRepo.state.value
         val isEssentialEnabled = essentialState.isEnabled
 
-        if (!hasEnforcingProfiles && !isQuickBlockActive && !hasUsageLimitForApp && !isEssentialEnabled) {
+        val focusSession = try {
+            TakeBackApplication.focusSessionRepository.session.value
+        } catch (e: Exception) {
+            null
+        }
+        val isFocusSessionActive = focusSession?.state == FocusSessionState.FOCUS_RUNNING
+        val isBreakActive = focusSession?.state == FocusSessionState.BREAK_RUNNING
+        val activeFocusProfileId = focusSession?.activeProfileId
+        val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
+
+        if (!hasEnforcingProfiles && !isQuickBlockActive && !hasUsageLimitForApp && !isEssentialEnabled && !isFocusSessionActive && !isBreakActive) {
             return
         }
 
@@ -530,6 +574,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
             currentSessionDurationMillis = currentSessionDuration,
             isUsageDataAvailable = activeSnapshot?.isAvailable ?: false,
             usageDataQuality = activeSnapshot?.quality ?: com.vr.takeback.domain.usage.UsageDataQuality.UNKNOWN,
+            isFocusSessionActive = isFocusSessionActive,
+            isBreakActive = isBreakActive,
+            activeFocusSessionProfileId = activeFocusProfileId,
+            breakWhitelistApps = breakWhitelistApps,
             isQuickBlockActive = isQuickBlockActive,
             quickBlockExpirationEpochMillis = quickBlockExpiry,
             quickBlockTargetPackages = quickBlockPackages,

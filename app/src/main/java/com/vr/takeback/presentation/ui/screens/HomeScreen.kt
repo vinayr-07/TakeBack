@@ -764,5 +764,22 @@ fun HomeScreenContent(
                 }
             )
         }
+
+        // Strict Mode Challenge Dialog for Quick Block Cancellation
+        if (uiState.isPendingCancelQuickBlock) {
+            StrictChallengeDialog(
+                mechanism = uiState.strictState.mechanism,
+                saltBase64 = uiState.strictState.saltBase64,
+                expectedHash = uiState.strictState.passwordHash,
+                mutationType = MutationType.CANCEL_QUICK_BLOCK,
+                targetId = "quick_block",
+                onTokenIssued = { token ->
+                    onEvent(HomeUiEvent.ConfirmCancelQuickBlockWithToken(token))
+                },
+                onDismissRequest = {
+                    onEvent(HomeUiEvent.DismissCancelQuickBlockChallenge)
+                }
+            )
+        }
     }
 }

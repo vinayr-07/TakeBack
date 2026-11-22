@@ -13,8 +13,8 @@ class TakeBackApplication : Application() {
             private set
 
         val profileRepository by lazy { ProfileRepository(instance.applicationContext) }
-        val quickBlockRepository by lazy { QuickBlockRepository() }
-        val focusSessionRepository by lazy { FocusSessionRepository() }
+        val quickBlockRepository by lazy { QuickBlockRepository(instance.applicationContext) }
+        val focusSessionRepository by lazy { FocusSessionRepository(instance.applicationContext) }
         val permissionRepository by lazy { PermissionRepository(instance.applicationContext) }
         val strictModeRepository by lazy { StrictModeRepository(instance.applicationContext) }
         val alarmRepository by lazy { AlarmRepository(instance.applicationContext) }

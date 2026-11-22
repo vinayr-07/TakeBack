@@ -12,7 +12,7 @@ import java.time.LocalTime
 class TakeBackNotificationListenerService : NotificationListenerService() {
 
     private val engine = CentralRestrictionEngine()
-    private val profileRepository by lazy { ProfileRepository(applicationContext) }
+    private val profileRepository by lazy { com.vr.takeback.TakeBackApplication.profileRepository }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
@@ -28,11 +28,22 @@ class TakeBackNotificationListenerService : NotificationListenerService() {
         val localTime = LocalTime.now()
         val dayOfWeek = LocalDate.now().dayOfWeek
 
+        val quickBlock = try { com.vr.takeback.TakeBackApplication.quickBlockRepository.state.value } catch (e: Exception) { null }
+        val focusSession = try { com.vr.takeback.TakeBackApplication.focusSessionRepository.session.value } catch (e: Exception) { null }
+        val isFocusActive = focusSession?.state == com.vr.takeback.domain.model.FocusSessionState.FOCUS_RUNNING
+        val isBreakActive = focusSession?.state == com.vr.takeback.domain.model.FocusSessionState.BREAK_RUNNING
+
         val snapshot = SystemContextSnapshot(
             timestampMillis = now,
             localTime = localTime,
             dayOfWeek = dayOfWeek,
-            foregroundPackageName = packageName
+            foregroundPackageName = packageName,
+            isQuickBlockActive = quickBlock?.isActive == true,
+            quickBlockTargetPackages = quickBlock?.targetPackages ?: emptySet(),
+            isFocusSessionActive = isFocusActive,
+            isBreakActive = isBreakActive,
+            activeFocusSessionProfileId = focusSession?.activeProfileId,
+            breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
         )
 
         val activeProfiles = profileRepository.profiles.value

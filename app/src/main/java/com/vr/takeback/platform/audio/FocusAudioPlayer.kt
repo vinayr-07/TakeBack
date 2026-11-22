@@ -57,28 +57,48 @@ class FocusAudioPlayer(private val context: Context) {
         audioJob = CoroutineScope(Dispatchers.Default).launch {
             val buffer = ShortArray(bufferSize / 2)
             var lastBrownSample = 0.0
+            var sampleIndex = 0L
 
             while (isActive && isPlaying) {
                 for (i in buffer.indices) {
-                    val sample = when (soundType.lowercase()) {
+                    val white = (random.nextDouble() * 2.0) - 1.0
+                    val sample = when (soundType.lowercase().trim()) {
                         "brown noise", "brown" -> {
-                            val white = (random.nextDouble() * 2.0) - 1.0
                             lastBrownSample = (lastBrownSample + (0.02 * white)) / 1.02
                             (lastBrownSample * 32767.0 * 0.4).toInt().coerceIn(-32768, 32767).toShort()
                         }
                         "rain", "rain simulation" -> {
-                            val white = (random.nextDouble() * 2.0) - 1.0
                             // Random droplets + filtered hiss
                             val droplet = if (random.nextInt(1000) > 985) (random.nextDouble() * 12000).toInt() else 0
                             lastBrownSample = (lastBrownSample + (0.04 * white)) / 1.04
                             ((lastBrownSample * 20000.0) + droplet).toInt().coerceIn(-32768, 32767).toShort()
                         }
+                        "ocean waves", "ocean" -> {
+                            // Sinusoidal surge with ~7.5s wave cycle
+                            val wavePeriod = (sampleRate * 7.5)
+                            val waveMod = 0.35 + 0.65 * (0.5 * (1.0 + Math.sin(2.0 * Math.PI * (sampleIndex % wavePeriod) / wavePeriod)))
+                            lastBrownSample = (lastBrownSample + (0.025 * white)) / 1.025
+                            (lastBrownSample * 32767.0 * 0.5 * waveMod).toInt().coerceIn(-32768, 32767).toShort()
+                        }
+                        "forest wind", "wind" -> {
+                            // Slower gust modulation (~5s cycle) with gentle frequency shifting
+                            val gustPeriod = (sampleRate * 5.0)
+                            val gust = 0.4 + 0.6 * (0.5 * (1.0 + Math.sin(2.0 * Math.PI * (sampleIndex % gustPeriod) / gustPeriod)))
+                            lastBrownSample = (lastBrownSample + (0.015 * white)) / 1.015
+                            (lastBrownSample * 32767.0 * 0.45 * gust).toInt().coerceIn(-32768, 32767).toShort()
+                        }
+                        "stream", "water" -> {
+                            // Gentle bubbling stream with micro-ripples
+                            val ripple = if (random.nextInt(500) > 490) ((random.nextDouble() - 0.5) * 8000).toInt() else 0
+                            lastBrownSample = (lastBrownSample + (0.05 * white)) / 1.05
+                            ((lastBrownSample * 18000.0) + ripple).toInt().coerceIn(-32768, 32767).toShort()
+                        }
                         else -> { // White Noise
-                            val white = (random.nextDouble() * 2.0) - 1.0
                             (white * 32767.0 * 0.15).toInt().coerceIn(-32768, 32767).toShort()
                         }
                     }
                     buffer[i] = sample
+                    sampleIndex++
                 }
                 track.write(buffer, 0, buffer.size)
             }

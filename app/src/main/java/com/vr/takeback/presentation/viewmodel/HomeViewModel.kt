@@ -26,6 +26,7 @@ data class HomeUiState(
     val isUsageLoading: Boolean = false,
     val dailyAllowanceMinutes: Int = 120,
     val pendingToggleProfileId: String? = null,
+    val isPendingCancelQuickBlock: Boolean = false,
     val showAllowanceDialog: Boolean = false,
     val evaluationTime: LocalTime = LocalTime.now(),
     val evaluationDay: DayOfWeek = LocalDate.now().dayOfWeek
@@ -53,6 +54,8 @@ sealed interface HomeUiEvent {
     object Refresh : HomeUiEvent
     data class StartQuickBlock(val minutes: Int) : HomeUiEvent
     object CancelQuickBlock : HomeUiEvent
+    data class ConfirmCancelQuickBlockWithToken(val token: String) : HomeUiEvent
+    object DismissCancelQuickBlockChallenge : HomeUiEvent
     data class SetDailyAllowance(val minutes: Int) : HomeUiEvent
     data class RequestToggleProfile(val profileId: String) : HomeUiEvent
     data class ConfirmToggleProfileWithToken(val profileId: String, val token: String) : HomeUiEvent
@@ -78,6 +81,7 @@ class HomeViewModel(
     private val _isUsageLoading = MutableStateFlow(false)
     private val _dailyAllowanceMinutes = MutableStateFlow(usageStatsRepository.getDailyAllowanceMinutes())
     private val _pendingToggleProfileId = MutableStateFlow<String?>(null)
+    private val _isPendingCancelQuickBlock = MutableStateFlow(false)
     private val _showAllowanceDialog = MutableStateFlow(false)
     private val _evaluationTime = MutableStateFlow(LocalTime.now())
     private val _evaluationDay = MutableStateFlow(LocalDate.now().dayOfWeek)
@@ -102,11 +106,12 @@ class HomeViewModel(
         },
         combine(
             _evaluationTime,
-            _evaluationDay
-        ) { time, day ->
-            Pair(time, day)
+            _evaluationDay,
+            _isPendingCancelQuickBlock
+        ) { time, day, pendingCancel ->
+            Triple(time, day, pendingCancel)
         }
-    ) { (profiles, quickBlock, perms, strict), (summary, loading, allowance, pendingToggle, showDialog), (time, day) ->
+    ) { (profiles, quickBlock, perms, strict), (summary, loading, allowance, pendingToggle, showDialog), (time, day, pendingCancel) ->
         HomeUiState(
             profiles = profiles,
             quickBlockState = quickBlock,
@@ -116,6 +121,7 @@ class HomeViewModel(
             isUsageLoading = loading,
             dailyAllowanceMinutes = allowance,
             pendingToggleProfileId = pendingToggle,
+            isPendingCancelQuickBlock = pendingCancel,
             showAllowanceDialog = showDialog,
             evaluationTime = time,
             evaluationDay = day
@@ -134,7 +140,21 @@ class HomeViewModel(
         when (event) {
             is HomeUiEvent.Refresh -> refreshAll()
             is HomeUiEvent.StartQuickBlock -> quickBlockRepository.startQuickBlock(event.minutes)
-            is HomeUiEvent.CancelQuickBlock -> quickBlockRepository.cancelQuickBlock()
+            is HomeUiEvent.CancelQuickBlock -> {
+                val isStrictLocked = strictModeRepository.protectionState.value.isCurrentlyLocked
+                if (isStrictLocked) {
+                    _isPendingCancelQuickBlock.value = true
+                } else {
+                    quickBlockRepository.cancelQuickBlock()
+                }
+            }
+            is HomeUiEvent.ConfirmCancelQuickBlockWithToken -> {
+                quickBlockRepository.cancelQuickBlock(token = event.token)
+                _isPendingCancelQuickBlock.value = false
+            }
+            is HomeUiEvent.DismissCancelQuickBlockChallenge -> {
+                _isPendingCancelQuickBlock.value = false
+            }
             is HomeUiEvent.SetDailyAllowance -> {
                 usageStatsRepository.setDailyAllowanceMinutes(event.minutes)
                 _dailyAllowanceMinutes.value = event.minutes
