@@ -226,7 +226,12 @@ class TakeBackAccessibilityService : AccessibilityService() {
                     val essentialState = essentialRepo.state.value
                     if (essentialState.isEnabled && !essentialState.isEmergencyExitActive) {
                         triggerUsageSnapshotRefresh(force = false) { freshSnapshot ->
-                            val totalDailyMinutes = (freshSnapshot.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+                            val deviceScreenTime = freshSnapshot.deviceScreenTimeMillis
+                            val totalDailyMinutes = if (freshSnapshot.isDeviceScreenTimeAvailable && deviceScreenTime != null) {
+                                (deviceScreenTime / (60 * 1000L)).toInt()
+                            } else {
+                                (freshSnapshot.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+                            }
                             if (totalDailyMinutes >= essentialState.dailyAllowanceMinutes) {
                                 reEvaluateCurrentForegroundApp()
                             }
@@ -491,11 +496,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
             null
         }
 
-        val totalDailyUsageMinutes = ((activeSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / (60 * 1000L)).toInt()
+        val deviceScreenTimeMillis = activeSnapshot?.deviceScreenTimeMillis
+        val isDeviceScreenTimeAvailable = activeSnapshot?.isDeviceScreenTimeAvailable == true && deviceScreenTimeMillis != null
+        val totalDailyUsageMinutes = if (isDeviceScreenTimeAvailable && deviceScreenTimeMillis != null) {
+            (deviceScreenTimeMillis / (60 * 1000L)).toInt()
+        } else {
+            ((activeSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / (60 * 1000L)).toInt()
+        }
+
         val isEssentialModeActive = if (isEssentialEnabled) {
             essentialRepo.isCurrentlyActive(
                 totalDailyUsageMinutes = totalDailyUsageMinutes,
-                isEnforcementAvailable = true
+                isEnforcementAvailable = true,
+                isUsageMetricAvailable = isDeviceScreenTimeAvailable || (activeSnapshot?.isAvailable == true)
             )
         } else false
 
@@ -543,9 +556,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
             triggerUsageSnapshotRefresh(force = false) { fresh ->
                 if (sessionTracker.currentPackage == packageName) {
                     val freshSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
-                    val freshTotalDailyMinutes = (fresh.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+                    val freshScreenTime = fresh.deviceScreenTimeMillis
+                    val freshScreenTimeAvailable = fresh.isDeviceScreenTimeAvailable && freshScreenTime != null
+                    val freshTotalDailyMinutes = if (freshScreenTimeAvailable && freshScreenTime != null) {
+                        (freshScreenTime / (60 * 1000L)).toInt()
+                    } else {
+                        (fresh.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+                    }
                     val freshEssentialActive = if (isEssentialEnabled) {
-                        essentialRepo.isCurrentlyActive(freshTotalDailyMinutes, true)
+                        essentialRepo.isCurrentlyActive(
+                            totalDailyUsageMinutes = freshTotalDailyMinutes,
+                            isEnforcementAvailable = true,
+                            isUsageMetricAvailable = freshScreenTimeAvailable || fresh.isAvailable
+                        )
                     } else false
                     val freshExempt = if (freshEssentialActive) {
                         TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)

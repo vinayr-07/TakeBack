@@ -126,14 +126,15 @@ fun EssentialModeDiagnosticsScreen(
                         Spacer(modifier = Modifier.width(12.dp))
                         Column {
                             Text(
-                                text = "Background Non-Interference Guarantee",
+                                text = "Enforcement Model: Foreground Access Gate",
                                 fontWeight = FontWeight.Bold,
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "Essential Mode is strictly an application-access gate evaluated on foreground transitions. It NEVER force-stops background processes, cancels jobs/alarms, terminates services, drops notifications, or interrupts active media playback.",
+                                text = (summary?.enforcementModelDescription ?: "Foreground Access Gate (Zero process killing or background service disruption)") +
+                                        "\nTakeBack never calls force-stop or process-killing APIs. Legitimate background sync, messaging, notifications, media playback, and One Hand Operation+ gestures continue running. (System memory trims & battery saver remain under Android OS control).",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
@@ -414,11 +415,17 @@ fun EssentialModeDiagnosticsScreen(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(vertical = 2.dp),
+                                        .padding(vertical = 4.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(customPkg, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("User-Confirmed Samsung Customization", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+                                        Text(customPkg, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
+                                    }
+                                    Surface(shape = RoundedCornerShape(6.dp), color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.padding(horizontal = 4.dp)) {
+                                        Text("EXEMPT", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                    }
                                     IconButton(
                                         onClick = {
                                             if (state.status == EssentialModeStatus.ACTIVE) {

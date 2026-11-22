@@ -12,6 +12,7 @@ import java.time.LocalDate
 class EssentialModeRepositoryTest {
 
     private lateinit var repository: EssentialModeRepository
+    private lateinit var fakeStrictModeRepo: StrictModeRepository
     private var isStrictActiveFlag: Boolean = false
     private var mockSalt: String? = null
     private var mockHash: String? = null
@@ -34,7 +35,7 @@ class EssentialModeRepositoryTest {
             saltBase64 = mockSalt,
             passwordHash = mockHash
         )
-        val fakeStrictModeRepo = StrictModeRepository(initialState = fakeState)
+        fakeStrictModeRepo = StrictModeRepository(initialState = fakeState)
 
         repository = EssentialModeRepository(
             context = null,
@@ -275,5 +276,97 @@ class EssentialModeRepositoryTest {
         val withToken = repository.setEnabled(true, token = token)
         assertTrue("Mutation with valid token must succeed", withToken)
         assertTrue(repository.state.value.isEnabled)
+    }
+
+    @Test
+    fun testIsCurrentlyActive_requiresUsageMetricAvailable() {
+        repository.setEnabled(true)
+        repository.setDailyAllowanceMinutes(120)
+
+        // Exceeded minutes but metric unavailable -> must NOT activate
+        val inactiveResult = repository.isCurrentlyActive(
+            totalDailyUsageMinutes = 150,
+            isEnforcementAvailable = true,
+            isUsageMetricAvailable = false
+        )
+        assertFalse("Should not activate when usage metric is unavailable", inactiveResult)
+        assertEquals(EssentialModeStatus.MONITORING, repository.state.value.status)
+
+        // Metric becomes available -> activates
+        val activeResult = repository.isCurrentlyActive(
+            totalDailyUsageMinutes = 150,
+            isEnforcementAvailable = true,
+            isUsageMetricAvailable = true
+        )
+        assertTrue("Should activate when usage metric is available and exceeds allowance", activeResult)
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+
+        // Once ACTIVE, latch invariant holds even if metric is temporarily unavailable
+        val stillActive = repository.isCurrentlyActive(
+            totalDailyUsageMinutes = 0,
+            isEnforcementAvailable = true,
+            isUsageMetricAvailable = false
+        )
+        assertTrue("Latch invariant must keep Essential Mode active despite metric unavailability", stillActive)
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+    }
+
+    @Test
+    fun testSetSelectedAdditionalPackage_validatesEligibility() {
+        val fakeProvider = com.vr.takeback.domain.security.FakePackageInfoProvider()
+        fakeProvider.installed.addAll(listOf("com.openai.chatgpt", "com.supercell.clashofclans", "com.custom.unknown"))
+        fakeProvider.appCategories["com.supercell.clashofclans"] = 0 // CATEGORY_GAME
+        val resolver = com.vr.takeback.domain.security.EssentialModeExemptionResolver(fakeProvider)
+
+        val repoWithResolver = EssentialModeRepository(
+            context = null,
+            strictModeRepoProvider = { fakeStrictModeRepo },
+            isStrictActiveProvider = { false },
+            exemptionResolverProvider = { resolver }
+        )
+
+        // 1. Prohibited game app must be rejected
+        val gameResult = repoWithResolver.setSelectedAdditionalPackage("com.supercell.clashofclans")
+        assertFalse("Game app must be rejected as additional allowed package", gameResult)
+
+        // 2. Verified productivity app must be accepted
+        val chatGptResult = repoWithResolver.setSelectedAdditionalPackage("com.openai.chatgpt")
+        assertTrue("Verified productivity app must be accepted", chatGptResult)
+        assertEquals("com.openai.chatgpt", repoWithResolver.state.value.selectedAdditionalPackage)
+
+        // 3. Blank package name must be rejected
+        val blankResult = repoWithResolver.setSelectedAdditionalPackage("   ")
+        assertFalse("Blank package name must be rejected", blankResult)
+
+        // 4. Clearing to null must be accepted
+        val clearResult = repoWithResolver.setSelectedAdditionalPackage(null)
+        assertTrue("Clearing additional package must be accepted", clearResult)
+        assertNull(repoWithResolver.state.value.selectedAdditionalPackage)
+
+        // 5. Modification while ACTIVE must be rejected
+        repoWithResolver.setEnabled(true)
+        repoWithResolver.setDailyAllowanceMinutes(60)
+        repoWithResolver.isCurrentlyActive(70)
+        val activeModifyResult = repoWithResolver.setSelectedAdditionalPackage("com.openai.chatgpt")
+        assertFalse("Modifying additional package while ACTIVE must be rejected", activeModifyResult)
+    }
+
+    @Test
+    fun testFailClosedStrictMode_onStorageError() {
+        val compromisedState = StrictProtectionState(
+            isGlobalStrictActive = true,
+            status = StrictProtectionStatus.STORAGE_ERROR,
+            mechanism = StrictMechanism.PIN
+        )
+        val compromisedRepo = StrictModeRepository(initialState = compromisedState)
+        val failClosedRepo = EssentialModeRepository(
+            context = null,
+            strictModeRepoProvider = { compromisedRepo },
+            isStrictActiveProvider = null // Force repo to check strictModeRepoProvider
+        )
+
+        // Mutation without token must fail because STORAGE_ERROR is treated as active (fail-closed)
+        val mutationResult = failClosedRepo.setDailyAllowanceMinutes(180, token = null)
+        assertFalse("STORAGE_ERROR in Strict Mode must fail-closed and block unauthenticated mutation", mutationResult)
     }
 }

@@ -270,6 +270,57 @@ class EssentialModeExemptionResolverTest {
         assertTrue("System packages list must contain com.android.settings", summary.systemAppPackagesList.contains("com.android.settings"))
         assertTrue("System packages list must contain com.google.android.webview", summary.systemAppPackagesList.contains("com.google.android.webview"))
     }
+
+    // 21. Conservative Category Handling: Unknown category defaults to ineligible
+    @Test
+    fun scenario21_conservativeCategoryHandling_unknownCategoryRejected() {
+        val unknownApp = "com.unknown.randomapp"
+        fakeProvider.installed.add(unknownApp)
+        // No category set (null or -1)
+
+        val eligibility = resolver.evaluateAdditionalAppEligibility(unknownApp)
+        assertFalse("App with unknown category and not in verified productivity list must be ineligible", eligibility.isEligible)
+        assertTrue(eligibility.reason.contains("Unknown application category") || eligibility.reason.contains("unclassified"))
+        assertFalse(resolver.canSelectAsAdditionalApp(unknownApp))
+    }
+
+    // 22. Reject Samsung retail / e-commerce apps as Good Lock candidates
+    @Test
+    fun scenario22_rejectSamsungRetailApps_asGoodLockCandidates() {
+        val retailApps = listOf(
+            "com.samsung.ecomm",
+            "com.sec.android.app.samsungapps",
+            "com.samsung.android.spay",
+            "com.samsung.android.themestore"
+        )
+        fakeProvider.installed.addAll(retailApps)
+
+        retailApps.forEach { retailPkg ->
+            assertFalse(
+                "Samsung store/retail/payment package $retailPkg must be rejected as Good Lock candidate",
+                resolver.isValidGoodLockCandidate(retailPkg)
+            )
+        }
+    }
+
+    // 23. Verified productivity tools accepted regardless of OS category metadata
+    @Test
+    fun scenario23_verifiedProductivityTools_accepted() {
+        val verifiedTools = listOf(
+            "com.openai.chatgpt",
+            "notion.id",
+            "md.obsidian",
+            "com.todoist",
+            "com.google.android.keep"
+        )
+        fakeProvider.installed.addAll(verifiedTools)
+
+        verifiedTools.forEach { toolPkg ->
+            val eligibility = resolver.evaluateAdditionalAppEligibility(toolPkg)
+            assertTrue("Verified productivity tool $toolPkg must be eligible", eligibility.isEligible)
+            assertTrue(resolver.canSelectAsAdditionalApp(toolPkg))
+        }
+    }
 }
 
 class FakePackageInfoProvider : PackageInfoProvider {

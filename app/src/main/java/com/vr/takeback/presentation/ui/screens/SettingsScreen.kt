@@ -388,6 +388,37 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(8.dp))
 
+                            // Today's Measured Usage
+                            val usageSnapshot = remember(essentialState) {
+                                runCatching { TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot() }.getOrNull()
+                            }
+                            val deviceScreenTimeMillis = usageSnapshot?.deviceScreenTimeMillis
+                            val isScreenTimeAvailable = usageSnapshot?.isDeviceScreenTimeAvailable == true && deviceScreenTimeMillis != null
+                            val measuredMinutes = if (isScreenTimeAvailable && deviceScreenTimeMillis != null) {
+                                (deviceScreenTimeMillis / 60000L).toInt()
+                            } else {
+                                ((usageSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / 60000L).toInt()
+                            }
+                            val measuredH = measuredMinutes / 60
+                            val measuredM = measuredMinutes % 60
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Today's Measured Screen Time", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        text = "${measuredH}h ${measuredM}m" + if (isScreenTimeAvailable) " (Device Interactive)" else " (App Sum)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (measuredMinutes >= essentialState.dailyAllowanceMinutes) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
                             // Daily Allowance
                             val hours = essentialState.dailyAllowanceMinutes / 60
                             val mins = essentialState.dailyAllowanceMinutes % 60
@@ -829,7 +860,8 @@ fun SettingsScreen(
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 items(filteredApps, key = { it.packageName }) { app ->
-                                    val isEligible = exemptionResolver.canSelectAsAdditionalApp(app.packageName)
+                                    val eligibility = exemptionResolver.evaluateAdditionalAppEligibility(app.packageName)
+                                    val isEligible = eligibility.isEligible
                                     val isCurrentSelected = essentialState.selectedAdditionalPackage == app.packageName
 
                                     Surface(
@@ -845,7 +877,7 @@ fun SettingsScreen(
                                                     if (ok) {
                                                         Toast.makeText(context, "Allowed app set to ${app.appName}", Toast.LENGTH_SHORT).show()
                                                     } else {
-                                                        Toast.makeText(context, "Update failed: blocked by Strict Mode or invalid state", Toast.LENGTH_SHORT).show()
+                                                        Toast.makeText(context, "Update failed: blocked by Strict Mode or ineligible app", Toast.LENGTH_SHORT).show()
                                                     }
                                                 }
                                             }
@@ -857,7 +889,7 @@ fun SettingsScreen(
                                             horizontalArrangement = Arrangement.SpaceBetween,
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Column(modifier = Modifier.weight(1f)) {
+                                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                                                 Text(
                                                     text = app.appName,
                                                     style = MaterialTheme.typography.bodyMedium,
@@ -868,6 +900,12 @@ fun SettingsScreen(
                                                     text = app.packageName,
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = if (isEligible) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                                                )
+                                                Text(
+                                                    text = eligibility.reason,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontSize = 10.sp,
+                                                    color = if (isEligible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                                                 )
                                             }
                                             Surface(

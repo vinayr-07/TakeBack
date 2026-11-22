@@ -28,8 +28,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vr.takeback.TakeBackApplication
+import com.vr.takeback.data.repository.ValidatedUsageSnapshot
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 import com.vr.takeback.ui.theme.TakeBackTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class BlockShieldActivity : ComponentActivity() {
 
@@ -66,9 +69,33 @@ class BlockShieldActivity : ComponentActivity() {
                     val strictState by strictRepo.protectionState.collectAsState()
                     val essentialRepo = remember { TakeBackApplication.essentialModeRepository }
                     val essentialState by essentialRepo.state.collectAsState()
+                    val usageRepo = remember { TakeBackApplication.usageStatsRepository }
+
+                    var liveSnapshot by remember { mutableStateOf<ValidatedUsageSnapshot?>(null) }
+
+                    // Periodically refresh live usage snapshot while shield is displayed
+                    LaunchedEffect(Unit) {
+                        while (true) {
+                            val snap = withContext(Dispatchers.IO) {
+                                try {
+                                    usageRepo.refreshUsageSnapshot()
+                                } catch (e: Exception) {
+                                    usageRepo.getActiveUsageSnapshot()
+                                }
+                            }
+                            liveSnapshot = snap
+                            kotlinx.coroutines.delay(10_000L)
+                        }
+                    }
 
                     val allowanceMins = if (rawAllowanceMins > 0) rawAllowanceMins else essentialState.dailyAllowanceMinutes
-                    val usedMins = if (rawUsedMins > 0) rawUsedMins else essentialState.usageAtActivationMinutes
+                    val liveScreenTimeMinutes = liveSnapshot?.let { snap ->
+                        if (snap.isDeviceScreenTimeAvailable && snap.deviceScreenTimeMillis != null) {
+                            (snap.deviceScreenTimeMillis / 60000L).toInt()
+                        } else {
+                            (snap.foregroundUsageByPackage.values.sumOf { it } / 60000L).toInt()
+                        }
+                    } ?: if (rawUsedMins > 0) rawUsedMins else essentialState.usageAtActivationMinutes
 
                     var showAuthDialog by remember { mutableStateOf(false) }
                     var showEmergencyExitPinDialog by remember { mutableStateOf(false) }
@@ -91,7 +118,9 @@ class BlockShieldActivity : ComponentActivity() {
                         isEssentialShield = isEssentialShield,
                         targetLabel = targetLabel,
                         allowanceMinutes = allowanceMins,
-                        usedMinutes = usedMins,
+                        usedMinutes = liveScreenTimeMinutes,
+                        usageAtActivationMinutes = essentialState.usageAtActivationMinutes,
+                        liveSnapshot = liveSnapshot,
                         selectedAdditionalPackage = essentialState.selectedAdditionalPackage,
                         isRateLimited = essentialRepo.isRateLimited(),
                         lockoutRemainingSeconds = essentialRepo.getLockoutRemainingSeconds(),
@@ -240,6 +269,8 @@ fun BlockShieldContent(
     targetLabel: String? = null,
     allowanceMinutes: Int = 0,
     usedMinutes: Int = 0,
+    usageAtActivationMinutes: Int = 0,
+    liveSnapshot: ValidatedUsageSnapshot? = null,
     selectedAdditionalPackage: String? = null,
     isRateLimited: Boolean = false,
     lockoutRemainingSeconds: Int = 0,
@@ -321,18 +352,44 @@ fun BlockShieldContent(
                     val allowH = allowanceMinutes / 60
                     val allowM = allowanceMinutes % 60
 
+                    val now = System.currentTimeMillis()
+                    val isStale = liveSnapshot != null && (now - liveSnapshot.capturedAtMillis > 60_000L)
+                    val qualityText = when {
+                        isStale -> "DATA STALE (>1m ago)"
+                        liveSnapshot?.isDeviceScreenTimeAvailable == true -> "Device Screen Time (Authoritative)"
+                        else -> "App Usage Sum (Heuristic)"
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column {
-                            Text("Today's Screen Time", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Today's Screen Time (Live)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text("${usedH}h ${usedM}m", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                            if (usageAtActivationMinutes > 0 && usageAtActivationMinutes != usedMinutes) {
+                                val actH = usageAtActivationMinutes / 60
+                                val actM = usageAtActivationMinutes % 60
+                                Text("Triggered at: ${actH}h ${actM}m", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
                         Column(horizontalAlignment = Alignment.End) {
                             Text("Daily Allowance", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text("${allowH}h ${allowM}m", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = if (isStale) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f) else MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
+                                modifier = Modifier.padding(top = 2.dp)
+                            ) {
+                                Text(
+                                    text = qualityText,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontSize = 9.sp,
+                                    color = if (isStale) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSecondaryContainer
+                                )
+                            }
                         }
                     }
 

@@ -41,7 +41,8 @@ data class EssentialModeState(
 class EssentialModeRepository(
     private val context: Context? = null,
     private val strictModeRepoProvider: (() -> StrictModeRepository)? = null,
-    private val isStrictActiveProvider: (() -> Boolean)? = null
+    private val isStrictActiveProvider: (() -> Boolean)? = null,
+    private val exemptionResolverProvider: (() -> com.vr.takeback.domain.security.EssentialModeExemptionResolver)? = null
 ) {
 
     companion object {
@@ -57,6 +58,9 @@ class EssentialModeRepository(
         private const val KEY_EMERGENCY_EXIT = "is_emergency_exit_active"
         private const val KEY_EMERGENCY_EXIT_EPOCH = "emergency_exit_epoch_millis"
         private const val KEY_CUSTOM_GOODLOCK = "custom_goodlock_modules"
+        private const val KEY_FAILED_ATTEMPTS = "failed_attempt_count"
+        private const val KEY_LOCKOUT_UNTIL_EPOCH = "lockout_until_epoch_millis"
+        private const val KEY_LAST_FAILED_EPOCH = "last_failed_epoch_millis"
 
         private fun safeLogI(msg: String) {
             try { Log.i(TAG, msg) } catch (t: Throwable) {}
@@ -68,6 +72,13 @@ class EssentialModeRepository(
     }
 
     private val prefs: SharedPreferences? = context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    @Volatile
+    private var failedAttemptCount = prefs?.getInt(KEY_FAILED_ATTEMPTS, 0) ?: 0
+    @Volatile
+    private var lockoutUntilEpochMillis = prefs?.getLong(KEY_LOCKOUT_UNTIL_EPOCH, 0L) ?: 0L
+    @Volatile
+    private var lastFailedAttemptEpochMillis = prefs?.getLong(KEY_LAST_FAILED_EPOCH, 0L) ?: 0L
 
     private val _state = MutableStateFlow(loadPersistedState())
     val state: StateFlow<EssentialModeState> = _state.asStateFlow()
@@ -129,36 +140,74 @@ class EssentialModeRepository(
         if (isStrictActiveProvider != null) {
             return isStrictActiveProvider.invoke()
         }
+        val strictRepo = strictModeRepoProvider?.invoke() ?: runCatching { TakeBackApplication.strictModeRepository }.getOrNull()
+        if (strictRepo == null) {
+            // Fail-closed: assume active to prevent unauthorized bypass
+            return true
+        }
         return try {
-            TakeBackApplication.strictModeRepository.protectionState.value.isCurrentlyLocked
+            val status = strictRepo.protectionState.value.status
+            when (status) {
+                StrictProtectionStatus.ACTIVE,
+                StrictProtectionStatus.ACTIVATION_PENDING,
+                StrictProtectionStatus.RECOVERY_REQUIRED,
+                StrictProtectionStatus.STORAGE_ERROR,
+                StrictProtectionStatus.COMPROMISED,
+                StrictProtectionStatus.INTERRUPTED -> true
+                StrictProtectionStatus.DISABLED -> false
+            }
         } catch (e: Exception) {
-            false
+            // Fail-closed
+            true
         }
     }
 
-    @Volatile
-    private var failedAttemptCount = 0
-    @Volatile
-    private var lockoutUntilEpochMillis = 0L
-
-    fun isRateLimited(): Boolean = System.currentTimeMillis() < lockoutUntilEpochMillis
+    fun isRateLimited(): Boolean {
+        val now = System.currentTimeMillis()
+        // Defensive check against clock tampering (clock set backwards)
+        if (lastFailedAttemptEpochMillis > 0L && now < lastFailedAttemptEpochMillis) {
+            return true
+        }
+        return now < lockoutUntilEpochMillis
+    }
 
     fun getLockoutRemainingSeconds(): Int {
-        val remaining = lockoutUntilEpochMillis - System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        if (lastFailedAttemptEpochMillis > 0L && now < lastFailedAttemptEpochMillis) {
+            return 30
+        }
+        val remaining = lockoutUntilEpochMillis - now
         return if (remaining > 0) ((remaining + 999) / 1000).toInt() else 0
     }
 
+    @Synchronized
     private fun recordFailedAttempt() {
+        val now = System.currentTimeMillis()
         failedAttemptCount++
+        lastFailedAttemptEpochMillis = now
         if (failedAttemptCount >= 5) {
             val lockoutSeconds = 30L * (failedAttemptCount - 4)
-            lockoutUntilEpochMillis = System.currentTimeMillis() + (lockoutSeconds * 1000L)
+            lockoutUntilEpochMillis = now + (lockoutSeconds * 1000L)
+        }
+        prefs?.edit()?.apply {
+            putInt(KEY_FAILED_ATTEMPTS, failedAttemptCount)
+            putLong(KEY_LOCKOUT_UNTIL_EPOCH, lockoutUntilEpochMillis)
+            putLong(KEY_LAST_FAILED_EPOCH, lastFailedAttemptEpochMillis)
+            apply()
         }
     }
 
+    @Synchronized
     private fun resetFailedAttempts() {
         failedAttemptCount = 0
         lockoutUntilEpochMillis = 0L
+        lastFailedAttemptEpochMillis = 0L
+        prefs?.edit()?.apply {
+            putInt(KEY_FAILED_ATTEMPTS, 0)
+            putLong(KEY_LOCKOUT_UNTIL_EPOCH, 0L)
+            putLong(KEY_LAST_FAILED_EPOCH, 0L)
+            apply()
+        }
     }
 
     fun hasConfiguredPin(): Boolean {
@@ -205,6 +254,7 @@ class EssentialModeRepository(
     fun isCurrentlyActive(
         totalDailyUsageMinutes: Int,
         isEnforcementAvailable: Boolean = true,
+        isUsageMetricAvailable: Boolean = true,
         today: LocalDate = LocalDate.now()
     ): Boolean {
         checkAndResetDailyCycle(today)
@@ -224,7 +274,7 @@ class EssentialModeRepository(
             return true
         }
 
-        if (!isEnforcementAvailable) {
+        if (!isEnforcementAvailable || !isUsageMetricAvailable) {
             return false
         }
 
@@ -331,10 +381,27 @@ class EssentialModeRepository(
             }
         }
 
-        val updated = current.copy(selectedAdditionalPackage = packageName)
-        _state.value = updated
-        persistState(updated)
-        return true
+        if (packageName != null) {
+            val trimmed = packageName.trim()
+            if (trimmed.isEmpty()) {
+                safeLogW("Cannot set empty package name as additional allowed application")
+                return false
+            }
+            val resolver = exemptionResolverProvider?.invoke() ?: runCatching { TakeBackApplication.essentialModeExemptionResolver }.getOrNull()
+            if (resolver != null && !resolver.canSelectAsAdditionalApp(trimmed)) {
+                safeLogW("Package $trimmed is not eligible to be selected as additional allowed application")
+                return false
+            }
+            val updated = current.copy(selectedAdditionalPackage = trimmed)
+            _state.value = updated
+            persistState(updated)
+            return true
+        } else {
+            val updated = current.copy(selectedAdditionalPackage = null)
+            _state.value = updated
+            persistState(updated)
+            return true
+        }
     }
 
     /**
@@ -417,7 +484,7 @@ class EssentialModeRepository(
         }
 
         val pkg = packageName.trim()
-        val resolver = runCatching { TakeBackApplication.essentialModeExemptionResolver }.getOrNull()
+        val resolver = exemptionResolverProvider?.invoke() ?: runCatching { TakeBackApplication.essentialModeExemptionResolver }.getOrNull()
         if (resolver != null && !resolver.isValidGoodLockCandidate(pkg)) {
             safeLogW("Rejected registration: $pkg is not a valid installed Samsung Good Lock module")
             return false

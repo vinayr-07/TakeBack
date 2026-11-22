@@ -41,6 +41,11 @@ data class ExemptionDecision(
     val reason: String
 )
 
+data class AppEligibility(
+    val isEligible: Boolean,
+    val reason: String
+)
+
 /**
  * Diagnostic summary for the Essential Mode diagnostic screen.
  */
@@ -58,6 +63,7 @@ data class ExemptionDiagnosticSummary(
     val systemAppPackagesList: List<String> = emptyList(),
     val isPackageEnumerationSuccessful: Boolean = true,
     val backgroundExecutionGuaranteed: Boolean = true,
+    val enforcementModelDescription: String = "Foreground Access Gate (Zero process killing or background service disruption)",
     val unverifiedPackages: List<String> = emptyList()
 )
 
@@ -65,7 +71,8 @@ data class GoodLockModuleDiagnostic(
     val moduleName: String,
     val packageName: String,
     val isInstalled: Boolean,
-    val isExempt: Boolean
+    val isExempt: Boolean,
+    val isUserConfirmedExemption: Boolean = false
 )
 
 /**
@@ -152,7 +159,26 @@ class EssentialModeExemptionResolver(
             "instagram", "tiktok", "musically", "zhiliaoapp", "facebook", "katana", "snapchat", "twitter",
             "threads", "reddit", "netflix", "hulu", "disney", "primevideo", "youtube", "spotify",
             "twitch", "discord", "game", "gaming", "pubg", "roblox", "candycrush",
-            "clashofclans", "brawlstars", "genshin", "steam", "playstation", "xbox"
+            "clashofclans", "brawlstars", "genshin", "steam", "playstation", "xbox", "pinterest"
+        )
+
+        val KNOWN_VERIFIED_PRODUCTIVITY_PACKAGES = setOf(
+            "com.openai.chatgpt",
+            "notion.id",
+            "md.obsidian",
+            "com.todoist",
+            "com.google.android.keep",
+            "com.microsoft.office.word",
+            "com.microsoft.office.excel",
+            "com.microsoft.office.powerpoint",
+            "com.google.android.apps.docs",
+            "com.google.android.apps.sheets",
+            "com.google.android.apps.slides",
+            "com.evernote",
+            "com.ticktick.task",
+            "com.anydo",
+            "com.slack",
+            "com.app.notes"
         )
     }
 
@@ -290,47 +316,65 @@ class EssentialModeExemptionResolver(
     }
 
     /**
-     * Determines whether an installed application is eligible to be selected as
-     * the single additional application.
-     * Prevents selecting games, video streaming, entertainment, or social media.
+     * Evaluates whether an installed application is eligible to be selected as
+     * the single additional application, returning detailed eligibility and reasons.
+     * Prevents selecting games, video streaming, entertainment, social media, or unverified categories.
      * Also verifies that the package is actually installed.
      */
-    fun isEligibleAdditionalApp(packageName: String): Boolean {
+    fun evaluateAdditionalAppEligibility(packageName: String): AppEligibility {
         val pkg = packageName.lowercase().trim()
-        if (pkg.isEmpty()) return false
+        if (pkg.isEmpty()) {
+            return AppEligibility(false, "Package name cannot be blank")
+        }
 
         val installed = packageInfoProvider.getInstalledPackages()
         if (installed.isNotEmpty() && !installed.contains(packageName.trim())) {
-            return false
+            return AppEligibility(false, "Application is not installed on this device")
         }
 
         // Core and system apps don't need to be selected as additional app
-        if (isCoreEssentialPackage(pkg) || isSystemApplication(pkg) || isGoodLockModule(pkg)) {
-            return false
+        if (isCoreEssentialPackage(pkg)) {
+            return AppEligibility(false, "Already exempt as a core essential application")
+        }
+        if (isSystemApplication(pkg)) {
+            return AppEligibility(false, "Already exempt as an Android system application")
+        }
+        if (isGoodLockModule(pkg)) {
+            return AppEligibility(false, "Already exempt as a Samsung Good Lock module")
         }
 
         // Check category metadata if available
         val category = packageInfoProvider.getApplicationCategory(pkg)
-        if (category != null) {
-            // Android ApplicationInfo categories:
-            // CATEGORY_GAME = 0
-            // CATEGORY_AUDIO = 1
-            // CATEGORY_VIDEO = 2
-            // CATEGORY_IMAGE = 3
-            // CATEGORY_SOCIAL = 4
-            if (category == 0 || category == 1 || category == 2 || category == 3 || category == 4) {
-                return false
-            }
+        when (category) {
+            0 -> return AppEligibility(false, "Prohibited category: Games")
+            1 -> return AppEligibility(false, "Prohibited category: Audio entertainment / music")
+            2 -> return AppEligibility(false, "Prohibited category: Video entertainment / streaming")
+            3 -> return AppEligibility(false, "Prohibited category: Image / photo entertainment")
+            4 -> return AppEligibility(false, "Prohibited category: Social networking")
         }
 
         // Filter out obvious social media, games, streaming, and entertainment
         for (pattern in INELIGIBLE_PACKAGE_SUBSTRINGS) {
             if (pkg.contains(pattern)) {
-                return false
+                return AppEligibility(false, "Prohibited entertainment, gaming, or social package ($pattern)")
             }
         }
 
-        return true
+        // Build 11 Conservative category policy:
+        // Must either have Android CATEGORY_PRODUCTIVITY (7) or belong to verified productivity registry.
+        if (category == 7 || KNOWN_VERIFIED_PRODUCTIVITY_PACKAGES.contains(pkg)) {
+            return AppEligibility(true, "Verified productivity application")
+        }
+
+        if (category == null || category == -1) {
+            return AppEligibility(false, "Unverified category: Application category is undefined. Only verified productivity applications are eligible.")
+        }
+
+        return AppEligibility(false, "Non-productivity category: Category ($category) is not approved for Essential Mode.")
+    }
+
+    fun isEligibleAdditionalApp(packageName: String): Boolean {
+        return evaluateAdditionalAppEligibility(packageName).isEligible
     }
 
     fun canSelectAsAdditionalApp(packageName: String): Boolean = isEligibleAdditionalApp(packageName)
@@ -365,6 +409,11 @@ class EssentialModeExemptionResolver(
             if (pkg.contains(pattern)) {
                 return false
             }
+        }
+
+        // Reject retail, marketing, or general e-commerce Samsung apps
+        if (pkg.contains("ecomm") || pkg.contains("shop") || pkg.contains("store") || pkg.contains("pay") || pkg.contains("billing")) {
+            return false
         }
 
         // 4. Must be a Samsung official package namespace or recognized Good Lock module
@@ -457,10 +506,11 @@ class EssentialModeExemptionResolver(
         for (customPkg in customGoodLockModules) {
             moduleDiagnostics.add(
                 GoodLockModuleDiagnostic(
-                    moduleName = "Custom Module ($customPkg)",
+                    moduleName = "User-Confirmed Samsung Customization ($customPkg)",
                     packageName = customPkg,
                     isInstalled = installed.contains(customPkg),
-                    isExempt = true
+                    isExempt = true,
+                    isUserConfirmedExemption = true
                 )
             )
         }

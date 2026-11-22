@@ -93,7 +93,10 @@ data class ValidatedUsageSnapshot(
     val isAvailable: Boolean,
     val dataSource: String,
     /** Defect 2: Rolling 60-minute foreground usage per package. Empty when unavailable. */
-    val hourlyUsageByPackage: Map<String, Long> = emptyMap()
+    val hourlyUsageByPackage: Map<String, Long> = emptyMap(),
+    /** Build 11: Authoritative device-interactive screen time (ms). Null when unavailable. */
+    val deviceScreenTimeMillis: Long? = null,
+    val isDeviceScreenTimeAvailable: Boolean = (deviceScreenTimeMillis != null)
 )
 
 /**
@@ -110,7 +113,8 @@ data class LastKnownQuotaState(
     val dailyForegroundUsageByPackage: Map<String, Long>,
     val hourlyForegroundUsageByPackage: Map<String, Long>,
     val quality: UsageDataQuality,
-    val provenance: String
+    val provenance: String,
+    val deviceScreenTimeMillis: Long? = null
 )
 
 class UsageStatsRepository(private val context: Context) {
@@ -270,7 +274,8 @@ class UsageStatsRepository(private val context: Context) {
                 hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                 quality = UsageDataQuality.UNKNOWN,
                 isAvailable = false,
-                dataSource = if (sameDayQuota != null) "Unloaded (Same-Day Quota Preserved)" else "No Snapshot"
+                dataSource = if (sameDayQuota != null) "Unloaded (Same-Day Quota Preserved)" else "No Snapshot",
+                deviceScreenTimeMillis = sameDayQuota?.deviceScreenTimeMillis
             )
         }
 
@@ -285,7 +290,8 @@ class UsageStatsRepository(private val context: Context) {
                 hourlyUsageByPackage = emptyMap(),
                 quality = UsageDataQuality.STALE,
                 isAvailable = false,
-                dataSource = "Cross-day Stale"
+                dataSource = "Cross-day Stale",
+                deviceScreenTimeMillis = null
             )
         }
 
@@ -332,7 +338,8 @@ class UsageStatsRepository(private val context: Context) {
                 hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                 quality = UsageDataQuality.PERMISSION_DENIED,
                 isAvailable = false,
-                dataSource = if (sameDayQuota != null) "Permission Denied (Same-Day Quota Preserved)" else "Permission Denied"
+                dataSource = if (sameDayQuota != null) "Permission Denied (Same-Day Quota Preserved)" else "Permission Denied",
+                deviceScreenTimeMillis = sameDayQuota?.deviceScreenTimeMillis
             )
         }
 
@@ -384,6 +391,7 @@ class UsageStatsRepository(private val context: Context) {
                     UsageDataQuality.PROVISIONAL
                 }
 
+                val deviceInteractiveTime = reconstruction.deviceInteractiveTimeMillis
                 ValidatedUsageSnapshot(
                     date = today,
                     capturedAtMillis = now,
@@ -391,7 +399,9 @@ class UsageStatsRepository(private val context: Context) {
                     quality = quality,
                     isAvailable = true,
                     dataSource = "UsageEvents",
-                    hourlyUsageByPackage = hourlyUsageMap
+                    hourlyUsageByPackage = hourlyUsageMap,
+                    deviceScreenTimeMillis = deviceInteractiveTime,
+                    isDeviceScreenTimeAvailable = (deviceInteractiveTime != null)
                 )
             }
             is UsageEventsQueryResult.EmptySuccess -> {
@@ -407,7 +417,8 @@ class UsageStatsRepository(private val context: Context) {
                     hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                     quality = UsageDataQuality.UNKNOWN,
                     isAvailable = false, // Unverified: empty stream does not assert available zero usage
-                    dataSource = "UsageEvents (0 events, unverified)"
+                    dataSource = "UsageEvents (0 events, unverified)",
+                    deviceScreenTimeMillis = sameDayQuota?.deviceScreenTimeMillis
                 )
             }
             is UsageEventsQueryResult.SecurityError -> {
@@ -419,7 +430,8 @@ class UsageStatsRepository(private val context: Context) {
                     hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                     quality = UsageDataQuality.PERMISSION_DENIED,
                     isAvailable = false,
-                    dataSource = "SecurityException"
+                    dataSource = "SecurityException",
+                    deviceScreenTimeMillis = sameDayQuota?.deviceScreenTimeMillis
                 )
             }
             is UsageEventsQueryResult.QueryError,
@@ -432,7 +444,8 @@ class UsageStatsRepository(private val context: Context) {
                     hourlyUsageByPackage = sameDayQuota?.hourlyForegroundUsageByPackage ?: emptyMap(),
                     quality = UsageDataQuality.QUERY_FAILED,
                     isAvailable = false,
-                    dataSource = "Query Failed"
+                    dataSource = "Query Failed",
+                    deviceScreenTimeMillis = sameDayQuota?.deviceScreenTimeMillis
                 )
             }
         }
@@ -447,7 +460,8 @@ class UsageStatsRepository(private val context: Context) {
                 dailyForegroundUsageByPackage = snapshot.foregroundUsageByPackage,
                 hourlyForegroundUsageByPackage = snapshot.hourlyUsageByPackage,
                 quality = snapshot.quality,
-                provenance = snapshot.dataSource
+                provenance = snapshot.dataSource,
+                deviceScreenTimeMillis = snapshot.deviceScreenTimeMillis
             )
         }
 
