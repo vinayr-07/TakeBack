@@ -25,6 +25,7 @@ class TakeBackApplication : Application() {
         val packageInfoProvider by lazy { AndroidPackageInfoProvider(instance.applicationContext) }
         val essentialModeExemptionResolver by lazy { EssentialModeExemptionResolver(packageInfoProvider) }
         val essentialModeRepository by lazy { EssentialModeRepository(instance.applicationContext) }
+        val socialMediaCooldownRepository by lazy { SocialMediaCooldownRepository(instance.applicationContext) }
     }
 
     override fun onCreate() {

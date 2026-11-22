@@ -29,7 +29,9 @@ import com.vr.takeback.domain.model.Profile
 import com.vr.takeback.domain.security.RealAccessibilityNodeSnapshot
 import com.vr.takeback.domain.security.SettingsDestination
 import com.vr.takeback.domain.security.SettingsProtectionManager
+import com.vr.takeback.domain.security.SocialMediaResolver
 import com.vr.takeback.domain.usage.ForegroundSessionTracker
+import com.vr.takeback.domain.usage.SocialMediaSessionTracker
 import com.vr.takeback.presentation.ui.shield.BlockShieldActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -97,6 +99,31 @@ class TakeBackAccessibilityService : AccessibilityService() {
                     pkg.contains("launcher", ignoreCase = true)
         },
         elapsedRealtimeClock = { SystemClock.elapsedRealtime() }
+    )
+
+    // Cross-App Social Media 5-Minute Session Limit & 55-Minute Cooldown Tracker
+    val socialSessionTracker = SocialMediaSessionTracker(
+        isSocialPackage = { pkg ->
+            SocialMediaResolver.isSocialMediaPackage(pkg) { targetPkg ->
+                try {
+                    val appInfo = packageManager.getApplicationInfo(targetPkg, 0)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        appInfo.category
+                    } else null
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        },
+        elapsedRealtimeClock = { SystemClock.elapsedRealtime() },
+        wallClock = { System.currentTimeMillis() },
+        onCooldownTriggered = { cooldownUntilEpoch ->
+            try {
+                TakeBackApplication.socialMediaCooldownRepository.setCooldownUntilEpochMillis(cooldownUntilEpoch)
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
     )
 
     // Build 8 Issue 1: Shared single-flight refresh queue
@@ -188,6 +215,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
             elapsedRealtimeMillis = SystemClock.elapsedRealtime()
         )
 
+        try {
+            val persistedCooldown = TakeBackApplication.socialMediaCooldownRepository.getCooldownUntilEpochMillis()
+            socialSessionTracker.setPersistedCooldown(persistedCooldown)
+        } catch (e: Exception) {
+            // ignore
+        }
+        socialSessionTracker.initializeState(
+            isInteractive = isInteractive,
+            isKeyguardLocked = isLocked,
+            elapsedRealtimeMillis = SystemClock.elapsedRealtime(),
+            wallClockEpochMillis = System.currentTimeMillis()
+        )
+
         // Build 7 Issue 3 & Build 8 Issue 4: Register broadcast receiver with monotonic timestamps
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_ON)
@@ -197,15 +237,24 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 val elapsed = SystemClock.elapsedRealtime()
+                val now = System.currentTimeMillis()
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_ON -> {
                         val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
                         val isLocked = km?.isKeyguardLocked ?: false
                         sessionTracker.onKeyguardChanged(isLocked, elapsed)
                         sessionTracker.onScreenStateChanged(true, elapsed)
+                        socialSessionTracker.onKeyguardChanged(isLocked, elapsed, now)
+                        socialSessionTracker.onScreenStateChanged(true, elapsed, now)
                     }
-                    Intent.ACTION_SCREEN_OFF -> sessionTracker.onScreenStateChanged(false, elapsed)
-                    Intent.ACTION_USER_PRESENT -> sessionTracker.onKeyguardChanged(false, elapsed)
+                    Intent.ACTION_SCREEN_OFF -> {
+                        sessionTracker.onScreenStateChanged(false, elapsed)
+                        socialSessionTracker.onScreenStateChanged(false, elapsed, now)
+                    }
+                    Intent.ACTION_USER_PRESENT -> {
+                        sessionTracker.onKeyguardChanged(false, elapsed)
+                        socialSessionTracker.onKeyguardChanged(false, elapsed, now)
+                    }
                 }
             }
         }
@@ -227,8 +276,15 @@ class TakeBackAccessibilityService : AccessibilityService() {
         periodicUsageCheckJob?.cancel()
         periodicUsageCheckJob = serviceScope.launch {
             while (isActive) {
-                delay(45_000L) // Check every 45 seconds for active session threshold crossing
+                delay(15_000L) // Check every 15 seconds for active session threshold crossing
                 try {
+                    // Check if active social media session crossed 5-minute threshold
+                    val socialDuration = socialSessionTracker.getCurrentSocialSessionDuration(SystemClock.elapsedRealtime())
+                    if (socialDuration >= 5 * 60 * 1000L) {
+                        socialSessionTracker.triggerCooldown(System.currentTimeMillis())
+                        reEvaluateCurrentForegroundApp()
+                    }
+
                     val essentialRepo = TakeBackApplication.essentialModeRepository
                     val essentialState = essentialRepo.state.value
                     if (essentialState.isEnabled && !essentialState.isEmergencyExitActive) {
@@ -329,6 +385,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
 
         val currentPkg = sessionTracker.currentPackage ?: ""
+        val isSocialCooldown = socialSessionTracker.isCooldownActive(now, SystemClock.elapsedRealtime())
+        val socialRemainingMinutes = socialSessionTracker.getCooldownRemainingMinutes(now, SystemClock.elapsedRealtime())
+        val socialSessionDuration = socialSessionTracker.getCurrentSocialSessionDuration(SystemClock.elapsedRealtime())
+
         val snapshot = SystemContextSnapshot(
             timestampMillis = now,
             localTime = localTime,
@@ -349,7 +409,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
             isEssentialModeActive = isEssentialActive,
             essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
             essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
-            essentialModeExemptPackages = exempt
+            essentialModeExemptPackages = exempt,
+            isSocialCooldownActive = isSocialCooldown,
+            socialCooldownRemainingMinutes = socialRemainingMinutes,
+            socialSessionDurationMillis = socialSessionDuration
         )
 
         // Audit all active windows first (Multi-Window Split-Screen, Pop-up View, and PiP)
@@ -497,6 +560,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         // ignoring arbitrary content-change or scroll events.
         if (isWindowTransition) {
             sessionTracker.onPackageChanged(packageName, SystemClock.elapsedRealtime())
+            socialSessionTracker.onPackageChanged(packageName, SystemClock.elapsedRealtime(), now)
         }
 
         val isLauncherOrSystemUi = packageName == "com.android.systemui" ||
@@ -543,8 +607,14 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val activeFocusProfileId = focusSession?.activeProfileId
         val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
 
+        val isSocialCooldownActive = socialSessionTracker.isCooldownActive(now, SystemClock.elapsedRealtime())
+        val socialCooldownRemainingMins = socialSessionTracker.getCooldownRemainingMinutes(now, SystemClock.elapsedRealtime())
+        val currentSocialSessionDuration = socialSessionTracker.getCurrentSocialSessionDuration(SystemClock.elapsedRealtime())
+        val isTargetSocial = SocialMediaResolver.isSocialMediaPackage(packageName)
+
         val areAnyRestrictionsPotentiallyActive = hasEnforcingProfiles || isQuickBlockActive ||
-                hasUsageLimitForApp || isEssentialEnabled || isFocusSessionActive || isBreakActive
+                hasUsageLimitForApp || isEssentialEnabled || isFocusSessionActive || isBreakActive ||
+                isSocialCooldownActive || isTargetSocial
 
         val quickBlockExpiry = if (isQuickBlockActive) {
             quickBlockState!!.startEpochMillis + (quickBlockState.durationMinutes * 60 * 1000L)
@@ -629,7 +699,10 @@ class TakeBackAccessibilityService : AccessibilityService() {
             isEssentialModeActive = isEssentialModeActive,
             essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
             essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
-            essentialModeExemptPackages = essentialExemptPackages
+            essentialModeExemptPackages = essentialExemptPackages,
+            isSocialCooldownActive = isSocialCooldownActive,
+            socialCooldownRemainingMinutes = socialCooldownRemainingMins,
+            socialSessionDurationMillis = currentSocialSessionDuration
         )
 
         // Multi-Window & Floating Window (Split-Screen, Pop-up View, Picture-in-Picture) Audit:
@@ -776,6 +849,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
     override fun onInterrupt() {
         Log.w(TAG, "Accessibility service interrupted by system")
         sessionTracker.reset()
+        socialSessionTracker.reset()
     }
 
     private fun handleBlockDecision(decision: BlockDecision.Blocked) {
@@ -791,6 +865,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             is BlockReason.HourlyQuotaExceeded -> "Hourly allowance exhausted"
             is BlockReason.SessionQuotaExceeded -> "Session limit reached (${decision.reason.limitMinutes}m)"
             is BlockReason.DailyAllowanceExceeded -> "Daily allowance reached (${decision.reason.allowanceMinutes / 60}h ${decision.reason.allowanceMinutes % 60}m)"
+            is BlockReason.CooldownActive -> "${decision.reason.targetCategory} cooldown active (${decision.reason.cooldownRemainingMinutes}m remaining)"
             is BlockReason.FocusSessionActive -> "Deep Focus sprint in progress"
             is BlockReason.QuickBlockActive -> "Quick Block active"
             is BlockReason.DomainBlock -> "Restricted website (${decision.reason.domain})"
@@ -826,12 +901,23 @@ class TakeBackAccessibilityService : AccessibilityService() {
             (decision.reason as BlockReason.DailyAllowanceExceeded).usedMinutes
         } else 0
 
+        val isCooldownShield = decision.reason is BlockReason.CooldownActive
+        val cooldownRemainingMins = if (decision.reason is BlockReason.CooldownActive) {
+            (decision.reason as BlockReason.CooldownActive).cooldownRemainingMinutes
+        } else 0
+        val targetCategory = if (decision.reason is BlockReason.CooldownActive) {
+            (decision.reason as BlockReason.CooldownActive).targetCategory
+        } else "Social Media"
+
         val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("EXTRA_APP_NAME", appName)
             putExtra("EXTRA_PROFILE_NAME", decision.triggeringProfileName)
             putExtra("EXTRA_REASON", reasonText)
             putExtra("EXTRA_IS_ESSENTIAL_SHIELD", isEssentialModeShield)
+            putExtra("EXTRA_IS_COOLDOWN_SHIELD", isCooldownShield)
+            putExtra("EXTRA_COOLDOWN_REMAINING_MINS", cooldownRemainingMins)
+            putExtra("EXTRA_TARGET_CATEGORY", targetCategory)
             putExtra("EXTRA_ALLOWANCE_MINS", allowanceMins)
             putExtra("EXTRA_USED_MINS", usedMins)
         }

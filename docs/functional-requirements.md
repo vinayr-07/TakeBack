@@ -143,3 +143,13 @@ This document specifies the complete, unambiguous functional requirements for **
 ### Module Q: Premium & Monetization Architecture
 - **FR-MON-001:** The system shall implement an abstraction layer for Google Play Billing v7+ supporting Free, Monthly, Yearly, and Lifetime tiers.
 - **FR-MON-002:** Core safety features, emergency allowlists, and basic app blocking shall remain permanently free and unpaywalled.
+
+### Module R: Cross-App Social Media Session Limit & Cooldown Engine
+- **FR-SOC-001:** The system shall identify social media applications using Android OS `ApplicationInfo.CATEGORY_SOCIAL` and a verified hardcoded set of major social networking packages (Instagram, Facebook, X/Twitter, Threads, TikTok, Snapchat, Reddit, Pinterest, LinkedIn, Bluesky, Tumblr).
+- **FR-SOC-002:** The system shall enforce a shared, cross-app 5-minute cumulative active foreground session limit across all social media applications combined.
+- **FR-SOC-003:** Active foreground time in any social media app shall accumulate into the shared session pool measured via monotonic elapsed realtime (`SystemClock.elapsedRealtime()`).
+- **FR-SOC-004:** The system shall provide an inter-app switch grace window of 45 seconds allowing rapid transitions between social applications or launcher without prematurely triggering cooldown.
+- **FR-SOC-005:** When cumulative social media active time reaches 5 minutes, or when the user exits social media apps for longer than 45 seconds after active usage, the system shall trigger a mandatory 55-minute cross-app cooldown.
+- **FR-SOC-006:** During the 55-minute cooldown, ALL social media applications shall be strictly blocked, displaying a live countdown of remaining cooldown minutes on `BlockShieldActivity`.
+- **FR-SOC-007:** Cooldown timestamps shall be persisted in private `SharedPreferences` to ensure immunity against application termination, process killing, and device reboots.
+

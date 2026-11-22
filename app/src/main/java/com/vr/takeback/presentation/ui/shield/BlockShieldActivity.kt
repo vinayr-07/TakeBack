@@ -44,6 +44,9 @@ class BlockShieldActivity : ComponentActivity() {
         val reason = intent.getStringExtra("EXTRA_REASON") ?: "Restricted Focus Window"
         val isSettingsShield = intent.getBooleanExtra("EXTRA_IS_SETTINGS_SHIELD", false)
         val isEssentialShield = intent.getBooleanExtra("EXTRA_IS_ESSENTIAL_SHIELD", false)
+        val isCooldownShield = intent.getBooleanExtra("EXTRA_IS_COOLDOWN_SHIELD", false)
+        val cooldownRemainingMins = intent.getIntExtra("EXTRA_COOLDOWN_REMAINING_MINS", 0)
+        val targetCategory = intent.getStringExtra("EXTRA_TARGET_CATEGORY") ?: "Social Media"
         val targetLabel = intent.getStringExtra("EXTRA_TARGET_LABEL")
         val rawAllowanceMins = intent.getIntExtra("EXTRA_ALLOWANCE_MINS", 0)
         val rawUsedMins = intent.getIntExtra("EXTRA_USED_MINS", 0)
@@ -116,6 +119,9 @@ class BlockShieldActivity : ComponentActivity() {
                         reason = reason,
                         isSettingsShield = isSettingsShield,
                         isEssentialShield = isEssentialShield,
+                        isCooldownShield = isCooldownShield,
+                        cooldownRemainingMinutes = cooldownRemainingMins,
+                        targetCategory = targetCategory,
                         targetLabel = targetLabel,
                         allowanceMinutes = allowanceMins,
                         usedMinutes = liveScreenTimeMinutes,
@@ -266,6 +272,9 @@ fun BlockShieldContent(
     reason: String,
     isSettingsShield: Boolean = false,
     isEssentialShield: Boolean = false,
+    isCooldownShield: Boolean = false,
+    cooldownRemainingMinutes: Int = 0,
+    targetCategory: String = "Social Media",
     targetLabel: String? = null,
     allowanceMinutes: Int = 0,
     usedMinutes: Int = 0,
@@ -290,15 +299,26 @@ fun BlockShieldContent(
                 .size(76.dp)
                 .clip(CircleShape)
                 .background(
-                    if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.errorContainer
-                    else MaterialTheme.colorScheme.primaryContainer
+                    when {
+                        isSettingsShield || isEssentialShield -> MaterialTheme.colorScheme.errorContainer
+                        isCooldownShield -> MaterialTheme.colorScheme.tertiaryContainer
+                        else -> MaterialTheme.colorScheme.primaryContainer
+                    }
                 ),
             contentAlignment = Alignment.Center
         ) {
             Icon(
-                imageVector = if (isSettingsShield || isEssentialShield) Icons.Filled.Lock else Icons.Filled.Shield,
+                imageVector = when {
+                    isSettingsShield || isEssentialShield -> Icons.Filled.Lock
+                    isCooldownShield -> Icons.Filled.HourglassTop
+                    else -> Icons.Filled.Shield
+                },
                 contentDescription = null,
-                tint = if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                tint = when {
+                    isSettingsShield || isEssentialShield -> MaterialTheme.colorScheme.error
+                    isCooldownShield -> MaterialTheme.colorScheme.tertiary
+                    else -> MaterialTheme.colorScheme.primary
+                },
                 modifier = Modifier.size(42.dp)
             )
         }
@@ -307,6 +327,7 @@ fun BlockShieldContent(
 
         Text(
             text = when {
+                isCooldownShield -> "$targetCategory Resting"
                 isEssentialShield -> "Daily Allowance Exhausted"
                 isSettingsShield -> (targetLabel ?: "Settings Access Locked")
                 else -> "$appName is Paused"
@@ -320,11 +341,15 @@ fun BlockShieldContent(
         Spacer(modifier = Modifier.height(8.dp))
 
         Badge(
-            containerColor = if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.errorContainer
-            else MaterialTheme.colorScheme.secondaryContainer
+            containerColor = when {
+                isSettingsShield || isEssentialShield -> MaterialTheme.colorScheme.errorContainer
+                isCooldownShield -> MaterialTheme.colorScheme.tertiaryContainer
+                else -> MaterialTheme.colorScheme.secondaryContainer
+            }
         ) {
             Text(
                 text = when {
+                    isCooldownShield -> "MANDATORY 55-MIN COOLDOWN"
                     isEssentialShield -> "ESSENTIAL MODE ACTIVE"
                     isSettingsShield -> "STRICT ANTI-TAMPER GUARD"
                     else -> "GUARDED BY: $profileName"
@@ -332,14 +357,49 @@ fun BlockShieldContent(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                 fontWeight = FontWeight.Bold,
                 fontSize = 11.sp,
-                color = if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.onErrorContainer
-                else MaterialTheme.colorScheme.onSecondaryContainer
+                color = when {
+                    isSettingsShield || isEssentialShield -> MaterialTheme.colorScheme.onErrorContainer
+                    isCooldownShield -> MaterialTheme.colorScheme.onTertiaryContainer
+                    else -> MaterialTheme.colorScheme.onSecondaryContainer
+                }
             )
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        if (isEssentialShield) {
+        if (isCooldownShield) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "$cooldownRemainingMinutes min remaining",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "5-minute session limit reached across $targetCategory apps. Next session unlocks after a 55-minute cooldown.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "Take a break, stretch, or focus on offline tasks.",
+                        style = MaterialTheme.typography.labelSmall,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else if (isEssentialShield) {
             // Essential Mode Usage Card
             Card(
                 modifier = Modifier.fillMaxWidth(),

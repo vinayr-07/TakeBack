@@ -1,6 +1,7 @@
 package com.vr.takeback.domain.engine
 
 import com.vr.takeback.domain.model.*
+import com.vr.takeback.domain.security.SocialMediaResolver
 import com.vr.takeback.domain.usage.UsageDataQuality
 import java.time.DayOfWeek
 import java.time.LocalTime
@@ -32,7 +33,10 @@ data class SystemContextSnapshot(
     val isEssentialModeActive: Boolean = false,
     val essentialModeAllowanceMinutes: Int = 0,
     val essentialModeTotalUsageMinutes: Int = 0,
-    val essentialModeExemptPackages: Set<String> = emptySet()
+    val essentialModeExemptPackages: Set<String> = emptySet(),
+    val isSocialCooldownActive: Boolean = false,
+    val socialCooldownRemainingMinutes: Int = 0,
+    val socialSessionDurationMillis: Long = 0L
 )
 
 /**
@@ -108,6 +112,34 @@ class CentralRestrictionEngine {
                         allowanceMinutes = snapshot.essentialModeAllowanceMinutes,
                         usedMinutes = snapshot.essentialModeTotalUsageMinutes
                     )
+                )
+            }
+        }
+
+        // Rule 0.75: Cross-App Social Media 5-Minute Session Limit & 55-Minute Cooldown Enforcement
+        if (SocialMediaResolver.isSocialMediaPackage(targetPackage)) {
+            if (snapshot.isSocialCooldownActive) {
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = "social_cooldown",
+                    triggeringProfileName = "Social Media Cooldown",
+                    reason = BlockReason.CooldownActive(
+                        targetCategory = "Social Media",
+                        cooldownRemainingMinutes = snapshot.socialCooldownRemainingMinutes
+                    ),
+                    remainingDurationMillis = snapshot.socialCooldownRemainingMinutes * 60_000L
+                )
+            }
+            if (snapshot.socialSessionDurationMillis >= 5 * 60 * 1000L) {
+                return BlockDecision.Blocked(
+                    target = BlockTarget.Application(targetPackage),
+                    triggeringProfileId = "social_cooldown",
+                    triggeringProfileName = "Social Media Cooldown",
+                    reason = BlockReason.CooldownActive(
+                        targetCategory = "Social Media",
+                        cooldownRemainingMinutes = 55
+                    ),
+                    remainingDurationMillis = 55 * 60_000L
                 )
             }
         }
