@@ -416,7 +416,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         )
 
         // Audit all active windows first (Multi-Window Split-Screen, Pop-up View, and PiP)
-        if (auditAllActiveWindows(activeProfiles, snapshot, now)) {
+        if (auditAllActiveWindows(activeProfiles, snapshot, now, currentPkg)) {
             return
         }
 
@@ -472,8 +472,14 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private fun auditAllActiveWindows(
         activeProfiles: List<Profile>,
         baseSnapshot: SystemContextSnapshot,
-        now: Long
+        now: Long,
+        currentForegroundPackage: String? = null
     ): Boolean {
+        // Debounce: do not re-audit within 1500ms of a block action to avoid animation/transition storms
+        if ((now - lastBlockedTimestamp) < 1500L) {
+            return false
+        }
+
         val currentWindows = try {
             windows
         } catch (e: Exception) {
@@ -493,6 +499,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
                 continue
             }
 
+            // Only inspect genuinely interactive/visible windows: must be active, focused, or in PiP
+            val isInteractive = window.isActive || window.isFocused || isPiP
+            if (!isInteractive) {
+                continue
+            }
+
+            // Window must have non-empty visible dimensions on screen
+            val bounds = android.graphics.Rect()
+            window.getBoundsInScreen(bounds)
+            if (bounds.isEmpty || bounds.width() <= 0 || bounds.height() <= 0) {
+                continue
+            }
+
             val rootNode = try {
                 window.root
             } catch (e: Exception) {
@@ -502,9 +521,20 @@ class TakeBackAccessibilityService : AccessibilityService() {
             val windowPkg = rootNode.packageName?.toString() ?: continue
             if (windowPkg.isBlank() ||
                 windowPkg == applicationContext.packageName ||
+                windowPkg == "android" ||
                 windowPkg == "com.android.systemui" ||
                 windowPkg.contains("launcher", ignoreCase = true)
             ) {
+                continue
+            }
+
+            // If this window's package is the foreground package currently being evaluated, skip duplicate audit
+            if (windowPkg == currentForegroundPackage) {
+                continue
+            }
+
+            // De-bounce rapid consecutive blocks for the same window package (< 2.0s)
+            if (windowPkg == lastBlockedPackage && (now - lastBlockedTimestamp) < 2000L) {
                 continue
             }
 
@@ -535,7 +565,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
                 lastBlockedPackage = windowPkg
                 lastBlockedTimestamp = now
-                handleBlockDecision(decision)
+                handleBlockDecision(decision, skipHomeAction = true)
                 return true
             }
         }
@@ -548,8 +578,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         val packageName = event.packageName?.toString() ?: return
 
-        // Ignore TakeBack itself
-        if (packageName == applicationContext.packageName) return
+        // Ignore TakeBack itself and core Android system framework
+        if (packageName == applicationContext.packageName || packageName == "android") return
 
         val now = System.currentTimeMillis()
         val eventType = event.eventType
@@ -708,7 +738,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         // Multi-Window & Floating Window (Split-Screen, Pop-up View, Picture-in-Picture) Audit:
         // Audit all interactive windows whenever a window transition occurs or launcher is active
         if (areAnyRestrictionsPotentiallyActive && (isWindowTransition || isLauncherOrSystemUi)) {
-            if (auditAllActiveWindows(activeProfiles, baseSnapshot, now)) {
+            if (auditAllActiveWindows(activeProfiles, baseSnapshot, now, packageName)) {
                 return
             }
         }
@@ -852,7 +882,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         socialSessionTracker.reset()
     }
 
-    private fun handleBlockDecision(decision: BlockDecision.Blocked) {
+    private fun handleBlockDecision(decision: BlockDecision.Blocked, skipHomeAction: Boolean = false) {
         val appName = when (val target = decision.target) {
             is BlockTarget.Application -> resolveAppLabel(target.packageName)
             is BlockTarget.Website -> target.domainOrUrl
@@ -878,7 +908,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
         requestMediaAudioFocusPause()
 
         // Return user to home immediately to stop the restricted app
-        performGlobalAction(GLOBAL_ACTION_HOME)
+        if (!skipHomeAction) {
+            performGlobalAction(GLOBAL_ACTION_HOME)
+        }
 
         // Log to Activity Timeline
         try {
@@ -937,13 +969,14 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private fun extractBrowserUrl(rootNode: AccessibilityNodeInfo?): String? {
         if (rootNode == null) return null
         return try {
-            findAddressBarNode(rootNode)
+            findAddressBarNode(rootNode, 0)
         } catch (e: Exception) {
             null
         }
     }
 
-    private fun findAddressBarNode(node: AccessibilityNodeInfo): String? {
+    private fun findAddressBarNode(node: AccessibilityNodeInfo, depth: Int = 0): String? {
+        if (depth > 8) return null
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
         val text = node.text?.toString()
 
@@ -958,7 +991,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findAddressBarNode(child)
+            val found = findAddressBarNode(child, depth + 1)
             if (found != null) return found
         }
         return null
@@ -967,13 +1000,14 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private fun isShortsOrReelsContainer(packageName: String, rootNode: AccessibilityNodeInfo?): Boolean {
         if (rootNode == null) return false
         return try {
-            findShortsNode(packageName, rootNode)
+            findShortsNode(packageName, rootNode, 0)
         } catch (e: Exception) {
             false
         }
     }
 
-    private fun findShortsNode(packageName: String, node: AccessibilityNodeInfo): Boolean {
+    private fun findShortsNode(packageName: String, node: AccessibilityNodeInfo, depth: Int = 0): Boolean {
+        if (depth > 8) return false
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
         if (packageName == "com.google.android.youtube") {
@@ -988,7 +1022,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val found = findShortsNode(packageName, child)
+            val found = findShortsNode(packageName, child, depth + 1)
             if (found) return true
         }
         return false
