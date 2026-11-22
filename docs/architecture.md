@@ -6,34 +6,34 @@
 
 ```mermaid
 flowchart TD
-    subgraph PresentationLayer [Presentation Layer (Jetpack Compose)]
-        Screens[Composable Screens: Home, Profiles, Focus, Insights, Settings]
-        ViewModels[Stateful ViewModels]
-        UIState[Immutable UiState / Intent Events]
+    subgraph PresentationLayer ["Presentation Layer (Jetpack Compose)"]
+        Screens["Composable Screens: Home, Profiles, Focus, Insights, Settings"]
+        ViewModels["Stateful ViewModels"]
+        UIState["Immutable UiState / Intent Events"]
     end
 
-    subgraph DomainLayer [Domain Layer (Pure Kotlin - Zero Android Dependencies)]
-        UseCases[Use Cases: EvaluateRestriction, StartFocusSession, ArmStrictMode]
-        Engine[Central Restriction Engine]
-        DomainModels[Domain Entities & Value Objects]
-        RepoInterfaces[Repository Interfaces]
+    subgraph DomainLayer ["Domain Layer (Pure Kotlin - Zero Android Dependencies)"]
+        UseCases["Use Cases: EvaluateRestriction, StartFocusSession, ArmStrictMode"]
+        Engine["Central Restriction Engine"]
+        DomainModels["Domain Entities and Value Objects"]
+        RepoInterfaces["Repository Interfaces"]
     end
 
-    subgraph DataLayer [Data Layer (Room + DataStore + System APIs)]
-        ReposImpl[Repository Implementations]
-        RoomDB[Room Local SQLite Database]
-        DataStore[Preferences & Encrypted Security DataStore]
-        DataSources[Local Data Sources & Package/Usage Caches]
+    subgraph DataLayer ["Data Layer (Room + DataStore + System APIs)"]
+        ReposImpl["Repository Implementations"]
+        RoomDB["Room Local SQLite Database"]
+        DataStore["Preferences and Encrypted Security DataStore"]
+        DataSources["Local Data Sources and Package/Usage Caches"]
     end
 
-    subgraph PlatformLayer [Platform & Enforcement Infrastructure Layer]
-        AccService[TakeBackAccessibilityService]
-        DeviceAdmin[TakeBackDeviceAdminReceiver]
-        FgService[FocusTimerService & AudioPlaybackService]
-        NotifService[TakeBackNotificationListener]
-        GeofenceClient[GeofenceBroadcastReceiver]
-        BootReceiver[BootCompletedReceiver]
-        Alarms[ExactAlarmScheduler]
+    subgraph PlatformLayer ["Platform and Enforcement Infrastructure Layer"]
+        AccService["TakeBackAccessibilityService"]
+        DeviceAdmin["TakeBackDeviceAdminReceiver"]
+        FgService["FocusTimerService and AudioPlaybackService"]
+        NotifService["TakeBackNotificationListener"]
+        GeofenceClient["GeofenceBroadcastReceiver"]
+        BootReceiver["BootCompletedReceiver"]
+        Alarms["ExactAlarmScheduler"]
     end
 
     PresentationLayer --> DomainLayer

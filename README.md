@@ -69,28 +69,28 @@ TakeBack is built following **Clean Architecture** principles and Android Archit
 
 ```mermaid
 flowchart TD
-    subgraph PresentationLayer [Presentation Layer (Jetpack Compose)]
-        Screens[Composable Screens: Home, Profiles, Focus, Insights, Settings]
-        ViewModels[MVI / MVVM ViewModels: HomeViewModel, etc.]
-        UiState[Immutable UiState & UiEvents]
+    subgraph PresentationLayer ["Presentation Layer (Jetpack Compose)"]
+        Screens["Composable Screens: Home, Profiles, Focus, Insights, Settings"]
+        ViewModels["MVI / MVVM ViewModels: HomeViewModel, etc."]
+        UiState["Immutable UiState and UiEvents"]
     end
 
-    subgraph DomainLayer [Domain Layer (Pure Kotlin - Zero Android Dependencies)]
-        Engine[Central Restriction Engine]
-        SecurityGate[StrictMutationGate]
-        DomainModels[Profile, Schedule, UsageLimit, BlockDecision]
+    subgraph DomainLayer ["Domain Layer (Pure Kotlin - Zero Android Dependencies)"]
+        Engine["Central Restriction Engine"]
+        SecurityGate["StrictMutationGate"]
+        DomainModels["Profile, Schedule, UsageLimit, BlockDecision"]
     end
 
-    subgraph DataLayer [Data Layer (Room + DataStore)]
-        Repos[ProfileRepository, StrictModeRepository, UsageStatsRepository]
-        Storage[Local SQLite DB, Encrypted Preferences]
+    subgraph DataLayer ["Data Layer (Room and DataStore)"]
+        Repos["ProfileRepository, StrictModeRepository, UsageStatsRepository"]
+        Storage["Local SQLite DB, Encrypted Preferences"]
     end
 
-    subgraph PlatformLayer [Platform & Enforcement Infrastructure Layer]
-        AccService[TakeBackAccessibilityService]
-        DeviceAdmin[TakeBackDeviceAdminReceiver]
-        FgService[FocusTimerService & AudioPlaybackService]
-        Alarms[ScheduleCoordinator & ExactAlarmScheduler]
+    subgraph PlatformLayer ["Platform and Enforcement Infrastructure Layer"]
+        AccService["TakeBackAccessibilityService"]
+        DeviceAdmin["TakeBackDeviceAdminReceiver"]
+        FgService["FocusTimerService and AudioPlaybackService"]
+        Alarms["ScheduleCoordinator and ExactAlarmScheduler"]
     end
 
     PresentationLayer --> DomainLayer

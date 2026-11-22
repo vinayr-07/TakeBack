@@ -6,23 +6,23 @@
 
 ```mermaid
 flowchart TD
-    subgraph DeviceBoundary [Protected Device Boundary - 100% On-Device]
-        AppUsage[UsageStats / App Screen Time]
-        BrowserURL[Extracted URL / Address Bar]
-        Geofence[GPS Coordinates / Geofence Cache]
-        StrictPIN[PIN & Protection Secrets]
-        RoomDB[(Local SQLite Room DB)]
-        DataStore[(Encrypted Preferences)]
+    subgraph DeviceBoundary ["Protected Device Boundary - 100% On-Device"]
+        AppUsage["UsageStats / App Screen Time"]
+        BrowserURL["Extracted URL / Address Bar"]
+        Geofence["GPS Coordinates / Geofence Cache"]
+        StrictPIN["PIN and Protection Secrets"]
+        RoomDB[("Local SQLite Room DB")]
+        DataStore[("Encrypted Preferences")]
         
         AppUsage --> RoomDB
-        BrowserURL --> TransientMemory[Transient Regex Matcher]
-        TransientMemory -->|Discard immediately| MemoryClean[Cleared Memory]
+        BrowserURL --> TransientMemory["Transient String Matcher"]
+        TransientMemory -->|Discard immediately| MemoryClean["Cleared Memory"]
         Geofence --> RoomDB
         StrictPIN --> DataStore
     end
     
-    subgraph ExternalWorld [External World / Network]
-        Cloud[Third-Party Trackers & Cloud Servers]
+    subgraph ExternalWorld ["External World / Network"]
+        Cloud["Third-Party Trackers and Cloud Servers"]
     end
     
     DeviceBoundary -.x|ZERO Network Sockets Opened| Cloud

@@ -6,23 +6,23 @@
 
 ```mermaid
 flowchart TD
-    subgraph UnitTier [Unit Tests (Pure JVM - >70% Coverage)]
-        EngineTests[Central Restriction Engine Deterministic Tests]
-        TimeTests[Overnight Schedules & Timezone Tests]
-        LimitTests[Sliding Window & Usage Limit Tests]
-        CryptoTests[Strict Mode PBKDF2 & Challenge Tests]
+    subgraph UnitTier ["Unit Tests (Pure JVM - >70% Coverage)"]
+        EngineTests["Central Restriction Engine Deterministic Tests"]
+        TimeTests["Overnight Schedules and Timezone Tests"]
+        LimitTests["Sliding Window and Usage Limit Tests"]
+        CryptoTests["Strict Mode PBKDF2 and Challenge Tests"]
     end
 
-    subgraph IntegrationTier [Integration Tests (Robolectric & AndroidX Test)]
-        RoomTests[Room DAO Entity Relational Queries]
-        DataStoreTests[Encrypted Preferences & Migration Tests]
-        UseCaseTests[Complete Domain UseCase Pipelines]
+    subgraph IntegrationTier ["Integration Tests (Robolectric and AndroidX Test)"]
+        RoomTests["Room DAO Entity Relational Queries"]
+        DataStoreTests["Encrypted Preferences and Migration Tests"]
+        UseCaseTests["Complete Domain UseCase Pipelines"]
     end
 
-    subgraph UITier [UI & System Tests (Compose UI & E2E)]
-        ComposeTests[Compose Screen Tests & State Hoisting]
-        PermissionTests[Permission Center State Flows]
-        FlowTests[Profile Creation & Blocking Journey Tests]
+    subgraph UITier ["UI and System Tests (Compose UI and E2E)"]
+        ComposeTests["Compose Screen Tests and State Hoisting"]
+        PermissionTests["Permission Center State Flows"]
+        FlowTests["Profile Creation and Blocking Journey Tests"]
     end
 
     UnitTier --> IntegrationTier
