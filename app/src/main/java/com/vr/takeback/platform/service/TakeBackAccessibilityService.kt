@@ -475,8 +475,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
         now: Long,
         currentForegroundPackage: String? = null
     ): Boolean {
-        // Debounce: do not re-audit within 1500ms of a block action to avoid animation/transition storms
-        if ((now - lastBlockedTimestamp) < 1500L) {
+        // Debounce: do not re-audit within 2500ms of any block action to prevent event storms during animations
+        if ((now - lastBlockedTimestamp) < 2500L) {
             return false
         }
 
@@ -488,6 +488,18 @@ class TakeBackAccessibilityService : AccessibilityService() {
         }
 
         if (currentWindows.isNullOrEmpty()) {
+            return false
+        }
+
+        // If TakeBack's own shield or UI is already the top/visible window, do not trigger duplicate blocks
+        val isTakeBackShieldActive = currentWindows.any { window ->
+            try {
+                window.root?.packageName == applicationContext.packageName
+            } catch (e: Exception) {
+                false
+            }
+        }
+        if (isTakeBackShieldActive) {
             return false
         }
 
@@ -533,8 +545,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
                 continue
             }
 
-            // De-bounce rapid consecutive blocks for the same window package (< 2.0s)
-            if (windowPkg == lastBlockedPackage && (now - lastBlockedTimestamp) < 2000L) {
+            // De-bounce rapid consecutive blocks for the same window package (< 5.0s)
+            if (windowPkg == lastBlockedPackage && (now - lastBlockedTimestamp) < 5000L) {
                 continue
             }
 
@@ -555,17 +567,24 @@ class TakeBackAccessibilityService : AccessibilityService() {
                     } catch (e: Exception) {
                         Log.w(TAG, "Failed to dismiss PiP window for $windowPkg", e)
                     }
+                } else {
+                    // Freeform pop-up view or multi-window: dismiss or send back if focused
+                    try {
+                        rootNode.performAction(AccessibilityNodeInfo.ACTION_DISMISS)
+                    } catch (e: Exception) {
+                        // ignore
+                    }
+                    if (window.isFocused) {
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                    }
                 }
 
                 // Halt background/video audio playback immediately
                 requestMediaAudioFocusPause()
 
-                // Collapse multi-window split-screen / pop-up view and return to launcher
-                performGlobalAction(GLOBAL_ACTION_HOME)
-
                 lastBlockedPackage = windowPkg
                 lastBlockedTimestamp = now
-                handleBlockDecision(decision, skipHomeAction = true)
+                handleBlockDecision(decision)
                 return true
             }
         }
@@ -882,7 +901,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         socialSessionTracker.reset()
     }
 
-    private fun handleBlockDecision(decision: BlockDecision.Blocked, skipHomeAction: Boolean = false) {
+    private fun handleBlockDecision(decision: BlockDecision.Blocked) {
         val appName = when (val target = decision.target) {
             is BlockTarget.Application -> resolveAppLabel(target.packageName)
             is BlockTarget.Website -> target.domainOrUrl
@@ -906,11 +925,6 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         // Halt background/video audio playback immediately
         requestMediaAudioFocusPause()
-
-        // Return user to home immediately to stop the restricted app
-        if (!skipHomeAction) {
-            performGlobalAction(GLOBAL_ACTION_HOME)
-        }
 
         // Log to Activity Timeline
         try {

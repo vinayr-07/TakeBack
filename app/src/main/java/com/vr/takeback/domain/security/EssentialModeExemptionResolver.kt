@@ -158,6 +158,7 @@ class EssentialModeExemptionResolver(
         // Essential payment and financial utility packages that must never be blocked in Essential Mode
         val ESSENTIAL_PAYMENT_PACKAGES = setOf(
             "com.samsung.android.spay",              // Samsung Wallet / Samsung Pay
+            "com.samsung.android.spayfw",            // Samsung Pay Framework / Wallet Core
             "com.samsung.android.rapsp",             // Samsung Pay Mini
             "com.phonepe.app",                       // PhonePe
             "com.google.android.apps.nbu.paisa.user", // Google Pay (GPay India / Tez)
@@ -305,7 +306,7 @@ class EssentialModeExemptionResolver(
         val trimmed = packageName.trim()
         if (ESSENTIAL_PAYMENT_PACKAGES.contains(trimmed)) return true
         val lower = trimmed.lowercase()
-        return lower == "com.phonepe.app" || lower == "com.samsung.android.spay" || lower == "com.samsung.android.rapsp"
+        return lower == "com.phonepe.app" || lower == "com.samsung.android.spay" || lower == "com.samsung.android.spayfw" || lower == "com.samsung.android.rapsp"
     }
 
     /**

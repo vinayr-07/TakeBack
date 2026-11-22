@@ -436,8 +436,21 @@ class EssentialModeExemptionResolverTest {
     fun scenario32_effectiveExemptPackages_includesPaymentApps() {
         val exempt = resolver.getEffectiveExemptPackages(null)
         assertTrue("Effective exempt packages must include Samsung Wallet", exempt.contains("com.samsung.android.spay"))
+        assertTrue("Effective exempt packages must include Samsung Pay Framework", exempt.contains("com.samsung.android.spayfw"))
         assertTrue("Effective exempt packages must include PhonePe", exempt.contains("com.phonepe.app"))
         assertTrue("Effective exempt packages must include Google Pay", exempt.contains("com.google.android.apps.nbu.paisa.user"))
+    }
+
+    // 33. Samsung Pay Framework (spayfw) is permanently exempt in Essential Mode
+    @Test
+    fun scenario33_samsungPayFramework_isExemptInEssentialMode() {
+        val spayfw = "com.samsung.android.spayfw"
+        fakeProvider.installed.add(spayfw)
+
+        val decision = resolver.resolveExemption(spayfw)
+        assertTrue("Samsung Pay Framework must be exempt under Essential Mode", decision.isExempt)
+        assertEquals("Must be categorized as CORE_PAYMENT", ExemptionCategory.CORE_PAYMENT, decision.category)
+        assertTrue(resolver.isExempt(spayfw))
     }
 }
 

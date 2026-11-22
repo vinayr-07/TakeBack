@@ -22,6 +22,7 @@ data class HomeUiState(
     val quickBlockState: QuickBlockState = QuickBlockState(),
     val permissionStatus: PermissionStatus = PermissionStatus(),
     val strictState: StrictProtectionState = StrictProtectionState(),
+    val essentialState: EssentialModeState = EssentialModeState(),
     val usageSummary: DailyUsageSummary? = null,
     val isUsageLoading: Boolean = false,
     val dailyAllowanceMinutes: Int = 120,
@@ -42,9 +43,10 @@ data class HomeUiState(
     val isAccessibilityMissing: Boolean get() = !permissionStatus.hasAccessibility
     val isUsageStatsMissing: Boolean get() = !permissionStatus.hasUsageStats
     val isQuickBlockActive: Boolean get() = quickBlockState.isActive
+    val isEssentialModeEnforcing: Boolean get() = essentialState.isEnabled && !essentialState.isEmergencyExitActive
     val hasEnabledProfile: Boolean get() = profiles.any { it.isEnabled }
-    val isProtectionConfigured: Boolean get() = isQuickBlockActive || activelyEnforcingProfiles.isNotEmpty() || hasEnabledProfile
-    val isProtectionActive: Boolean get() = isQuickBlockActive || activelyEnforcingProfiles.isNotEmpty()
+    val isProtectionConfigured: Boolean get() = isQuickBlockActive || activelyEnforcingProfiles.isNotEmpty() || hasEnabledProfile || isEssentialModeEnforcing
+    val isProtectionActive: Boolean get() = isQuickBlockActive || activelyEnforcingProfiles.isNotEmpty() || isEssentialModeEnforcing
 }
 
 /**
@@ -74,7 +76,8 @@ class HomeViewModel(
     private val quickBlockRepository: QuickBlockRepository,
     private val usageStatsRepository: UsageStatsRepository,
     private val permissionRepository: PermissionRepository,
-    private val strictModeRepository: StrictModeRepository
+    private val strictModeRepository: StrictModeRepository,
+    private val essentialModeRepository: EssentialModeRepository = TakeBackApplication.essentialModeRepository
 ) : ViewModel() {
 
     private val _usageSummary = MutableStateFlow<DailyUsageSummary?>(null)
@@ -91,9 +94,10 @@ class HomeViewModel(
             profileRepository.profiles,
             quickBlockRepository.state,
             permissionRepository.permissionStatus,
-            strictModeRepository.protectionState
-        ) { profiles, quickBlock, perms, strict ->
-            Tuple4(profiles, quickBlock, perms, strict)
+            strictModeRepository.protectionState,
+            essentialModeRepository.state
+        ) { profiles, quickBlock, perms, strict, essential ->
+            Tuple5(profiles, quickBlock, perms, strict, essential)
         },
         combine(
             _usageSummary,
@@ -111,12 +115,13 @@ class HomeViewModel(
         ) { time, day, pendingCancel ->
             Triple(time, day, pendingCancel)
         }
-    ) { (profiles, quickBlock, perms, strict), (summary, loading, allowance, pendingToggle, showDialog), (time, day, pendingCancel) ->
+    ) { (profiles, quickBlock, perms, strict, essential), (summary, loading, allowance, pendingToggle, showDialog), (time, day, pendingCancel) ->
         HomeUiState(
             profiles = profiles,
             quickBlockState = quickBlock,
             permissionStatus = perms,
             strictState = strict,
+            essentialState = essential,
             usageSummary = summary,
             isUsageLoading = loading,
             dailyAllowanceMinutes = allowance,
@@ -156,6 +161,14 @@ class HomeViewModel(
                 _isPendingCancelQuickBlock.value = false
             }
             is HomeUiEvent.SetDailyAllowance -> {
+                val isStrictLocked = strictModeRepository.protectionState.value.isCurrentlyLocked
+                val currentAllowance = _dailyAllowanceMinutes.value
+                if (isStrictLocked && event.minutes > currentAllowance) {
+                    // Cannot increase daily allowance under Strict Mode
+                    _showAllowanceDialog.value = false
+                    return
+                }
+                essentialModeRepository.setDailyAllowanceMinutes(event.minutes)
                 usageStatsRepository.setDailyAllowanceMinutes(event.minutes)
                 _dailyAllowanceMinutes.value = event.minutes
                 _showAllowanceDialog.value = false
@@ -215,7 +228,8 @@ class HomeViewModel(
                     quickBlockRepository = TakeBackApplication.quickBlockRepository,
                     usageStatsRepository = TakeBackApplication.usageStatsRepository,
                     permissionRepository = TakeBackApplication.permissionRepository,
-                    strictModeRepository = TakeBackApplication.strictModeRepository
+                    strictModeRepository = TakeBackApplication.strictModeRepository,
+                    essentialModeRepository = TakeBackApplication.essentialModeRepository
                 ) as T
             }
         }

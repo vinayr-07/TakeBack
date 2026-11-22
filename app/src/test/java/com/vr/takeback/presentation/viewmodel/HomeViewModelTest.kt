@@ -47,6 +47,18 @@ class HomeViewModelTest {
     }
 
     @Test
+    fun testHomeUiState_essentialModeActive_setsProtectionActive() {
+        val essentialState = com.vr.takeback.data.repository.EssentialModeState(
+            isEnabled = true,
+            status = com.vr.takeback.data.repository.EssentialModeStatus.ACTIVE
+        )
+        val state = HomeUiState(essentialState = essentialState)
+        assertTrue("Essential mode should be enforcing", state.isEssentialModeEnforcing)
+        assertTrue("Protection should be active when Essential Mode is enabled", state.isProtectionActive)
+        assertTrue("Protection should be configured", state.isProtectionConfigured)
+    }
+
+    @Test
     fun testHomeUiState_activelyEnforcingProfiles() {
         val studyProfile = Profile(
             id = "study_profile",

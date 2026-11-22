@@ -318,6 +318,9 @@ fun HomeScreenContent(
                                             val secs = uiState.quickBlockState.remainingSeconds % 60
                                             "Quick Block active (${mins}m ${secs}s left) • Guarding distractions"
                                         }
+                                        uiState.isEssentialModeEnforcing -> {
+                                            "Essential Mode active • Daily screen time limit enforced"
+                                        }
                                         uiState.activelyEnforcingProfiles.isNotEmpty() -> {
                                             val totalApps = uiState.activelyEnforcingProfiles.flatMap { it.targetApps }.distinctBy { it.packageName }.size
                                             "${uiState.activelyEnforcingProfiles.size} profile(s) actively blocking $totalApps app(s)"
@@ -725,16 +728,30 @@ fun HomeScreenContent(
                             style = MaterialTheme.typography.bodyMedium
                         )
                         Spacer(modifier = Modifier.height(8.dp))
+                        if (uiState.strictState.isCurrentlyLocked) {
+                            Text(
+                                text = "Strict Mode is active: You can decrease your allowance to strengthen protection, but you cannot increase it.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                        }
                         listOf(60, 120, 180, 240, 300).forEach { mins ->
                             val hours = mins / 60
+                            val isIncreasingLocked = uiState.strictState.isCurrentlyLocked && mins > uiState.dailyAllowanceMinutes
                             OutlinedButton(
                                 onClick = {
                                     onEvent(HomeUiEvent.SetDailyAllowance(mins))
                                 },
+                                enabled = !isIncreasingLocked,
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = if (uiState.dailyAllowanceMinutes == mins) ButtonDefaults.outlinedButtonColors(containerColor = MaterialTheme.colorScheme.primaryContainer) else ButtonDefaults.outlinedButtonColors()
                             ) {
-                                Text("$hours hours per day", fontWeight = if (uiState.dailyAllowanceMinutes == mins) FontWeight.Bold else FontWeight.Normal)
+                                Text(
+                                    text = if (isIncreasingLocked) "$hours hours per day (Locked by Strict Mode)" else "$hours hours per day",
+                                    fontWeight = if (uiState.dailyAllowanceMinutes == mins) FontWeight.Bold else FontWeight.Normal
+                                )
                             }
                         }
                     }
