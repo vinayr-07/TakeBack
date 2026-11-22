@@ -20,9 +20,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.data.repository.EssentialModeStatus
 import com.vr.takeback.domain.security.ExemptionDiagnosticSummary
+import com.vr.takeback.domain.security.MutationType
+import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -32,11 +35,28 @@ fun EssentialModeDiagnosticsScreen(
     val context = LocalContext.current
     val essentialRepo = remember { TakeBackApplication.essentialModeRepository }
     val exemptionResolver = remember { TakeBackApplication.essentialModeExemptionResolver }
+    val strictRepo = remember { TakeBackApplication.strictModeRepository }
+    val strictState by strictRepo.protectionState.collectAsState()
 
     val state by essentialRepo.state.collectAsState()
     var diagnosticSummary by remember { mutableStateOf<ExemptionDiagnosticSummary?>(null) }
     var showAddModuleDialog by remember { mutableStateOf(false) }
+    var showSystemPackagesDialog by remember { mutableStateOf(false) }
     var customPackageInput by remember { mutableStateOf("") }
+    var customPackageError by remember { mutableStateOf<String?>(null) }
+    var systemAppSearchQuery by remember { mutableStateOf("") }
+
+    var pendingMutation by remember { mutableStateOf<((String?) -> Unit)?>(null) }
+    var showStrictChallenge by remember { mutableStateOf(false) }
+
+    fun executeMutation(mutation: (String?) -> Unit) {
+        if (strictState.isGlobalStrictActive) {
+            pendingMutation = mutation
+            showStrictChallenge = true
+        } else {
+            mutation(null)
+        }
+    }
 
     LaunchedEffect(state) {
         diagnosticSummary = exemptionResolver.getDiagnosticSummary(state.selectedAdditionalPackage)
@@ -304,7 +324,16 @@ fun EssentialModeDiagnosticsScreen(
                                     fontWeight = FontWeight.Bold
                                 )
                             }
-                            IconButton(onClick = { showAddModuleDialog = true }) {
+                            IconButton(
+                                onClick = {
+                                    if (state.status == EssentialModeStatus.ACTIVE) {
+                                        Toast.makeText(context, "Cannot add exemptions while Essential Mode is active", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        customPackageError = null
+                                        showAddModuleDialog = true
+                                    }
+                                }
+                            ) {
                                 Icon(Icons.Filled.Add, contentDescription = "Add Module")
                             }
                         }
@@ -392,9 +421,20 @@ fun EssentialModeDiagnosticsScreen(
                                     Text(customPkg, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
                                     IconButton(
                                         onClick = {
-                                            essentialRepo.removeCustomGoodLockModule(customPkg)
-                                            exemptionResolver.synchronizeCustomGoodLockModules(essentialRepo.state.value.customGoodLockModules)
-                                            diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackage)
+                                            if (state.status == EssentialModeStatus.ACTIVE) {
+                                                Toast.makeText(context, "Cannot remove exemptions while Essential Mode is active", Toast.LENGTH_SHORT).show()
+                                                return@IconButton
+                                            }
+                                            executeMutation { token ->
+                                                val ok = essentialRepo.removeCustomGoodLockModule(customPkg, token)
+                                                if (ok) {
+                                                    exemptionResolver.synchronizeCustomGoodLockModules(essentialRepo.state.value.customGoodLockModules)
+                                                    diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackage)
+                                                    Toast.makeText(context, "Module removed", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    Toast.makeText(context, "Action failed or blocked by Strict Mode", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
                                         },
                                         modifier = Modifier.size(24.dp)
                                     ) {
@@ -447,6 +487,40 @@ fun EssentialModeDiagnosticsScreen(
                             Text("FLAG_UPDATED_SYSTEM_APP packages exempt:", style = MaterialTheme.typography.bodySmall)
                             Text("${summary?.updatedSystemAppExemptionCount ?: 0}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                         }
+
+                        if (summary?.isPackageEnumerationSuccessful == false) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "Package enumeration restricted by Android OS. TakeBack is using the verified fallback system package registry.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = {
+                                systemAppSearchQuery = ""
+                                showSystemPackagesDialog = true
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Filled.List, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("View All System Packages (${summary?.systemAppPackagesList?.size ?: 0})")
+                        }
                     }
                 }
             }
@@ -458,34 +532,60 @@ fun EssentialModeDiagnosticsScreen(
                 onDismissRequest = {
                     showAddModuleDialog = false
                     customPackageInput = ""
+                    customPackageError = null
                 },
                 title = { Text("Register Good Lock Module") },
                 text = {
                     Column {
                         Text(
-                            text = "Enter the exact package name of a Samsung Good Lock module not automatically recognized:",
+                            text = "Enter the exact package name of a Samsung Good Lock module installed on this device:",
                             style = MaterialTheme.typography.bodySmall
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         OutlinedTextField(
                             value = customPackageInput,
-                            onValueChange = { customPackageInput = it.trim() },
+                            onValueChange = {
+                                customPackageInput = it.trim()
+                                customPackageError = null
+                            },
                             label = { Text("Package name (e.g. com.samsung.android...)") },
                             singleLine = true,
+                            isError = customPackageError != null,
+                            supportingText = customPackageError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
                             modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Must belong to Samsung namespace (com.samsung.* / com.sec.*) or official Good Lock registry. Games, social, and streaming apps are rejected.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 confirmButton = {
                     Button(
                         onClick = {
-                            if (customPackageInput.isNotBlank()) {
-                                essentialRepo.addCustomGoodLockModule(customPackageInput)
-                                exemptionResolver.synchronizeCustomGoodLockModules(essentialRepo.state.value.customGoodLockModules)
-                                diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackage)
-                                Toast.makeText(context, "Module registered as exempt", Toast.LENGTH_SHORT).show()
-                                showAddModuleDialog = false
-                                customPackageInput = ""
+                            val pkg = customPackageInput.trim()
+                            if (pkg.isBlank()) {
+                                customPackageError = "Package name cannot be blank"
+                                return@Button
+                            }
+                            if (!exemptionResolver.isValidGoodLockCandidate(pkg)) {
+                                customPackageError = "Package is ineligible (must be installed, belong to Samsung/Good Lock namespace, and not be games/social)"
+                                return@Button
+                            }
+                            showAddModuleDialog = false
+                            executeMutation { token ->
+                                val ok = essentialRepo.addCustomGoodLockModule(pkg, token)
+                                if (ok) {
+                                    exemptionResolver.synchronizeCustomGoodLockModules(essentialRepo.state.value.customGoodLockModules)
+                                    diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackage)
+                                    Toast.makeText(context, "Module registered as exempt", Toast.LENGTH_SHORT).show()
+                                    customPackageInput = ""
+                                    customPackageError = null
+                                } else {
+                                    Toast.makeText(context, "Registration blocked by Strict Mode or invalid state", Toast.LENGTH_SHORT).show()
+                                }
                             }
                         }
                     ) {
@@ -497,10 +597,131 @@ fun EssentialModeDiagnosticsScreen(
                         onClick = {
                             showAddModuleDialog = false
                             customPackageInput = ""
+                            customPackageError = null
                         }
                     ) {
                         Text("Cancel")
                     }
+                }
+            )
+        }
+
+        // Dialog: View All System Packages
+        if (showSystemPackagesDialog) {
+            val allPackages = summary?.systemAppPackagesList ?: emptyList()
+            val filteredPackages = allPackages.filter { it.contains(systemAppSearchQuery, ignoreCase = true) }
+
+            Dialog(onDismissRequest = { showSystemPackagesDialog = false }) {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 6.dp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .fillMaxHeight(0.85f)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(20.dp)
+                    ) {
+                        Text(
+                            text = "Exempt System Packages",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "${allPackages.size} system packages verified exempt to preserve device integrity.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        OutlinedTextField(
+                            value = systemAppSearchQuery,
+                            onValueChange = { systemAppSearchQuery = it },
+                            placeholder = { Text("Search system packages...") },
+                            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        LazyColumn(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            items(filteredPackages) { pkg ->
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = pkg,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Surface(
+                                            shape = RoundedCornerShape(4.dp),
+                                            color = MaterialTheme.colorScheme.primaryContainer
+                                        ) {
+                                            Text(
+                                                text = "SYSTEM",
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(onClick = { showSystemPackagesDialog = false }) {
+                                Text("Close")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showStrictChallenge) {
+            StrictChallengeDialog(
+                mechanism = strictState.mechanism,
+                saltBase64 = strictState.saltBase64,
+                expectedHash = strictState.passwordHash,
+                mutationType = MutationType.UPDATE_ESSENTIAL_MODE,
+                onTokenIssued = { token ->
+                    showStrictChallenge = false
+                    val action = pendingMutation
+                    pendingMutation = null
+                    action?.invoke(token)
+                },
+                onDismissRequest = {
+                    showStrictChallenge = false
+                    pendingMutation = null
                 }
             )
         }

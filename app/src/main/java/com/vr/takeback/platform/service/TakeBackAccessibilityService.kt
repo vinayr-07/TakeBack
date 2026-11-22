@@ -29,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.DayOfWeek
@@ -210,11 +211,39 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         // Initial refresh using the same throttled / single-flight guard
         triggerUsageSnapshotRefresh(force = true)
+        startPeriodicUsageCheck()
+    }
+
+    private var periodicUsageCheckJob: Job? = null
+
+    private fun startPeriodicUsageCheck() {
+        periodicUsageCheckJob?.cancel()
+        periodicUsageCheckJob = serviceScope.launch {
+            while (isActive) {
+                delay(45_000L) // Check every 45 seconds for active session threshold crossing
+                try {
+                    val essentialRepo = TakeBackApplication.essentialModeRepository
+                    val essentialState = essentialRepo.state.value
+                    if (essentialState.isEnabled && !essentialState.isEmergencyExitActive) {
+                        triggerUsageSnapshotRefresh(force = false) { freshSnapshot ->
+                            val totalDailyMinutes = (freshSnapshot.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
+                            if (totalDailyMinutes >= essentialState.dailyAllowanceMinutes) {
+                                reEvaluateCurrentForegroundApp()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error in periodic usage check", e)
+                }
+            }
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isServiceRunning = false
+        periodicUsageCheckJob?.cancel()
+        periodicUsageCheckJob = null
         if (activeServiceInstance == this) {
             activeServiceInstance = null
         }
@@ -510,7 +539,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         // Build 7 Issue 4 & Build 8 Issue 1: Controlled refresh triggers.
         // Refresh only on window state changes (not on scrolling or content-changes).
         val isSnapshotFresh = activeSnapshot?.isAvailable == true && (now - activeSnapshot.capturedAtMillis <= 30_000L)
-        if (hasUsageLimitForApp && !isSnapshotFresh && isWindowTransition) {
+        if ((hasUsageLimitForApp || isEssentialEnabled) && !isSnapshotFresh && isWindowTransition) {
             triggerUsageSnapshotRefresh(force = false) { fresh ->
                 if (sessionTracker.currentPackage == packageName) {
                     val freshSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
@@ -590,12 +619,21 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         // Launch full-screen BlockShieldActivity
         val isEssentialModeShield = decision.reason is BlockReason.DailyAllowanceExceeded
+        val allowanceMins = if (decision.reason is BlockReason.DailyAllowanceExceeded) {
+            (decision.reason as BlockReason.DailyAllowanceExceeded).allowanceMinutes
+        } else 0
+        val usedMins = if (decision.reason is BlockReason.DailyAllowanceExceeded) {
+            (decision.reason as BlockReason.DailyAllowanceExceeded).usedMinutes
+        } else 0
+
         val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("EXTRA_APP_NAME", appName)
             putExtra("EXTRA_PROFILE_NAME", decision.triggeringProfileName)
             putExtra("EXTRA_REASON", reasonText)
             putExtra("EXTRA_IS_ESSENTIAL_SHIELD", isEssentialModeShield)
+            putExtra("EXTRA_ALLOWANCE_MINS", allowanceMins)
+            putExtra("EXTRA_USED_MINS", usedMins)
         }
         startActivity(shieldIntent)
     }

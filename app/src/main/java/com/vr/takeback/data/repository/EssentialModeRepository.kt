@@ -136,6 +136,37 @@ class EssentialModeRepository(
         }
     }
 
+    @Volatile
+    private var failedAttemptCount = 0
+    @Volatile
+    private var lockoutUntilEpochMillis = 0L
+
+    fun isRateLimited(): Boolean = System.currentTimeMillis() < lockoutUntilEpochMillis
+
+    fun getLockoutRemainingSeconds(): Int {
+        val remaining = lockoutUntilEpochMillis - System.currentTimeMillis()
+        return if (remaining > 0) ((remaining + 999) / 1000).toInt() else 0
+    }
+
+    private fun recordFailedAttempt() {
+        failedAttemptCount++
+        if (failedAttemptCount >= 5) {
+            val lockoutSeconds = 30L * (failedAttemptCount - 4)
+            lockoutUntilEpochMillis = System.currentTimeMillis() + (lockoutSeconds * 1000L)
+        }
+    }
+
+    private fun resetFailedAttempts() {
+        failedAttemptCount = 0
+        lockoutUntilEpochMillis = 0L
+    }
+
+    fun hasConfiguredPin(): Boolean {
+        val strictRepo = strictModeRepoProvider?.invoke() ?: runCatching { TakeBackApplication.strictModeRepository }.getOrNull()
+        val strictState = strictRepo?.protectionState?.value
+        return !strictState?.saltBase64.isNullOrEmpty() && !strictState?.passwordHash.isNullOrEmpty()
+    }
+
     /**
      * Reconciles daily rollover.
      * When date advances past dailyCycleDate, Emergency Exit expires and cycle resets.
@@ -146,6 +177,7 @@ class EssentialModeRepository(
         val todayStr = today.toString()
         if (current.dailyCycleDate != todayStr) {
             safeLogI("Daily cycle rollover detected: ${current.dailyCycleDate} -> $todayStr. Resetting Emergency Exit.")
+            resetFailedAttempts()
             val newStatus = if (current.isEnabled) EssentialModeStatus.MONITORING else EssentialModeStatus.DISABLED
             val updated = current.copy(
                 dailyCycleDate = todayStr,
@@ -164,6 +196,10 @@ class EssentialModeRepository(
 
     /**
      * Determines whether Essential Mode is currently actively restricting non-exempt applications.
+     * Invariant: Once activated (ACTIVE), Essential Mode remains locked active until:
+     * 1. Authenticated Emergency Exit, or
+     * 2. Next daily cycle rollover at midnight.
+     * It NEVER deactivates due to lower usage snapshots, process restart, or reboot.
      */
     @Synchronized
     fun isCurrentlyActive(
@@ -183,37 +219,48 @@ class EssentialModeRepository(
             return false
         }
 
+        // LATCH INVARIANT: Once ACTIVE, remain ACTIVE until Emergency Exit or midnight reset.
+        if (current.status == EssentialModeStatus.ACTIVE) {
+            return true
+        }
+
         if (!isEnforcementAvailable) {
-            // Temporary enforcement unavailability does not deactivate an already-active mode
-            return current.status == EssentialModeStatus.ACTIVE
+            return false
         }
 
         val reached = totalDailyUsageMinutes >= current.dailyAllowanceMinutes
         if (reached) {
-            if (current.status != EssentialModeStatus.ACTIVE) {
-                val updated = current.copy(
-                    status = EssentialModeStatus.ACTIVE,
-                    activationEpochMillis = if (current.activationEpochMillis == 0L) System.currentTimeMillis() else current.activationEpochMillis,
-                    usageAtActivationMinutes = totalDailyUsageMinutes
-                )
-                _state.value = updated
-                persistState(updated)
-            }
+            val updated = current.copy(
+                status = EssentialModeStatus.ACTIVE,
+                activationEpochMillis = System.currentTimeMillis(),
+                usageAtActivationMinutes = totalDailyUsageMinutes
+            )
+            _state.value = updated
+            persistState(updated)
             return true
-        } else {
-            if (current.status == EssentialModeStatus.ACTIVE && current.activationEpochMillis == 0L) {
-                val updated = current.copy(status = EssentialModeStatus.MONITORING)
-                _state.value = updated
-                persistState(updated)
-            }
-            return false
         }
+
+        return false
     }
 
     /**
      * Updates Essential Mode enabled state. Protected by StrictMutationGate when Strict Mode is active.
      */
     fun setEnabled(enabled: Boolean, token: String? = null): Boolean {
+        val current = _state.value
+
+        // Invariant: Cannot toggle off while ACTIVE. Must use Emergency Exit.
+        if (!enabled && current.status == EssentialModeStatus.ACTIVE) {
+            safeLogW("Cannot disable Essential Mode via toggle while ACTIVE. Must use Emergency Exit.")
+            return false
+        }
+
+        // Invariant: Cannot enable without an existing configured Strict Mode PIN for Emergency Exit.
+        if (enabled && !hasConfiguredPin()) {
+            safeLogW("Cannot enable Essential Mode without a configured Strict Mode PIN.")
+            return false
+        }
+
         if (isStrictActive()) {
             val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
             if (!valid) {
@@ -221,8 +268,12 @@ class EssentialModeRepository(
                 return false
             }
         }
-        val current = _state.value
-        val newStatus = if (enabled) EssentialModeStatus.MONITORING else EssentialModeStatus.DISABLED
+
+        val newStatus = if (enabled) {
+            if (current.status == EssentialModeStatus.ACTIVE) EssentialModeStatus.ACTIVE else EssentialModeStatus.MONITORING
+        } else {
+            EssentialModeStatus.DISABLED
+        }
         val updated = current.copy(
             isEnabled = enabled,
             status = newStatus
@@ -290,8 +341,14 @@ class EssentialModeRepository(
      * Authenticates using the existing Strict Mode PIN/password and triggers Emergency Exit.
      * Deactivates Essential Mode for the remainder of the current local daily cycle.
      * Does NOT modify recorded usage, reset allowance, disable Strict Mode, or disable Device Admin.
+     * Protected against rapid brute-force attempts with escalating lockout backoff.
      */
     fun authenticateAndTriggerEmergencyExit(pin: String): Boolean {
+        if (isRateLimited()) {
+            safeLogW("Emergency Exit rejected: Rate limited. Lockout remaining: ${getLockoutRemainingSeconds()}s")
+            return false
+        }
+
         val strictRepo = strictModeRepoProvider?.invoke() ?: runCatching { TakeBackApplication.strictModeRepository }.getOrNull()
         val strictState = strictRepo?.protectionState?.value
 
@@ -299,17 +356,19 @@ class EssentialModeRepository(
         val hash = strictState?.passwordHash
 
         if (salt.isNullOrEmpty() || hash.isNullOrEmpty()) {
-            // Strict Mode has no PIN configured; verify if Strict Mode is armed
+            recordFailedAttempt()
             safeLogW("Emergency Exit attempted but no Strict Mode credential exists")
             return false
         }
 
         val isPinValid = StrictModeManager.verifyPin(pin, salt, hash)
         if (!isPinValid) {
-            safeLogW("Emergency Exit authentication failed: incorrect credential")
+            recordFailedAttempt()
+            safeLogW("Emergency Exit authentication failed: incorrect credential (failed attempts: $failedAttemptCount)")
             return false
         }
 
+        resetFailedAttempts()
         safeLogI("Emergency Exit authenticated successfully. Deactivating Essential Mode until next daily reset.")
         val current = _state.value
         val updated = current.copy(
@@ -322,19 +381,74 @@ class EssentialModeRepository(
         return true
     }
 
-    fun addCustomGoodLockModule(packageName: String) {
+    /**
+     * Authenticates Emergency Exit using a solved challenge token (supports both PIN and Random Text Challenge).
+     */
+    fun authenticateAndTriggerEmergencyExitWithToken(token: String): Boolean {
+        if (StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)) {
+            resetFailedAttempts()
+            safeLogI("Emergency Exit authorized via challenge token. Deactivating Essential Mode until next daily reset.")
+            val current = _state.value
+            val updated = current.copy(
+                isEmergencyExitActive = true,
+                emergencyExitEpochMillis = System.currentTimeMillis(),
+                status = EssentialModeStatus.EMERGENCY_EXIT_ACTIVE
+            )
+            _state.value = updated
+            persistState(updated)
+            return true
+        }
+        return false
+    }
+
+    fun addCustomGoodLockModule(packageName: String, token: String? = null): Boolean {
         val current = _state.value
-        val newSet = HashSet(current.customGoodLockModules).apply { add(packageName.trim()) }
+        if (current.status == EssentialModeStatus.ACTIVE) {
+            safeLogW("Cannot register custom Good Lock module while Essential Mode is ACTIVE")
+            return false
+        }
+
+        if (isStrictActive()) {
+            val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
+            if (!valid) {
+                safeLogW("Attempted to register custom Good Lock module without valid Strict Mode authorization token")
+                return false
+            }
+        }
+
+        val pkg = packageName.trim()
+        val resolver = runCatching { TakeBackApplication.essentialModeExemptionResolver }.getOrNull()
+        if (resolver != null && !resolver.isValidGoodLockCandidate(pkg)) {
+            safeLogW("Rejected registration: $pkg is not a valid installed Samsung Good Lock module")
+            return false
+        }
+
+        val newSet = HashSet(current.customGoodLockModules).apply { add(pkg) }
         val updated = current.copy(customGoodLockModules = newSet)
         _state.value = updated
         persistState(updated)
+        return true
     }
 
-    fun removeCustomGoodLockModule(packageName: String) {
+    fun removeCustomGoodLockModule(packageName: String, token: String? = null): Boolean {
         val current = _state.value
+        if (current.status == EssentialModeStatus.ACTIVE) {
+            safeLogW("Cannot remove custom Good Lock module while Essential Mode is ACTIVE")
+            return false
+        }
+
+        if (isStrictActive()) {
+            val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
+            if (!valid) {
+                safeLogW("Attempted to remove custom Good Lock module without valid Strict Mode authorization token")
+                return false
+            }
+        }
+
         val newSet = HashSet(current.customGoodLockModules).apply { remove(packageName.trim()) }
         val updated = current.copy(customGoodLockModules = newSet)
         _state.value = updated
         persistState(updated)
+        return true
     }
 }

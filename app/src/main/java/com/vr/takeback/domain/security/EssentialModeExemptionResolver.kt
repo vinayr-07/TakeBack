@@ -55,6 +55,8 @@ data class ExemptionDiagnosticSummary(
     val detectedGoodLockModules: List<GoodLockModuleDiagnostic>,
     val systemAppExemptionCount: Int,
     val updatedSystemAppExemptionCount: Int,
+    val systemAppPackagesList: List<String> = emptyList(),
+    val isPackageEnumerationSuccessful: Boolean = true,
     val backgroundExecutionGuaranteed: Boolean = true,
     val unverifiedPackages: List<String> = emptyList()
 )
@@ -291,9 +293,16 @@ class EssentialModeExemptionResolver(
      * Determines whether an installed application is eligible to be selected as
      * the single additional application.
      * Prevents selecting games, video streaming, entertainment, or social media.
+     * Also verifies that the package is actually installed.
      */
     fun isEligibleAdditionalApp(packageName: String): Boolean {
         val pkg = packageName.lowercase().trim()
+        if (pkg.isEmpty()) return false
+
+        val installed = packageInfoProvider.getInstalledPackages()
+        if (installed.isNotEmpty() && !installed.contains(packageName.trim())) {
+            return false
+        }
 
         // Core and system apps don't need to be selected as additional app
         if (isCoreEssentialPackage(pkg) || isSystemApplication(pkg) || isGoodLockModule(pkg)) {
@@ -307,7 +316,9 @@ class EssentialModeExemptionResolver(
             // CATEGORY_GAME = 0
             // CATEGORY_AUDIO = 1
             // CATEGORY_VIDEO = 2
-            if (category == 0 || category == 1 || category == 2) {
+            // CATEGORY_IMAGE = 3
+            // CATEGORY_SOCIAL = 4
+            if (category == 0 || category == 1 || category == 2 || category == 3 || category == 4) {
                 return false
             }
         }
@@ -323,6 +334,45 @@ class EssentialModeExemptionResolver(
     }
 
     fun canSelectAsAdditionalApp(packageName: String): Boolean = isEligibleAdditionalApp(packageName)
+
+    /**
+     * Verifies whether a candidate package name is a legitimate Samsung Good Lock module
+     * before allowing it to be registered in the custom allowlist.
+     * Prevents arbitrary distracting apps (e.g. Instagram, TikTok, Games) from being registered as Good Lock.
+     */
+    fun isValidGoodLockCandidate(packageName: String): Boolean {
+        val pkg = packageName.lowercase().trim()
+        if (pkg.isEmpty()) return false
+
+        // 1. Must be installed on the device (if package enumeration is available)
+        val installed = packageInfoProvider.getInstalledPackages()
+        if (installed.isNotEmpty() && !installed.contains(packageName.trim())) {
+            return false
+        }
+
+        // 2. Reject core essential apps or general system apps
+        if (isCoreEssentialPackage(pkg) || isSystemApplication(pkg)) {
+            return false
+        }
+
+        // 3. Reject games, streaming, and social media
+        val category = packageInfoProvider.getApplicationCategory(pkg)
+        if (category != null && (category == 0 || category == 1 || category == 2 || category == 3 || category == 4)) {
+            return false
+        }
+
+        for (pattern in INELIGIBLE_PACKAGE_SUBSTRINGS) {
+            if (pkg.contains(pattern)) {
+                return false
+            }
+        }
+
+        // 4. Must be a Samsung official package namespace or recognized Good Lock module
+        val isSamsungNamespace = pkg.startsWith("com.samsung.") || pkg.startsWith("com.sec.")
+        val isKnownModule = KNOWN_GOOD_LOCK_MODULES.containsKey(packageName.trim())
+
+        return isSamsungNamespace || isKnownModule
+    }
 
     /**
      * Returns the full set of currently effective exempt packages for snapshot evaluation.
@@ -415,15 +465,19 @@ class EssentialModeExemptionResolver(
             )
         }
 
+        val systemPackagesList = mutableListOf<String>()
         var systemAppCount = 0
         var updatedSystemAppCount = 0
         for (pkg in installed) {
             if (packageInfoProvider.isUpdatedSystemApp(pkg)) {
                 updatedSystemAppCount++
+                systemPackagesList.add(pkg)
             } else if (packageInfoProvider.isSystemApp(pkg)) {
                 systemAppCount++
+                systemPackagesList.add(pkg)
             }
         }
+        systemPackagesList.sort()
 
         return ExemptionDiagnosticSummary(
             coreApplications = coreStatus,
@@ -436,6 +490,8 @@ class EssentialModeExemptionResolver(
             detectedGoodLockModules = moduleDiagnostics,
             systemAppExemptionCount = systemAppCount,
             updatedSystemAppExemptionCount = updatedSystemAppCount,
+            systemAppPackagesList = systemPackagesList,
+            isPackageEnumerationSuccessful = installed.isNotEmpty(),
             backgroundExecutionGuaranteed = true,
             unverifiedPackages = emptyList()
         )

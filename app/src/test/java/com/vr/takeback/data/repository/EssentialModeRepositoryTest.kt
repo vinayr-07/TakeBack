@@ -157,6 +157,109 @@ class EssentialModeRepositoryTest {
         val appChanged = repository.setSelectedAdditionalPackage("com.some.other.app")
         assertFalse("Cannot change additional app while Essential Mode is active", appChanged)
         assertEquals("com.openai.chatgpt", repository.state.value.selectedAdditionalPackage)
+
+        // Toggling off while ACTIVE must be rejected
+        val toggledOff = repository.setEnabled(false)
+        assertFalse("Cannot toggle off Essential Mode while ACTIVE", toggledOff)
+        assertTrue(repository.state.value.isEnabled)
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+    }
+
+    @Test
+    fun testLatchInvariant_remainsActive_evenIfReportedUsageDrops() {
+        repository.setEnabled(true)
+        repository.setDailyAllowanceMinutes(60)
+
+        // Threshold reached -> ACTIVE
+        assertTrue(repository.isCurrentlyActive(65))
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+
+        // Subsequent query reports 0 or low delta (e.g. cold restart / transient error)
+        assertTrue("Latch invariant: must stay ACTIVE when reported usage drops to 0", repository.isCurrentlyActive(0))
+        assertTrue("Latch invariant: must stay ACTIVE when reported usage drops below allowance", repository.isCurrentlyActive(30))
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+    }
+
+    @Test
+    fun testSetEnabled_requiresConfiguredPin() {
+        // Setup repository without a configured PIN
+        val unconfiguredState = StrictProtectionState(
+            isGlobalStrictActive = false,
+            saltBase64 = null,
+            passwordHash = null
+        )
+        val unconfiguredStrictRepo = StrictModeRepository(initialState = unconfiguredState)
+        val repoWithoutPin = EssentialModeRepository(
+            context = null,
+            strictModeRepoProvider = { unconfiguredStrictRepo },
+            isStrictActiveProvider = { false }
+        )
+
+        assertFalse("hasConfiguredPin() must return false when no PIN is set", repoWithoutPin.hasConfiguredPin())
+        val enableResult = repoWithoutPin.setEnabled(true)
+        assertFalse("Enabling Essential Mode without a configured Strict Mode PIN must be rejected", enableResult)
+        assertFalse(repoWithoutPin.state.value.isEnabled)
+    }
+
+    @Test
+    fun testRateLimiting_lockoutAfterFiveFailedAttempts() {
+        repository.setEnabled(true)
+        repository.setDailyAllowanceMinutes(60)
+        repository.isCurrentlyActive(70)
+
+        assertFalse(repository.isRateLimited())
+        assertEquals(0, repository.getLockoutRemainingSeconds())
+
+        // 4 failed attempts: not yet locked out
+        for (i in 1..4) {
+            val ok = repository.authenticateAndTriggerEmergencyExit("wrong_$i")
+            assertFalse(ok)
+            assertFalse(repository.isRateLimited())
+        }
+
+        // 5th failed attempt: triggers lockout
+        val fifthAttempt = repository.authenticateAndTriggerEmergencyExit("wrong_5")
+        assertFalse(fifthAttempt)
+        assertTrue("Must be rate limited after 5 failed attempts", repository.isRateLimited())
+        assertTrue("Remaining lockout must be > 0", repository.getLockoutRemainingSeconds() > 0)
+
+        // While locked out, even the correct PIN is rejected immediately
+        val blockedCorrectPin = repository.authenticateAndTriggerEmergencyExit("1234")
+        assertFalse("Must reject authentication during lockout period", blockedCorrectPin)
+    }
+
+    @Test
+    fun testEmergencyExit_withChallengeToken() {
+        repository.setEnabled(true)
+        repository.setDailyAllowanceMinutes(60)
+        repository.isCurrentlyActive(70)
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+
+        // Invalid token
+        val invalidTokenResult = repository.authenticateAndTriggerEmergencyExitWithToken("invalid-token")
+        assertFalse(invalidTokenResult)
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+
+        // Valid token issued by StrictMutationGate
+        val validToken = StrictMutationGate.issueToken(MutationType.UPDATE_ESSENTIAL_MODE)
+        val validTokenResult = repository.authenticateAndTriggerEmergencyExitWithToken(validToken)
+        assertTrue("Emergency Exit with valid token must succeed", validTokenResult)
+        assertTrue(repository.state.value.isEmergencyExitActive)
+        assertEquals(EssentialModeStatus.EMERGENCY_EXIT_ACTIVE, repository.state.value.status)
+    }
+
+    @Test
+    fun testCustomGoodLock_mutationGateAndActiveProtection() {
+        // Disallowed while ACTIVE
+        repository.setEnabled(true)
+        repository.setDailyAllowanceMinutes(60)
+        repository.isCurrentlyActive(70)
+        assertEquals(EssentialModeStatus.ACTIVE, repository.state.value.status)
+
+        val addWhileActive = repository.addCustomGoodLockModule("com.samsung.android.test")
+        assertFalse("Cannot add custom Good Lock module while ACTIVE", addWhileActive)
+        val removeWhileActive = repository.removeCustomGoodLockModule("com.samsung.android.test")
+        assertFalse("Cannot remove custom Good Lock module while ACTIVE", removeWhileActive)
     }
 
     @Test

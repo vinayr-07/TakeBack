@@ -42,6 +42,8 @@ class BlockShieldActivity : ComponentActivity() {
         val isSettingsShield = intent.getBooleanExtra("EXTRA_IS_SETTINGS_SHIELD", false)
         val isEssentialShield = intent.getBooleanExtra("EXTRA_IS_ESSENTIAL_SHIELD", false)
         val targetLabel = intent.getStringExtra("EXTRA_TARGET_LABEL")
+        val rawAllowanceMins = intent.getIntExtra("EXTRA_ALLOWANCE_MINS", 0)
+        val rawUsedMins = intent.getIntExtra("EXTRA_USED_MINS", 0)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -62,8 +64,24 @@ class BlockShieldActivity : ComponentActivity() {
                 ) {
                     val strictRepo = TakeBackApplication.strictModeRepository
                     val strictState by strictRepo.protectionState.collectAsState()
+                    val essentialRepo = remember { TakeBackApplication.essentialModeRepository }
+                    val essentialState by essentialRepo.state.collectAsState()
+
+                    val allowanceMins = if (rawAllowanceMins > 0) rawAllowanceMins else essentialState.dailyAllowanceMinutes
+                    val usedMins = if (rawUsedMins > 0) rawUsedMins else essentialState.usageAtActivationMinutes
+
                     var showAuthDialog by remember { mutableStateOf(false) }
-                    var showEmergencyExitDialog by remember { mutableStateOf(false) }
+                    var showEmergencyExitPinDialog by remember { mutableStateOf(false) }
+                    var showEmergencyExitChallengeDialog by remember { mutableStateOf(false) }
+                    var rateLimitTick by remember { mutableStateOf(0) }
+
+                    // Lockout countdown tick
+                    LaunchedEffect(showEmergencyExitPinDialog, rateLimitTick) {
+                        if (essentialRepo.isRateLimited()) {
+                            kotlinx.coroutines.delay(1000L)
+                            rateLimitTick++
+                        }
+                    }
 
                     BlockShieldContent(
                         appName = appName,
@@ -72,6 +90,11 @@ class BlockShieldActivity : ComponentActivity() {
                         isSettingsShield = isSettingsShield,
                         isEssentialShield = isEssentialShield,
                         targetLabel = targetLabel,
+                        allowanceMinutes = allowanceMins,
+                        usedMinutes = usedMins,
+                        selectedAdditionalPackage = essentialState.selectedAdditionalPackage,
+                        isRateLimited = essentialRepo.isRateLimited(),
+                        lockoutRemainingSeconds = essentialRepo.getLockoutRemainingSeconds(),
                         onGoHomeClick = {
                             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                                 addCategory(Intent.CATEGORY_HOME)
@@ -84,60 +107,99 @@ class BlockShieldActivity : ComponentActivity() {
                             showAuthDialog = true
                         },
                         onEmergencyExitClick = {
-                            showEmergencyExitDialog = true
+                            if (strictState.mechanism == com.vr.takeback.domain.model.StrictMechanism.TEXT_CHALLENGE) {
+                                showEmergencyExitChallengeDialog = true
+                            } else {
+                                showEmergencyExitPinDialog = true
+                            }
                         }
                     )
 
-                    if (showEmergencyExitDialog) {
+                    if (showEmergencyExitPinDialog) {
                         var enteredPin by remember { mutableStateOf("") }
                         var pinError by remember { mutableStateOf<String?>(null) }
+                        val isLockedOut = essentialRepo.isRateLimited()
+                        val lockoutRemaining = essentialRepo.getLockoutRemainingSeconds()
 
                         AlertDialog(
-                            onDismissRequest = { showEmergencyExitDialog = false },
+                            onDismissRequest = { showEmergencyExitPinDialog = false },
                             icon = { Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
                             title = { Text("Emergency Exit", fontWeight = FontWeight.Bold) },
                             text = {
                                 Column {
                                     Text(
-                                        "Authenticate with your existing Strict Mode PIN to pause Essential Mode for the remainder of today. " +
-                                                "Daily usage monitoring will continue, and restrictions will automatically resume at the next daily reset.",
+                                        "Authenticate with your Strict Mode PIN to pause Essential Mode for the remainder of today. " +
+                                                "Restrictions will automatically resume at tomorrow's daily reset.",
                                         style = MaterialTheme.typography.bodyMedium
                                     )
                                     Spacer(modifier = Modifier.height(16.dp))
-                                    OutlinedTextField(
-                                        value = enteredPin,
-                                        onValueChange = { enteredPin = it; pinError = null },
-                                        label = { Text("Strict Mode PIN") },
-                                        isError = pinError != null,
-                                        supportingText = pinError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
-                                        visualTransformation = PasswordVisualTransformation(),
-                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                                        singleLine = true,
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
+
+                                    if (isLockedOut) {
+                                        Text(
+                                            "Too many failed attempts. Locked out for $lockoutRemaining seconds.",
+                                            color = MaterialTheme.colorScheme.error,
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                    } else {
+                                        OutlinedTextField(
+                                            value = enteredPin,
+                                            onValueChange = { enteredPin = it; pinError = null },
+                                            label = { Text("Strict Mode PIN") },
+                                            isError = pinError != null,
+                                            supportingText = pinError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
+                                            visualTransformation = PasswordVisualTransformation(),
+                                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                                            singleLine = true,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    }
                                 }
                             },
                             confirmButton = {
                                 Button(
                                     onClick = {
-                                        val success = TakeBackApplication.essentialModeRepository.authenticateAndTriggerEmergencyExit(enteredPin)
+                                        if (isLockedOut) return@Button
+                                        val success = essentialRepo.authenticateAndTriggerEmergencyExit(enteredPin)
                                         if (success) {
-                                            showEmergencyExitDialog = false
+                                            showEmergencyExitPinDialog = false
                                             finish()
                                         } else {
-                                            pinError = "Incorrect Strict Mode PIN."
+                                            pinError = if (essentialRepo.isRateLimited()) {
+                                                "Too many failed attempts. Locked out for ${essentialRepo.getLockoutRemainingSeconds()}s."
+                                            } else {
+                                                "Incorrect Strict Mode PIN."
+                                            }
                                         }
                                     },
+                                    enabled = !isLockedOut && enteredPin.isNotBlank(),
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                 ) {
                                     Text("Authorize Exit")
                                 }
                             },
                             dismissButton = {
-                                TextButton(onClick = { showEmergencyExitDialog = false }) {
+                                TextButton(onClick = { showEmergencyExitPinDialog = false }) {
                                     Text("Cancel")
                                 }
                             }
+                        )
+                    }
+
+                    if (showEmergencyExitChallengeDialog) {
+                        StrictChallengeDialog(
+                            mechanism = strictState.mechanism,
+                            saltBase64 = strictState.saltBase64,
+                            expectedHash = strictState.passwordHash,
+                            mutationType = com.vr.takeback.domain.security.MutationType.UPDATE_ESSENTIAL_MODE,
+                            onTokenIssued = { token ->
+                                val success = essentialRepo.authenticateAndTriggerEmergencyExitWithToken(token)
+                                if (success) {
+                                    showEmergencyExitChallengeDialog = false
+                                    finish()
+                                }
+                            },
+                            onDismissRequest = { showEmergencyExitChallengeDialog = false }
                         )
                     }
 
@@ -176,6 +238,11 @@ fun BlockShieldContent(
     isSettingsShield: Boolean = false,
     isEssentialShield: Boolean = false,
     targetLabel: String? = null,
+    allowanceMinutes: Int = 0,
+    usedMinutes: Int = 0,
+    selectedAdditionalPackage: String? = null,
+    isRateLimited: Boolean = false,
+    lockoutRemainingSeconds: Int = 0,
     onGoHomeClick: () -> Unit,
     onAuthenticateClick: () -> Unit = {},
     onEmergencyExitClick: () -> Unit = {}
@@ -183,13 +250,13 @@ fun BlockShieldContent(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(28.dp),
+            .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
         Box(
             modifier = Modifier
-                .size(88.dp)
+                .size(76.dp)
                 .clip(CircleShape)
                 .background(
                     if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.errorContainer
@@ -201,25 +268,25 @@ fun BlockShieldContent(
                 imageVector = if (isSettingsShield || isEssentialShield) Icons.Filled.Lock else Icons.Filled.Shield,
                 contentDescription = null,
                 tint = if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(48.dp)
+                modifier = Modifier.size(42.dp)
             )
         }
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
         Text(
             text = when {
-                isEssentialShield -> "Daily Allowance Reached"
+                isEssentialShield -> "Daily Allowance Exhausted"
                 isSettingsShield -> (targetLabel ?: "Settings Access Locked")
                 else -> "$appName is Paused"
             },
-            style = MaterialTheme.typography.displayMedium,
+            style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground,
             textAlign = TextAlign.Center
         )
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         Badge(
             containerColor = if (isSettingsShield || isEssentialShield) MaterialTheme.colorScheme.errorContainer
@@ -239,50 +306,131 @@ fun BlockShieldContent(
             )
         }
 
-        Spacer(modifier = Modifier.height(20.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surface
-            )
-        ) {
-            Column(
-                modifier = Modifier.padding(20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+        if (isEssentialShield) {
+            // Essential Mode Usage Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Filled.HourglassTop,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp)
+                Column(modifier = Modifier.padding(16.dp)) {
+                    val usedH = usedMinutes / 60
+                    val usedM = usedMinutes % 60
+                    val allowH = allowanceMinutes / 60
+                    val allowM = allowanceMinutes % 60
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("Today's Screen Time", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${usedH}h ${usedM}m", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("Daily Allowance", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${allowH}h ${allowM}m", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    val progress = if (allowanceMinutes > 0) (usedMinutes.toFloat() / allowanceMinutes.toFloat()).coerceIn(0f, 1f) else 1f
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                        color = MaterialTheme.colorScheme.error,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text("Available Applications:", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelMedium)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf("Phone", "SMS", "Camera", "WhatsApp").forEach { appTitle ->
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
+                            ) {
+                                Text(
+                                    text = appTitle,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+                    if (!selectedAdditionalPackage.isNullOrEmpty()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        val cleanAppName = selectedAdditionalPackage.substringAfterLast('.').replaceFirstChar { it.uppercase() }
+                        Text(
+                            text = "+ User-Selected App: $cleanAppName ($selectedAdditionalPackage)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Restriction In Effect",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold
+                        text = "Samsung One Hand Operation+ gestures and Good Lock modules remain operational.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = reason,
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = TextAlign.Center,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            }
+        } else {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Filled.HourglassTop,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Restriction In Effect",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = reason,
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         Button(
             onClick = onGoHomeClick,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(54.dp),
+                .height(52.dp),
             shape = RoundedCornerShape(14.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.primary,
@@ -293,12 +441,12 @@ fun BlockShieldContent(
         }
 
         if (isSettingsShield) {
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
             OutlinedButton(
                 onClick = onAuthenticateClick,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(54.dp),
+                    .height(52.dp),
                 shape = RoundedCornerShape(14.dp)
             ) {
                 Text("Authenticate for Settings Access", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
@@ -306,18 +454,23 @@ fun BlockShieldContent(
         }
 
         if (isEssentialShield) {
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
             OutlinedButton(
                 onClick = onEmergencyExitClick,
+                enabled = !isRateLimited,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(54.dp),
+                    .height(52.dp),
                 shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
             ) {
                 Icon(Icons.Filled.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Emergency Exit", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text(
+                    text = if (isRateLimited) "Emergency Exit Locked (${lockoutRemainingSeconds}s)" else "Emergency Exit",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp
+                )
             }
         }
     }

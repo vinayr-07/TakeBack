@@ -218,6 +218,58 @@ class EssentialModeExemptionResolverTest {
         assertTrue("Custom registered Good Lock module must become exempt", decision.isExempt)
         assertEquals(ExemptionCategory.SAMSUNG_GOOD_LOCK, decision.category)
     }
+
+    // 18. Android CATEGORY_SOCIAL (4) and uninstalled packages are rejected
+    @Test
+    fun scenario18_categorySocial_and_uninstalled_rejected() {
+        val installedProductivityApp = "com.app.notes"
+        val installedSocialApp = "com.custom.socialnetwork"
+        val uninstalledApp = "com.ghost.app"
+
+        fakeProvider.installed.add(installedProductivityApp)
+        fakeProvider.installed.add(installedSocialApp)
+        // Set Android ApplicationInfo.CATEGORY_SOCIAL = 4
+        fakeProvider.appCategories[installedSocialApp] = 4
+
+        assertTrue("Installed productivity app must be eligible", resolver.canSelectAsAdditionalApp(installedProductivityApp))
+        assertFalse("App with CATEGORY_SOCIAL (4) must be rejected", resolver.canSelectAsAdditionalApp(installedSocialApp))
+        assertFalse("Uninstalled app must be rejected when package enumeration is active", resolver.canSelectAsAdditionalApp(uninstalledApp))
+    }
+
+    // 19. Candidate validation for custom Good Lock modules
+    @Test
+    fun scenario19_isValidGoodLockCandidate() {
+        val installedSamsungModule = "com.samsung.android.newnav"
+        val installedThirdPartyApp = "com.spotify.music"
+        val uninstalledSamsungModule = "com.samsung.android.uninstalled"
+
+        fakeProvider.installed.add(installedSamsungModule)
+        fakeProvider.installed.add(installedThirdPartyApp)
+
+        assertTrue("Installed Samsung namespace package must be a valid candidate", resolver.isValidGoodLockCandidate(installedSamsungModule))
+        assertFalse("Third party non-Samsung app must be rejected as Good Lock candidate", resolver.isValidGoodLockCandidate(installedThirdPartyApp))
+        assertFalse("Uninstalled package must be rejected as Good Lock candidate", resolver.isValidGoodLockCandidate(uninstalledSamsungModule))
+    }
+
+    // 20. Diagnostic summary system package transparency
+    @Test
+    fun scenario20_diagnosticSummary_systemPackages_transparency() {
+        val sys1 = "com.android.settings"
+        val sys2 = "com.android.systemui"
+        val updatedSys = "com.google.android.webview"
+
+        fakeProvider.installed.addAll(listOf(sys1, sys2, updatedSys))
+        fakeProvider.systemPackages.add(sys1)
+        fakeProvider.systemPackages.add(sys2)
+        fakeProvider.updatedSystemPackages.add(updatedSys)
+
+        val summary = resolver.getDiagnosticSummary()
+        assertTrue("Package enumeration must be marked successful", summary.isPackageEnumerationSuccessful)
+        assertEquals(2, summary.systemAppExemptionCount)
+        assertEquals(1, summary.updatedSystemAppExemptionCount)
+        assertTrue("System packages list must contain com.android.settings", summary.systemAppPackagesList.contains("com.android.settings"))
+        assertTrue("System packages list must contain com.google.android.webview", summary.systemAppPackagesList.contains("com.google.android.webview"))
+    }
 }
 
 class FakePackageInfoProvider : PackageInfoProvider {
@@ -239,6 +291,6 @@ class FakePackageInfoProvider : PackageInfoProvider {
     override fun getCameraPackages(): Set<String> = cameras
     override fun getHomeLauncherPackages(): Set<String> = launchers
     override fun getInputMethodPackages(): Set<String> = imes
-    override fun getInstalledPackages(): Set<String> = installed
+    override fun getInstalledPackages(): Set<String> = if (installed.isEmpty() && (systemPackages.isNotEmpty() || updatedSystemPackages.isNotEmpty())) systemPackages + updatedSystemPackages else installed
     override fun getApplicationCategory(packageName: String): Int? = appCategories[packageName]
 }
