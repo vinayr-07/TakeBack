@@ -154,6 +154,14 @@ class EssentialModeExemptionResolver(
             "android"
         )
 
+        // Disqualified package substrings for automatic system application exemption.
+        // Prevents OEM preinstalled bloatware (Gallery, Videos, File Managers, Browsers)
+        // with FLAG_SYSTEM from evading Essential Mode restrictions.
+        val DISQUALIFIED_SYSTEM_PACKAGE_SUBSTRINGS = setOf(
+            "gallery", "photos", "video", "videoplayer", "mediaplayer",
+            "myfiles", "filemanager", "documentsui", "sbrowser", "browser", "chrome"
+        )
+
         // Ineligible package substrings for additional application selection
         private val INELIGIBLE_PACKAGE_SUBSTRINGS = setOf(
             "instagram", "tiktok", "musically", "zhiliaoapp", "facebook", "katana", "snapchat", "twitter",
@@ -305,14 +313,34 @@ class EssentialModeExemptionResolver(
     /**
      * Returns true if package is an Android system or updated system app,
      * or essential system component (Settings, UI, Launcher, IME, etc.).
+     * Crucially: Disqualifies OEM bloatware, galleries, video players, file managers,
+     * and browsers that may have FLAG_SYSTEM set on OEM ROMs (e.g. Samsung OneUI).
      */
     fun isSystemApplication(packageName: String): Boolean {
-        if (ESSENTIAL_ANDROID_SYSTEM_PACKAGES.contains(packageName)) return true
-        if (packageInfoProvider.getHomeLauncherPackages().contains(packageName)) return true
-        if (packageInfoProvider.getInputMethodPackages().contains(packageName)) return true
-        if (packageInfoProvider.isSystemApp(packageName)) return true
-        if (packageInfoProvider.isUpdatedSystemApp(packageName)) return true
-        return false
+        val trimmed = packageName.trim()
+        if (ESSENTIAL_ANDROID_SYSTEM_PACKAGES.contains(trimmed)) return true
+        if (packageInfoProvider.getHomeLauncherPackages().contains(trimmed)) return true
+        if (packageInfoProvider.getInputMethodPackages().contains(trimmed)) return true
+
+        val isSys = packageInfoProvider.isSystemApp(trimmed) || packageInfoProvider.isUpdatedSystemApp(trimmed)
+        if (!isSys) return false
+
+        val lowerPkg = trimmed.lowercase()
+        for (pattern in DISQUALIFIED_SYSTEM_PACKAGE_SUBSTRINGS) {
+            if (lowerPkg.contains(pattern)) {
+                return false
+            }
+        }
+        if (lowerPkg.endsWith(".files") || lowerPkg.endsWith(".gallery")) {
+            return false
+        }
+
+        val category = packageInfoProvider.getApplicationCategory(trimmed)
+        if (category != null && category in 0..4) {
+            return false
+        }
+
+        return true
     }
 
     /**
@@ -463,7 +491,7 @@ class EssentialModeExemptionResolver(
         exempt.addAll(packageInfoProvider.getInputMethodPackages())
 
         for (pkg in installed) {
-            if (packageInfoProvider.isSystemApp(pkg) || packageInfoProvider.isUpdatedSystemApp(pkg)) {
+            if (isSystemApplication(pkg)) {
                 exempt.add(pkg)
             }
         }
@@ -520,12 +548,14 @@ class EssentialModeExemptionResolver(
         var systemAppCount = 0
         var updatedSystemAppCount = 0
         for (pkg in installed) {
-            if (packageInfoProvider.isUpdatedSystemApp(pkg)) {
-                updatedSystemAppCount++
-                systemPackagesList.add(pkg)
-            } else if (packageInfoProvider.isSystemApp(pkg)) {
-                systemAppCount++
-                systemPackagesList.add(pkg)
+            if (isSystemApplication(pkg)) {
+                if (packageInfoProvider.isUpdatedSystemApp(pkg)) {
+                    updatedSystemAppCount++
+                    systemPackagesList.add(pkg)
+                } else if (packageInfoProvider.isSystemApp(pkg)) {
+                    systemAppCount++
+                    systemPackagesList.add(pkg)
+                }
             }
         }
         systemPackagesList.sort()

@@ -6,11 +6,16 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.data.repository.ValidatedUsageSnapshot
 import com.vr.takeback.domain.engine.CentralRestrictionEngine
@@ -20,6 +25,7 @@ import com.vr.takeback.domain.model.BlockReason
 import com.vr.takeback.domain.model.BlockTarget
 import com.vr.takeback.domain.model.EventType
 import com.vr.takeback.domain.model.FocusSessionState
+import com.vr.takeback.domain.model.Profile
 import com.vr.takeback.domain.security.RealAccessibilityNodeSnapshot
 import com.vr.takeback.domain.security.SettingsDestination
 import com.vr.takeback.domain.security.SettingsProtectionManager
@@ -273,14 +279,6 @@ class TakeBackAccessibilityService : AccessibilityService() {
      * Invoked at schedule boundaries so restrictions begin/end immediately without waiting for app switch.
      */
     fun reEvaluateCurrentForegroundApp() {
-        val currentPkg = sessionTracker.currentPackage ?: return
-        if (currentPkg == applicationContext.packageName ||
-            currentPkg == "com.android.systemui" ||
-            currentPkg.contains("launcher", ignoreCase = true)
-        ) {
-            return
-        }
-
         val now = System.currentTimeMillis()
         val localTime = LocalTime.now()
         val dayOfWeek = LocalDate.now().dayOfWeek
@@ -330,6 +328,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val activeFocusProfileId = focusSession?.activeProfileId
         val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
 
+        val currentPkg = sessionTracker.currentPackage ?: ""
         val snapshot = SystemContextSnapshot(
             timestampMillis = now,
             localTime = localTime,
@@ -353,6 +352,19 @@ class TakeBackAccessibilityService : AccessibilityService() {
             essentialModeExemptPackages = exempt
         )
 
+        // Audit all active windows first (Multi-Window Split-Screen, Pop-up View, and PiP)
+        if (auditAllActiveWindows(activeProfiles, snapshot, now)) {
+            return
+        }
+
+        if (currentPkg.isEmpty() ||
+            currentPkg == applicationContext.packageName ||
+            currentPkg == "com.android.systemui" ||
+            currentPkg.contains("launcher", ignoreCase = true)
+        ) {
+            return
+        }
+
         val decision = engine.evaluate(activeProfiles, snapshot)
         if (decision is BlockDecision.Blocked) {
             Log.i(TAG, "Schedule boundary immediate block for $currentPkg: ${decision.reason} (Profile: ${decision.triggeringProfileName})")
@@ -360,6 +372,112 @@ class TakeBackAccessibilityService : AccessibilityService() {
             lastBlockedTimestamp = now
             handleBlockDecision(decision)
         }
+    }
+
+    /**
+     * Immediately pauses background media/video audio playback across the device
+     * by requesting transient audio focus from AudioManager.
+     */
+    private fun requestMediaAudioFocusPause() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .build()
+                audioManager.requestAudioFocus(focusRequest)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to request media audio focus pause", e)
+        }
+    }
+
+    /**
+     * Audits all currently visible interactive windows (including Split-Screen, Freeform / Pop-up view,
+     * and Picture-in-Picture) to ensure restricted applications cannot be run in multi-window or floating modes.
+     *
+     * Returns true if a blocked window was detected and handled.
+     */
+    private fun auditAllActiveWindows(
+        activeProfiles: List<Profile>,
+        baseSnapshot: SystemContextSnapshot,
+        now: Long
+    ): Boolean {
+        val currentWindows = try {
+            windows
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to query interactive windows hierarchy", e)
+            null
+        }
+
+        if (currentWindows.isNullOrEmpty()) {
+            return false
+        }
+
+        for (window in currentWindows) {
+            val isPiP = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && window.isInPictureInPictureMode
+            val isAppWindow = window.type == AccessibilityWindowInfo.TYPE_APPLICATION
+
+            if (!isAppWindow && !isPiP) {
+                continue
+            }
+
+            val rootNode = try {
+                window.root
+            } catch (e: Exception) {
+                null
+            } ?: continue
+
+            val windowPkg = rootNode.packageName?.toString() ?: continue
+            if (windowPkg.isBlank() ||
+                windowPkg == applicationContext.packageName ||
+                windowPkg == "com.android.systemui" ||
+                windowPkg.contains("launcher", ignoreCase = true)
+            ) {
+                continue
+            }
+
+            // Evaluate this specific window's package against active restrictions
+            val windowSnapshot = baseSnapshot.copy(
+                foregroundPackageName = windowPkg,
+                activeBrowserUrl = if (SUPPORTED_BROWSERS.contains(windowPkg)) extractBrowserUrl(rootNode) else null
+            )
+
+            val decision = engine.evaluate(activeProfiles, windowSnapshot)
+            if (decision is BlockDecision.Blocked) {
+                Log.i(TAG, "Multi-window / PiP restriction triggered for $windowPkg: ${decision.reason} (Profile: ${decision.triggeringProfileName}, isPiP: $isPiP)")
+
+                // If it is a Picture-in-Picture window, dismiss the PiP window directly
+                if (isPiP) {
+                    try {
+                        rootNode.performAction(AccessibilityNodeInfo.ACTION_DISMISS)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to dismiss PiP window for $windowPkg", e)
+                    }
+                }
+
+                // Halt background/video audio playback immediately
+                requestMediaAudioFocusPause()
+
+                // Collapse multi-window split-screen / pop-up view and return to launcher
+                performGlobalAction(GLOBAL_ACTION_HOME)
+
+                lastBlockedPackage = windowPkg
+                lastBlockedTimestamp = now
+                handleBlockDecision(decision)
+                return true
+            }
+        }
+
+        return false
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -384,7 +502,145 @@ class TakeBackAccessibilityService : AccessibilityService() {
         val isLauncherOrSystemUi = packageName == "com.android.systemui" ||
                 packageName.contains("launcher", ignoreCase = true)
 
-        // Early-return for launcher/systemUI packages (these cannot be blocked by profiles).
+        // Fetch live shared states from TakeBackApplication
+        val activeProfiles = try {
+            TakeBackApplication.profileRepository.profiles.value
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        val quickBlockState = try {
+            TakeBackApplication.quickBlockRepository.state.value
+        } catch (e: Exception) {
+            null
+        }
+
+        val isQuickBlockActive = quickBlockState?.isActive == true
+        val enabledProfiles = activeProfiles.filter { it.isEnabled }
+
+        val localTime = LocalTime.now()
+        val dayOfWeek = LocalDate.now().dayOfWeek
+        val hasEnforcingProfiles = enabledProfiles.any { profile ->
+            engine.isProfileCurrentlyEnforcing(profile, localTime, dayOfWeek)
+        }
+        val hasUsageLimitForApp = enabledProfiles.any { profile ->
+            profile.usageLimits.any { limit ->
+                limit.isEnabled && (limit.targetPackageName == null || limit.targetPackageName == packageName)
+            }
+        }
+
+        val essentialRepo = TakeBackApplication.essentialModeRepository
+        val essentialState = essentialRepo.state.value
+        val isEssentialEnabled = essentialState.isEnabled
+
+        val focusSession = try {
+            TakeBackApplication.focusSessionRepository.session.value
+        } catch (e: Exception) {
+            null
+        }
+        val isFocusSessionActive = focusSession?.state == FocusSessionState.FOCUS_RUNNING
+        val isBreakActive = focusSession?.state == FocusSessionState.BREAK_RUNNING
+        val activeFocusProfileId = focusSession?.activeProfileId
+        val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
+
+        val areAnyRestrictionsPotentiallyActive = hasEnforcingProfiles || isQuickBlockActive ||
+                hasUsageLimitForApp || isEssentialEnabled || isFocusSessionActive || isBreakActive
+
+        val quickBlockExpiry = if (isQuickBlockActive) {
+            quickBlockState!!.startEpochMillis + (quickBlockState.durationMinutes * 60 * 1000L)
+        } else null
+
+        val allConfiguredPackages = try {
+            TakeBackApplication.profileRepository.getAllRestrictedPackages(onlyEnabled = false)
+        } catch (e: Exception) {
+            emptySet()
+        }
+
+        val quickBlockPackages = if (isQuickBlockActive) {
+            if (quickBlockState?.targetPackages.isNullOrEmpty()) {
+                allConfiguredPackages.ifEmpty {
+                    setOf(
+                        "com.instagram.android",
+                        "com.zhiliaoapp.musically",
+                        "com.google.android.youtube",
+                        "com.reddit.frontpage",
+                        "com.twitter.android",
+                        "com.facebook.katana",
+                        "com.snapchat.android"
+                    )
+                }
+            } else {
+                quickBlockState!!.targetPackages
+            }
+        } else emptySet()
+
+        val activeSnapshot = try {
+            TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
+        } catch (e: Exception) {
+            null
+        }
+
+        val deviceScreenTimeMillis = activeSnapshot?.deviceScreenTimeMillis
+        val isDeviceScreenTimeAvailable = activeSnapshot?.isDeviceScreenTimeAvailable == true && deviceScreenTimeMillis != null
+        val totalDailyUsageMinutes = if (isDeviceScreenTimeAvailable) {
+            ((deviceScreenTimeMillis ?: 0L) / (60 * 1000L)).toInt()
+        } else {
+            ((activeSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / (60 * 1000L)).toInt()
+        }
+
+        val isEssentialModeActive = if (isEssentialEnabled) {
+            essentialRepo.isCurrentlyActive(
+                totalDailyUsageMinutes = totalDailyUsageMinutes,
+                isEnforcementAvailable = true,
+                isUsageMetricAvailable = isDeviceScreenTimeAvailable || (activeSnapshot?.isAvailable == true)
+            )
+        } else false
+
+        val essentialExemptPackages = if (isEssentialModeActive) {
+            TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+        } else emptySet()
+
+        val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
+
+        // Extract browser URL if inside a supported browser
+        val browserUrl = if (SUPPORTED_BROWSERS.contains(packageName)) {
+            extractBrowserUrl(rootInActiveWindow)
+        } else null
+
+        // Base context snapshot for restriction evaluation
+        val baseSnapshot = SystemContextSnapshot(
+            timestampMillis = now,
+            localTime = localTime,
+            dayOfWeek = dayOfWeek,
+            foregroundPackageName = packageName,
+            activeBrowserUrl = browserUrl,
+            accumulatedForegroundTimeMillis = activeSnapshot?.foregroundUsageByPackage ?: emptyMap(),
+            hourlyForegroundTimeMillis = activeSnapshot?.hourlyUsageByPackage ?: emptyMap(),
+            currentSessionDurationMillis = currentSessionDuration,
+            isUsageDataAvailable = activeSnapshot?.isAvailable ?: false,
+            usageDataQuality = activeSnapshot?.quality ?: com.vr.takeback.domain.usage.UsageDataQuality.UNKNOWN,
+            isFocusSessionActive = isFocusSessionActive,
+            isBreakActive = isBreakActive,
+            activeFocusSessionProfileId = activeFocusProfileId,
+            breakWhitelistApps = breakWhitelistApps,
+            isQuickBlockActive = isQuickBlockActive,
+            quickBlockExpirationEpochMillis = quickBlockExpiry,
+            quickBlockTargetPackages = quickBlockPackages,
+            isEssentialModeActive = isEssentialModeActive,
+            essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
+            essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
+            essentialModeExemptPackages = essentialExemptPackages
+        )
+
+        // Multi-Window & Floating Window (Split-Screen, Pop-up View, Picture-in-Picture) Audit:
+        // Audit all interactive windows whenever a window transition occurs or launcher is active
+        if (areAnyRestrictionsPotentiallyActive && (isWindowTransition || isLauncherOrSystemUi)) {
+            if (auditAllActiveWindows(activeProfiles, baseSnapshot, now)) {
+                return
+            }
+        }
+
+        // Early-return for launcher/systemUI packages when no blocked floating windows are active
         if (isLauncherOrSystemUi) {
             return
         }
@@ -435,49 +691,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Fetch live shared states from TakeBackApplication
-        val activeProfiles = try {
-            TakeBackApplication.profileRepository.profiles.value
-        } catch (e: Exception) {
-            emptyList()
-        }
-
-        val quickBlockState = try {
-            TakeBackApplication.quickBlockRepository.state.value
-        } catch (e: Exception) {
-            null
-        }
-
-        val isQuickBlockActive = quickBlockState?.isActive == true
-        val enabledProfiles = activeProfiles.filter { it.isEnabled }
-
-        // Core Invariance: If no profiles are enforcing, no usage limits apply, and Quick Block is off, allow all apps immediately
-        val localTime = LocalTime.now()
-        val dayOfWeek = LocalDate.now().dayOfWeek
-        val hasEnforcingProfiles = enabledProfiles.any { profile ->
-            engine.isProfileCurrentlyEnforcing(profile, localTime, dayOfWeek)
-        }
-        val hasUsageLimitForApp = enabledProfiles.any { profile ->
-            profile.usageLimits.any { limit ->
-                limit.isEnabled && (limit.targetPackageName == null || limit.targetPackageName == packageName)
-            }
-        }
-
-        val essentialRepo = TakeBackApplication.essentialModeRepository
-        val essentialState = essentialRepo.state.value
-        val isEssentialEnabled = essentialState.isEnabled
-
-        val focusSession = try {
-            TakeBackApplication.focusSessionRepository.session.value
-        } catch (e: Exception) {
-            null
-        }
-        val isFocusSessionActive = focusSession?.state == FocusSessionState.FOCUS_RUNNING
-        val isBreakActive = focusSession?.state == FocusSessionState.BREAK_RUNNING
-        val activeFocusProfileId = focusSession?.activeProfileId
-        val breakWhitelistApps = focusSession?.breakWhitelistApps ?: emptySet()
-
-        if (!hasEnforcingProfiles && !isQuickBlockActive && !hasUsageLimitForApp && !isEssentialEnabled && !isFocusSessionActive && !isBreakActive) {
+        if (!areAnyRestrictionsPotentiallyActive) {
             return
         }
 
@@ -501,93 +715,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Extract browser URL if inside a supported browser
-        val browserUrl = if (SUPPORTED_BROWSERS.contains(packageName)) {
-            extractBrowserUrl(rootInActiveWindow)
-        } else null
-
-        val quickBlockExpiry = if (isQuickBlockActive) {
-            quickBlockState!!.startEpochMillis + (quickBlockState.durationMinutes * 60 * 1000L)
-        } else null
-
-        val allConfiguredPackages = try {
-            TakeBackApplication.profileRepository.getAllRestrictedPackages(onlyEnabled = false)
-        } catch (e: Exception) {
-            emptySet()
-        }
-
-        val quickBlockPackages = if (isQuickBlockActive) {
-            if (quickBlockState?.targetPackages.isNullOrEmpty()) {
-                allConfiguredPackages.ifEmpty {
-                    setOf(
-                        "com.instagram.android",
-                        "com.zhiliaoapp.musically",
-                        "com.google.android.youtube",
-                        "com.reddit.frontpage",
-                        "com.twitter.android",
-                        "com.facebook.katana",
-                        "com.snapchat.android"
-                    )
-                }
-            } else {
-                quickBlockState!!.targetPackages
-            }
-        } else emptySet()
-
-        val activeSnapshot = try {
-            TakeBackApplication.usageStatsRepository.getActiveUsageSnapshot()
-        } catch (e: Exception) {
-            null
-        }
-
-        val deviceScreenTimeMillis = activeSnapshot?.deviceScreenTimeMillis
-        val isDeviceScreenTimeAvailable = activeSnapshot?.isDeviceScreenTimeAvailable == true && deviceScreenTimeMillis != null
-        val totalDailyUsageMinutes = if (isDeviceScreenTimeAvailable && deviceScreenTimeMillis != null) {
-            (deviceScreenTimeMillis / (60 * 1000L)).toInt()
-        } else {
-            ((activeSnapshot?.foregroundUsageByPackage?.values?.sumOf { it } ?: 0L) / (60 * 1000L)).toInt()
-        }
-
-        val isEssentialModeActive = if (isEssentialEnabled) {
-            essentialRepo.isCurrentlyActive(
-                totalDailyUsageMinutes = totalDailyUsageMinutes,
-                isEnforcementAvailable = true,
-                isUsageMetricAvailable = isDeviceScreenTimeAvailable || (activeSnapshot?.isAvailable == true)
-            )
-        } else false
-
-        val essentialExemptPackages = if (isEssentialModeActive) {
-            TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
-        } else emptySet()
-
-        val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
-
-        // Build current context snapshot
-        val snapshot = SystemContextSnapshot(
-            timestampMillis = now,
-            localTime = localTime,
-            dayOfWeek = dayOfWeek,
-            foregroundPackageName = packageName,
-            activeBrowserUrl = browserUrl,
-            accumulatedForegroundTimeMillis = activeSnapshot?.foregroundUsageByPackage ?: emptyMap(),
-            hourlyForegroundTimeMillis = activeSnapshot?.hourlyUsageByPackage ?: emptyMap(),
-            currentSessionDurationMillis = currentSessionDuration,
-            isUsageDataAvailable = activeSnapshot?.isAvailable ?: false,
-            usageDataQuality = activeSnapshot?.quality ?: com.vr.takeback.domain.usage.UsageDataQuality.UNKNOWN,
-            isFocusSessionActive = isFocusSessionActive,
-            isBreakActive = isBreakActive,
-            activeFocusSessionProfileId = activeFocusProfileId,
-            breakWhitelistApps = breakWhitelistApps,
-            isQuickBlockActive = isQuickBlockActive,
-            quickBlockExpirationEpochMillis = quickBlockExpiry,
-            quickBlockTargetPackages = quickBlockPackages,
-            isEssentialModeActive = isEssentialModeActive,
-            essentialModeAllowanceMinutes = essentialState.dailyAllowanceMinutes,
-            essentialModeTotalUsageMinutes = totalDailyUsageMinutes,
-            essentialModeExemptPackages = essentialExemptPackages
-        )
-
-        val immediateDecision = engine.evaluate(activeProfiles, snapshot)
+        val immediateDecision = engine.evaluate(activeProfiles, baseSnapshot)
 
         if (immediateDecision is BlockDecision.Blocked) {
             Log.i(TAG, "Blocking $packageName immediately because: ${immediateDecision.reason} (Profile: ${immediateDecision.triggeringProfileName})")
@@ -597,8 +725,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Build 7 Issue 4 & Build 8 Issue 1: Controlled refresh triggers.
-        // Refresh only on window state changes (not on scrolling or content-changes).
+        // Controlled refresh triggers on window transitions
         val isSnapshotFresh = activeSnapshot?.isAvailable == true && (now - activeSnapshot.capturedAtMillis <= 30_000L)
         if ((hasUsageLimitForApp || isEssentialEnabled) && !isSnapshotFresh && isWindowTransition) {
             triggerUsageSnapshotRefresh(force = false) { fresh ->
@@ -606,8 +733,8 @@ class TakeBackAccessibilityService : AccessibilityService() {
                     val freshSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
                     val freshScreenTime = fresh.deviceScreenTimeMillis
                     val freshScreenTimeAvailable = fresh.isDeviceScreenTimeAvailable && freshScreenTime != null
-                    val freshTotalDailyMinutes = if (freshScreenTimeAvailable && freshScreenTime != null) {
-                        (freshScreenTime / (60 * 1000L)).toInt()
+                    val freshTotalDailyMinutes = if (freshScreenTimeAvailable) {
+                        ((freshScreenTime ?: 0L) / (60 * 1000L)).toInt()
                     } else {
                         (fresh.foregroundUsageByPackage.values.sumOf { it } / (60 * 1000L)).toInt()
                     }
@@ -622,10 +749,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
                         TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
                     } else emptySet()
 
-                    val updatedSnapshot = snapshot.copy(
+                    val updatedSnapshot = baseSnapshot.copy(
                         timestampMillis = System.currentTimeMillis(),
                         accumulatedForegroundTimeMillis = fresh.foregroundUsageByPackage,
-                        // Build 7 Issue 1: Propagate fresh hourlyForegroundTimeMillis to delayed evaluation
                         hourlyForegroundTimeMillis = fresh.hourlyUsageByPackage,
                         currentSessionDurationMillis = freshSessionDuration,
                         isUsageDataAvailable = fresh.isAvailable,
@@ -672,6 +798,9 @@ class TakeBackAccessibilityService : AccessibilityService() {
             is BlockReason.GeofenceActive -> "Restricted at this location"
             is BlockReason.GoalNotMet -> "Productivity goal required first"
         }
+
+        // Halt background/video audio playback immediately
+        requestMediaAudioFocusPause()
 
         // Return user to home immediately to stop the restricted app
         performGlobalAction(GLOBAL_ACTION_HOME)

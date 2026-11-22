@@ -60,6 +60,8 @@
             android:exported="false"
             android:launchMode="singleTask"
             android:excludeFromRecents="true"
+            android:resizeableActivity="false"
+            android:supportsPictureInPicture="false"
             android:theme="@style/Theme.TakeBack" />
 
         <!-- TakeBack Accessibility Service for Real-Time App & Browser URL Detection -->

@@ -321,6 +321,72 @@ class EssentialModeExemptionResolverTest {
             assertTrue(resolver.canSelectAsAdditionalApp(toolPkg))
         }
     }
+
+    // 24. Samsung Gallery disqualified from system app exemption despite FLAG_SYSTEM
+    @Test
+    fun scenario24_samsungGallery_disqualifiedFromSystemAppExemption() {
+        val galleryPkg = "com.sec.android.gallery3d"
+        fakeProvider.installed.add(galleryPkg)
+        fakeProvider.systemPackages.add(galleryPkg)
+        fakeProvider.appCategories[galleryPkg] = 3 // CATEGORY_IMAGE
+
+        val decision = resolver.resolveExemption(galleryPkg)
+        assertFalse("Samsung Gallery must NOT be exempt under Essential Mode despite FLAG_SYSTEM", decision.isExempt)
+        assertEquals(ExemptionCategory.NOT_EXEMPT, decision.category)
+        assertFalse(resolver.isSystemApplication(galleryPkg))
+    }
+
+    // 25. Samsung My Files disqualified from system app exemption despite FLAG_SYSTEM
+    @Test
+    fun scenario25_samsungMyFiles_disqualifiedFromSystemAppExemption() {
+        val filesPkg = "com.sec.android.app.myfiles"
+        fakeProvider.installed.add(filesPkg)
+        fakeProvider.systemPackages.add(filesPkg)
+
+        val decision = resolver.resolveExemption(filesPkg)
+        assertFalse("Samsung My Files must NOT be exempt under Essential Mode despite FLAG_SYSTEM", decision.isExempt)
+        assertEquals(ExemptionCategory.NOT_EXEMPT, decision.category)
+        assertFalse(resolver.isSystemApplication(filesPkg))
+    }
+
+    // 26. Samsung Video Player and Browser disqualified from system app exemption
+    @Test
+    fun scenario26_samsungVideoAndBrowser_disqualifiedFromSystemAppExemption() {
+        val videoPkg = "com.samsung.android.videolist"
+        val browserPkg = "com.sec.android.app.sbrowser"
+        fakeProvider.installed.addAll(listOf(videoPkg, browserPkg))
+        fakeProvider.systemPackages.addAll(listOf(videoPkg, browserPkg))
+        fakeProvider.appCategories[videoPkg] = 2 // CATEGORY_VIDEO
+
+        assertFalse("Samsung Video must not be exempt", resolver.isExempt(videoPkg))
+        assertFalse("Samsung Browser must not be exempt", resolver.isExempt(browserPkg))
+        assertFalse(resolver.isSystemApplication(videoPkg))
+        assertFalse(resolver.isSystemApplication(browserPkg))
+    }
+
+    // 27. Google Photos disqualified from system app exemption
+    @Test
+    fun scenario27_googlePhotos_disqualifiedFromSystemAppExemption() {
+        val photosPkg = "com.google.android.apps.photos"
+        fakeProvider.installed.add(photosPkg)
+        fakeProvider.systemPackages.add(photosPkg)
+        fakeProvider.appCategories[photosPkg] = 3
+
+        assertFalse("Google Photos must not be exempt", resolver.isExempt(photosPkg))
+        assertFalse(resolver.isSystemApplication(photosPkg))
+    }
+
+    // 28. Android system media category apps disqualified from system app exemption
+    @Test
+    fun scenario28_mediaCategorySystemApps_disqualifiedFromSystemAppExemption() {
+        val customSysMediaPkg = "com.oem.customplayer"
+        fakeProvider.installed.add(customSysMediaPkg)
+        fakeProvider.systemPackages.add(customSysMediaPkg)
+        fakeProvider.appCategories[customSysMediaPkg] = 1 // CATEGORY_AUDIO
+
+        assertFalse("System app with audio category must not be exempt", resolver.isExempt(customSysMediaPkg))
+        assertFalse(resolver.isSystemApplication(customSysMediaPkg))
+    }
 }
 
 class FakePackageInfoProvider : PackageInfoProvider {
