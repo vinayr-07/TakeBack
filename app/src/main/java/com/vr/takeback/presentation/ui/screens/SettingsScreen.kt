@@ -36,9 +36,11 @@ import com.vr.takeback.data.repository.StrictModeRepository
 import com.vr.takeback.data.repository.StrictProtectionStatus
 import com.vr.takeback.domain.model.StrictMechanism
 import com.vr.takeback.domain.model.TargetApp
+import com.vr.takeback.domain.security.EssentialModeExemptionResolver
 import com.vr.takeback.domain.security.MutationType
 import com.vr.takeback.platform.receiver.TakeBackDeviceAdminReceiver
 import com.vr.takeback.platform.util.OemBatteryOptimizer
+import com.vr.takeback.presentation.ui.components.EssentialModeExitDialog
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -74,14 +76,14 @@ fun SettingsScreen(
     var additionalAppError by remember { mutableStateOf<String?>(null) }
 
     var showPinRequiredDialog by remember { mutableStateOf(false) }
+    var pendingEnableEssentialAfterPin by remember { mutableStateOf(false) }
     var showSettingsEmergencyExitPinDialog by remember { mutableStateOf(false) }
-    var showSettingsEmergencyExitChallengeDialog by remember { mutableStateOf(false) }
 
     var pendingEssentialMutation by remember { mutableStateOf<((String?) -> Unit)?>(null) }
     var showEssentialChallenge by remember { mutableStateOf(false) }
 
     fun executeEssentialMutation(mutation: (String?) -> Unit) {
-        if (strictState.isGlobalStrictActive) {
+        if (strictState.isCurrentlyLocked) {
             pendingEssentialMutation = mutation
             showEssentialChallenge = true
         } else {
@@ -308,16 +310,17 @@ fun SettingsScreen(
                                 }
                             }
                             Switch(
-                                checked = essentialState.isEnabled,
+                                checked = essentialState.isEnabled && !essentialState.isEmergencyExitActive,
                                 onCheckedChange = { targetState ->
                                     if (targetState) {
                                         if (!essentialRepo.hasConfiguredPin()) {
+                                            pendingEnableEssentialAfterPin = true
                                             showPinRequiredDialog = true
                                             return@Switch
                                         }
                                     } else {
                                         if (essentialState.status == EssentialModeStatus.ACTIVE) {
-                                            Toast.makeText(context, "Essential Mode is currently ACTIVE. To pause restrictions before midnight reset, use Emergency Exit below.", Toast.LENGTH_LONG).show()
+                                            showSettingsEmergencyExitPinDialog = true
                                             return@Switch
                                         }
                                     }
@@ -367,22 +370,38 @@ fun SettingsScreen(
                                 }
                             }
 
-                            if (essentialState.status == EssentialModeStatus.ACTIVE) {
+                            if (essentialState.isEnabled && !essentialState.isEmergencyExitActive) {
                                 Spacer(modifier = Modifier.height(10.dp))
                                 OutlinedButton(
                                     onClick = {
-                                        if (strictState.mechanism == StrictMechanism.TEXT_CHALLENGE) {
-                                            showSettingsEmergencyExitChallengeDialog = true
-                                        } else {
-                                            showSettingsEmergencyExitPinDialog = true
-                                        }
+                                        showSettingsEmergencyExitPinDialog = true
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                                 ) {
                                     Icon(Icons.Filled.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Emergency Exit (Until Midnight)", fontWeight = FontWeight.Bold)
+                                    Text("Exit Essential Mode (Password)", fontWeight = FontWeight.Bold)
+                                }
+                            } else if (essentialState.isEnabled && essentialState.isEmergencyExitActive) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Text(
+                                    text = "Paused for today via Emergency Exit. Automatically resumes tomorrow at midnight, or toggle ON above to resume now.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.tertiary
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                TextButton(
+                                    onClick = {
+                                        executeEssentialMutation { token ->
+                                            val success = essentialRepo.setEnabled(false, token)
+                                            if (!success) {
+                                                Toast.makeText(context, "Action blocked by Strict Mode or invalid state", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    }
+                                ) {
+                                    Text("Turn Off Auto-Resume")
                                 }
                             }
 
@@ -448,16 +467,23 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Additional Allowed Application
+                            // Additional Allowed Applications (up to 2)
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Allowed App (User Selected)", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
                                     Text(
-                                        text = essentialState.selectedAdditionalPackage ?: "None configured",
+                                        text = "Allowed Apps (${essentialState.selectedAdditionalPackages.size}/${EssentialModeExemptionResolver.MAX_ADDITIONAL_PACKAGES} User Selected)",
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    Text(
+                                        text = essentialState.selectedAdditionalPackages
+                                            .takeIf { it.isNotEmpty() }
+                                            ?.joinToString(", ")
+                                            ?: "None configured (AI chatbots auto-exempt)",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -465,9 +491,9 @@ fun SettingsScreen(
                                 TextButton(
                                     onClick = {
                                         if (essentialState.status == EssentialModeStatus.ACTIVE) {
-                                            Toast.makeText(context, "Cannot change allowed app while Essential Mode is active", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(context, "Cannot change allowed apps while Essential Mode is active", Toast.LENGTH_SHORT).show()
                                         } else {
-                                            additionalAppInput = essentialState.selectedAdditionalPackage ?: ""
+                                            additionalAppInput = essentialState.selectedAdditionalPackages.firstOrNull() ?: ""
                                             additionalAppError = null
                                             showAdditionalAppDialog = true
                                         }
@@ -490,7 +516,7 @@ fun SettingsScreen(
                         } else {
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = "Restricts non-essential phone access automatically once your total daily screen time exceeds the configured threshold. Dialer, SMS, Camera, WhatsApp, and Samsung Good Lock remain fully available.",
+                                text = "Restricts non-essential phone access automatically once your total daily screen time exceeds the configured threshold. Dialer, SMS, Camera, WhatsApp, Payments, AI chatbots (ChatGPT, Gemini, Claude, etc.), Good Lock, and up to 2 selected apps remain available.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -662,14 +688,16 @@ fun SettingsScreen(
                                 selected = selectedMechanism == StrictMechanism.PIN,
                                 onClick = { selectedMechanism = StrictMechanism.PIN }
                             )
-                            Text("Secure PIN (4-6 digits)")
+                            Text("Password / PIN (min 4 characters)")
                         }
                         if (selectedMechanism == StrictMechanism.PIN) {
                             Spacer(modifier = Modifier.height(8.dp))
                             OutlinedTextField(
                                 value = pinToSet,
-                                onValueChange = { if (it.length <= 6) pinToSet = it },
-                                label = { Text("Enter 4-6 digit PIN") },
+                                onValueChange = { if (it.length <= 32) pinToSet = it },
+                                label = { Text("Enter password or PIN (4+ chars)") },
+                                visualTransformation = PasswordVisualTransformation(),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth()
                             )
@@ -687,11 +715,21 @@ fun SettingsScreen(
 
                             if (selectedMechanism == StrictMechanism.PIN) {
                                 if (pinToSet.length >= 4) {
-                                    strictModeRepository.armStrictWithPin(pinToSet)
+                                    val enteredPin = pinToSet
+                                    val armed = strictModeRepository.armStrictWithPin(enteredPin)
                                     pinToSet = ""
                                     showArmDialog = false
+                                    if (armed && pendingEnableEssentialAfterPin) {
+                                        pendingEnableEssentialAfterPin = false
+                                        val token = strictModeRepository.verifyAndIssueToken(
+                                            input = enteredPin,
+                                            mutationType = MutationType.UPDATE_ESSENTIAL_MODE
+                                        )
+                                        essentialRepo.setEnabled(true, token)
+                                    }
                                 }
                             } else {
+                                pendingEnableEssentialAfterPin = false
                                 strictModeRepository.armStrictWithTextChallenge()
                                 showArmDialog = false
                             }
@@ -702,7 +740,10 @@ fun SettingsScreen(
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showArmDialog = false }) {
+                    TextButton(onClick = {
+                        pendingEnableEssentialAfterPin = false
+                        showArmDialog = false
+                    }) {
                         Text("Cancel")
                     }
                 }
@@ -800,12 +841,15 @@ fun SettingsScreen(
             )
         }
 
-        // Dialog: Select Additional Application (Installed App Picker)
+        // Dialog: Select Up to 2 Additional Applications (Installed App Picker)
         if (showAdditionalAppDialog) {
             val appDiscoveryRepo = remember { AppDiscoveryRepository(context) }
             var installedApps by remember { mutableStateOf<List<TargetApp>>(emptyList()) }
             var searchQuery by remember { mutableStateOf("") }
             var isLoading by remember { mutableStateOf(true) }
+            var draftSelection by remember(essentialState.selectedAdditionalPackages) {
+                mutableStateOf(essentialState.selectedAdditionalPackages)
+            }
 
             LaunchedEffect(Unit) {
                 installedApps = appDiscoveryRepo.getInstalledApplications()
@@ -831,14 +875,32 @@ fun SettingsScreen(
                             .fillMaxSize()
                             .padding(20.dp)
                     ) {
-                        Text(
-                            text = "Select Allowed Application",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Select Allowed Apps",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
+                            ) {
+                                Text(
+                                    text = "${draftSelection.size}/${EssentialModeExemptionResolver.MAX_ADDITIONAL_PACKAGES}",
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            }
+                        }
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Select exactly one additional productivity application to allow during Essential Mode. Social media, games, and streaming are rejected.",
+                            text = "Select up to 2 additional productivity apps to allow during Essential Mode. AI chatbots, payments, phone, SMS, camera & WhatsApp are already exempt by default.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -876,23 +938,25 @@ fun SettingsScreen(
                                 items(filteredApps, key = { it.packageName }) { app ->
                                     val eligibility = exemptionResolver.evaluateAdditionalAppEligibility(app.packageName)
                                     val isEligible = eligibility.isEligible
-                                    val isCurrentSelected = essentialState.selectedAdditionalPackage == app.packageName
+                                    val isSelected = draftSelection.contains(app.packageName)
 
                                     Surface(
                                         shape = RoundedCornerShape(12.dp),
-                                        color = if (isCurrentSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                                        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
                                         else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .clickable(enabled = isEligible) {
-                                                showAdditionalAppDialog = false
-                                                executeEssentialMutation { token ->
-                                                    val ok = essentialRepo.setSelectedAdditionalPackage(app.packageName, token)
-                                                    if (ok) {
-                                                        Toast.makeText(context, "Allowed app set to ${app.appName}", Toast.LENGTH_SHORT).show()
-                                                    } else {
-                                                        Toast.makeText(context, "Update failed: blocked by Strict Mode or ineligible app", Toast.LENGTH_SHORT).show()
-                                                    }
+                                            .clickable(enabled = isEligible || isSelected) {
+                                                if (isSelected) {
+                                                    draftSelection = draftSelection.filter { it != app.packageName }
+                                                } else if (draftSelection.size < EssentialModeExemptionResolver.MAX_ADDITIONAL_PACKAGES) {
+                                                    draftSelection = draftSelection + app.packageName
+                                                } else {
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Maximum ${EssentialModeExemptionResolver.MAX_ADDITIONAL_PACKAGES} additional apps allowed",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
                                                 }
                                             }
                                     ) {
@@ -908,12 +972,12 @@ fun SettingsScreen(
                                                     text = app.appName,
                                                     style = MaterialTheme.typography.bodyMedium,
                                                     fontWeight = FontWeight.Bold,
-                                                    color = if (isEligible) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+                                                    color = if (isEligible || isSelected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
                                                 )
                                                 Text(
                                                     text = app.packageName,
                                                     style = MaterialTheme.typography.labelSmall,
-                                                    color = if (isEligible) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                                                    color = if (isEligible || isSelected) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                                                 )
                                                 Text(
                                                     text = eligibility.reason,
@@ -922,17 +986,25 @@ fun SettingsScreen(
                                                     color = if (isEligible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                                                 )
                                             }
-                                            Surface(
-                                                shape = RoundedCornerShape(6.dp),
-                                                color = if (isEligible) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
-                                            ) {
-                                                Text(
-                                                    text = if (isEligible) "ELIGIBLE" else "INELIGIBLE",
-                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = if (isEligible) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.error
+                                            if (isSelected) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.CheckCircle,
+                                                    contentDescription = "Selected",
+                                                    tint = MaterialTheme.colorScheme.primary
                                                 )
+                                            } else {
+                                                Surface(
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    color = if (isEligible) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+                                                ) {
+                                                    Text(
+                                                        text = if (isEligible) "ELIGIBLE" else "INELIGIBLE",
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = if (isEligible) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.error
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -947,19 +1019,37 @@ fun SettingsScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            TextButton(
-                                onClick = {
-                                    showAdditionalAppDialog = false
-                                    executeEssentialMutation { token ->
-                                        essentialRepo.setSelectedAdditionalPackage(null, token)
-                                        Toast.makeText(context, "Cleared additional allowed app", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            ) {
-                                Text("Clear Selection")
+                            TextButton(onClick = { draftSelection = emptyList() }) {
+                                Text("Clear All")
                             }
-                            TextButton(onClick = { showAdditionalAppDialog = false }) {
-                                Text("Close")
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                TextButton(onClick = { showAdditionalAppDialog = false }) {
+                                    Text("Cancel")
+                                }
+                                Button(
+                                    onClick = {
+                                        val finalSelection = draftSelection
+                                        showAdditionalAppDialog = false
+                                        executeEssentialMutation { token ->
+                                            val ok = essentialRepo.setSelectedAdditionalPackages(finalSelection, token)
+                                            if (ok) {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Saved ${finalSelection.size} allowed app(s)",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            } else {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Update failed: blocked by Strict Mode or ineligible app",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                        }
+                                    }
+                                ) {
+                                    Text("Save (${draftSelection.size}/2)")
+                                }
                             }
                         }
                     }
@@ -991,97 +1081,25 @@ fun SettingsScreen(
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showPinRequiredDialog = false }) {
+                    TextButton(onClick = {
+                        pendingEnableEssentialAfterPin = false
+                        showPinRequiredDialog = false
+                    }) {
                         Text("Cancel")
                     }
                 }
             )
         }
 
-        // Dialog: Emergency Exit from Settings (PIN)
+        // Dialog: Exit Essential Mode from Settings (Password-only)
         if (showSettingsEmergencyExitPinDialog) {
-            var enteredPin by remember { mutableStateOf("") }
-            var pinError by remember { mutableStateOf<String?>(null) }
-            val isLockedOut = essentialRepo.isRateLimited()
-            val lockoutSecs = essentialRepo.getLockoutRemainingSeconds()
-
-            AlertDialog(
-                onDismissRequest = { showSettingsEmergencyExitPinDialog = false },
-                icon = { Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                title = { Text("Emergency Exit") },
-                text = {
-                    Column {
-                        Text(
-                            "Enter your Strict Mode PIN to pause Essential Mode restrictions for the remainder of today. " +
-                            "Restrictions will automatically resume at tomorrow's daily reset."
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        if (isLockedOut) {
-                            Text(
-                                "Too many failed attempts. Locked out for $lockoutSecs seconds.",
-                                color = MaterialTheme.colorScheme.error,
-                                fontWeight = FontWeight.Bold
-                            )
-                        } else {
-                            OutlinedTextField(
-                                value = enteredPin,
-                                onValueChange = { enteredPin = it; pinError = null },
-                                label = { Text("Strict Mode PIN") },
-                                isError = pinError != null,
-                                supportingText = pinError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
-                                visualTransformation = PasswordVisualTransformation(),
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                    }
+            EssentialModeExitDialog(
+                essentialRepository = essentialRepo,
+                onExited = {
+                    showSettingsEmergencyExitPinDialog = false
+                    Toast.makeText(context, "Essential Mode exited until midnight reset", Toast.LENGTH_SHORT).show()
                 },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            if (isLockedOut) return@Button
-                            val success = essentialRepo.authenticateAndTriggerEmergencyExit(enteredPin)
-                            if (success) {
-                                showSettingsEmergencyExitPinDialog = false
-                                Toast.makeText(context, "Emergency Exit activated until midnight reset", Toast.LENGTH_SHORT).show()
-                            } else {
-                                pinError = if (essentialRepo.isRateLimited()) {
-                                    "Too many failed attempts. Locked out for ${essentialRepo.getLockoutRemainingSeconds()}s."
-                                } else {
-                                    "Incorrect Strict Mode PIN."
-                                }
-                            }
-                        },
-                        enabled = !isLockedOut && enteredPin.isNotBlank(),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                    ) {
-                        Text("Authorize Exit")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showSettingsEmergencyExitPinDialog = false }) {
-                        Text("Cancel")
-                    }
-                }
-            )
-        }
-
-        // Dialog: Emergency Exit from Settings (Challenge Token)
-        if (showSettingsEmergencyExitChallengeDialog) {
-            StrictChallengeDialog(
-                mechanism = strictState.mechanism,
-                saltBase64 = strictState.saltBase64,
-                expectedHash = strictState.passwordHash,
-                mutationType = MutationType.UPDATE_ESSENTIAL_MODE,
-                onTokenIssued = { token ->
-                    val success = essentialRepo.authenticateAndTriggerEmergencyExitWithToken(token)
-                    if (success) {
-                        showSettingsEmergencyExitChallengeDialog = false
-                        Toast.makeText(context, "Emergency Exit activated until midnight reset", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                onDismissRequest = { showSettingsEmergencyExitChallengeDialog = false }
+                onDismissRequest = { showSettingsEmergencyExitPinDialog = false }
             )
         }
 

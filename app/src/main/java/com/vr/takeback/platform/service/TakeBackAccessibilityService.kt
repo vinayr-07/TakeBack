@@ -1,11 +1,14 @@
 package com.vr.takeback.platform.service
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.app.ActivityManager
 import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Path
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -26,7 +29,11 @@ import com.vr.takeback.domain.model.BlockTarget
 import com.vr.takeback.domain.model.EventType
 import com.vr.takeback.domain.model.FocusSessionState
 import com.vr.takeback.domain.model.Profile
+import com.vr.takeback.domain.security.ProtectionDecision
 import com.vr.takeback.domain.security.RealAccessibilityNodeSnapshot
+import com.vr.takeback.domain.security.RealRecentsNodeSnapshot
+import com.vr.takeback.domain.security.RecentsCardMatch
+import com.vr.takeback.domain.security.RecentsTaskInspector
 import com.vr.takeback.domain.security.SettingsDestination
 import com.vr.takeback.domain.security.SettingsProtectionManager
 import com.vr.takeback.domain.security.SocialMediaResolver
@@ -91,6 +98,14 @@ class TakeBackAccessibilityService : AccessibilityService() {
     private var lastBlockedSettingsDestination: SettingsDestination? = null
     private var lastBlockedSettingsTimestamp: Long = 0
     private var serviceConnectedTimestamp: Long = 0L
+    @Volatile
+    private var awaitingPostEnableSettingsExit: Boolean = false
+    @Volatile
+    private var isStickyTakeBackAppInfoActive: Boolean = false
+    @Volatile
+    private var hasTamperedSettingsInRecents: Boolean = false
+    private var lastRecentsDismissTimestamp: Long = 0L
+    private val recentlyBlockedApps = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     // Build 7 Issue 3 & Build 8 Issue 4: Monotonic elapsed realtime session tracker
     val sessionTracker = ForegroundSessionTracker(
@@ -203,6 +218,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         isServiceRunning = true
         activeServiceInstance = this
         serviceConnectedTimestamp = SystemClock.elapsedRealtime()
+        awaitingPostEnableSettingsExit = true
         Log.i(TAG, "TakeBack Accessibility Service connected and active")
 
         // Build 8 Issue 4: Query actual device state from PowerManager and KeyguardManager
@@ -267,7 +283,12 @@ class TakeBackAccessibilityService : AccessibilityService() {
             Log.w(TAG, "Failed to register screen state receiver", e)
         }
 
-        // Initial refresh using the same throttled / single-flight guard
+        // Warm package info cache off main thread & trigger initial usage snapshot refresh
+        serviceScope.launch {
+            try {
+                TakeBackApplication.packageInfoProvider.refreshSnapshotNow()
+            } catch (_: Exception) {}
+        }
         triggerUsageSnapshotRefresh(force = true)
         startPeriodicUsageCheck()
     }
@@ -362,7 +383,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
             essentialRepo.isCurrentlyActive(totalDailyUsageMinutes, true, isDeviceScreenTimeAvailable || activeSnapshot.isAvailable)
         } else false
         val exempt = if (isEssentialActive) {
-            TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+            getCachedEffectiveExemptPackages(essentialState.selectedAdditionalPackages, essentialState.customGoodLockModules)
         } else emptySet()
 
         val quickBlockState = try {
@@ -552,6 +573,32 @@ class TakeBackAccessibilityService : AccessibilityService() {
                 continue
             }
 
+            // Evaluate multi-window / pop-up / split-screen Settings anti-tamper first when Strict Mode is locked
+            val strictState = try {
+                TakeBackApplication.strictModeRepository.protectionState.value
+            } catch (e: Exception) {
+                null
+            }
+            if (strictState?.isSettingsLocked == true && SettingsProtectionManager.isProtectedSettingsPackage(windowPkg)) {
+                val settingsDecision = SettingsProtectionManager.evaluate(
+                    packageName = windowPkg,
+                    className = null,
+                    rootNode = RealAccessibilityNodeSnapshot(rootNode),
+                    isStrictLocked = true,
+                    isMaintenanceUnlocked = false
+                )
+                if (settingsDecision.isRestricted && !shouldBypassDuringInitialEnable(settingsDecision.destination)) {
+                    if (settingsDecision.destination == lastBlockedSettingsDestination && (now - lastBlockedSettingsTimestamp) < 650L) {
+                        return false
+                    }
+                    try {
+                        rootNode.performAction(AccessibilityNodeInfo.ACTION_DISMISS)
+                    } catch (_: Exception) {}
+                    launchSettingsShield(settingsDecision, now)
+                    return true
+                }
+            }
+
             // Evaluate this specific window's package against active restrictions
             val windowSnapshot = baseSnapshot.copy(
                 foregroundPackageName = windowPkg,
@@ -599,13 +646,26 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         val packageName = event.packageName?.toString() ?: return
 
-        // Ignore TakeBack itself and core Android system framework
-        if (packageName == applicationContext.packageName || packageName == "android") return
+        // Ignore TakeBack itself and core Android system framework; returning to TakeBack ends initial enable grace window.
+        if (packageName == applicationContext.packageName) {
+            awaitingPostEnableSettingsExit = false
+            isStickyTakeBackAppInfoActive = false
+            return
+        }
+        if (packageName == "android") return
 
         val now = System.currentTimeMillis()
         val eventType = event.eventType
         val isWindowTransition = eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
                 eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+
+        if (isWindowTransition &&
+            !SettingsProtectionManager.isProtectedSettingsPackage(packageName) &&
+            packageName != "com.android.systemui"
+        ) {
+            awaitingPostEnableSettingsExit = false
+            isStickyTakeBackAppInfoActive = false
+        }
 
         // Build 8 Issue 4: Drive foreground transitions ONLY by verified window transitions,
         // ignoring arbitrary content-change or scroll events.
@@ -616,6 +676,39 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         val isLauncherOrSystemUi = packageName == "com.android.systemui" ||
                 packageName.contains("launcher", ignoreCase = true)
+
+        // Fast-path 1: Ignore TakeBack's own UI events while TakeBack is active foreground,
+        // without accidentally dropping incoming Settings or blocked-app transitions.
+        if (packageName == applicationContext.packageName &&
+            rootInActiveWindow?.packageName == applicationContext.packageName
+        ) {
+            return
+        }
+
+        val strictState = try {
+            TakeBackApplication.strictModeRepository.protectionState.value
+        } catch (e: Exception) {
+            null
+        }
+
+        // Fast-path 2: Enforce Strict Mode Settings/Admin/AppInfo protection BEFORE any UsageStats or package work.
+        if (strictState?.isSettingsLocked == true && SettingsProtectionManager.isProtectedSettingsPackage(packageName)) {
+            if (evaluateAndHandleSettingsProtection(packageName, event, now)) {
+                return
+            }
+        }
+
+        // Fast-path 3: Drop high-frequency content-change noise for apps that aren't transitions, clicks, launchers, browsers, or video feeds.
+        val isShortFormOrBrowser = packageName == "com.google.android.youtube" ||
+                packageName == "com.instagram.android" ||
+                SUPPORTED_BROWSERS.contains(packageName)
+        if (!isWindowTransition &&
+            eventType != AccessibilityEvent.TYPE_VIEW_CLICKED &&
+            !isLauncherOrSystemUi &&
+            !isShortFormOrBrowser
+        ) {
+            return
+        }
 
         // Fetch live shared states from TakeBackApplication
         val activeProfiles = try {
@@ -718,7 +811,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
         } else false
 
         val essentialExemptPackages = if (isEssentialModeActive) {
-            TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+            getCachedEffectiveExemptPackages(essentialState.selectedAdditionalPackages, essentialState.customGoodLockModules)
         } else emptySet()
 
         val currentSessionDuration = sessionTracker.getCurrentSessionDuration(SystemClock.elapsedRealtime())
@@ -758,66 +851,27 @@ class TakeBackAccessibilityService : AccessibilityService() {
 
         // Multi-Window & Floating Window (Split-Screen, Pop-up View, Picture-in-Picture) Audit:
         // Audit all interactive windows whenever a window transition occurs or launcher is active
-        if (areAnyRestrictionsPotentiallyActive && (isWindowTransition || isLauncherOrSystemUi)) {
+        if ((areAnyRestrictionsPotentiallyActive || strictState?.isSettingsLocked == true) &&
+            (isWindowTransition || isLauncherOrSystemUi)
+        ) {
             if (auditAllActiveWindows(activeProfiles, baseSnapshot, now, packageName)) {
                 return
             }
         }
 
-        // Early-return for launcher/systemUI packages when no blocked floating windows are active
+        // On Launcher / SystemUI: inspect Recent Apps / Overview to clear tampered Settings or blocked apps from background
         if (isLauncherOrSystemUi) {
-            return
-        }
-
-        // If TakeBack's own shield or activity is currently the front active window,
-        // ignore background events to prevent recursive block loops.
-        val activeWindowRoot = rootInActiveWindow
-        if (activeWindowRoot?.packageName == applicationContext.packageName) {
-            return
-        }
-
-        // Strict Mode Anti-Tamper: Restrict Android Settings, App Info, Device Admin, and Uninstall screens
-        val strictState = try {
-            TakeBackApplication.strictModeRepository.protectionState.value
-        } catch (e: Exception) {
-            null
-        }
-
-        // Post-connection grace window (15s): user just toggled the accessibility permission ON in Settings
-        // and needs to navigate back out of Settings to TakeBack without being blocked.
-        val isWithinConnectionGracePeriod = (SystemClock.elapsedRealtime() - serviceConnectedTimestamp) < 15_000L
-
-        if (strictState?.isSettingsLocked == true && !isWithinConnectionGracePeriod) {
-            val rootNode = rootInActiveWindow
-            val snapshot = if (rootNode != null) RealAccessibilityNodeSnapshot(rootNode) else null
-            val decision = SettingsProtectionManager.evaluate(
+            handleRecentsOverview(
                 packageName = packageName,
                 className = event.className?.toString(),
-                rootNode = snapshot,
-                isStrictLocked = strictState.isSettingsLocked,
-                isMaintenanceUnlocked = !strictState.isSettingsLocked
+                now = now,
+                activeProfiles = activeProfiles,
+                quickBlockPackages = quickBlockPackages,
+                isQuickBlockActive = isQuickBlockActive,
+                isSocialCooldownActive = isSocialCooldownActive,
+                isStrictLocked = strictState?.isSettingsLocked == true
             )
-
-            if (decision.isRestricted) {
-                // De-bounce rapid consecutive events for the same blocked settings destination (< 3.0s)
-                if (decision.destination == lastBlockedSettingsDestination && (now - lastBlockedSettingsTimestamp) < 3000) {
-                    return
-                }
-                lastBlockedSettingsDestination = decision.destination
-                lastBlockedSettingsTimestamp = now
-
-                val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                    putExtra("EXTRA_APP_NAME", "Android Settings")
-                    putExtra("EXTRA_PROFILE_NAME", "Strict Mode")
-                    putExtra("EXTRA_REASON", decision.warningMessage)
-                    putExtra("EXTRA_IS_SETTINGS_SHIELD", true)
-                    putExtra("EXTRA_DESTINATION", decision.destination.name)
-                    putExtra("EXTRA_TARGET_LABEL", decision.targetLabel)
-                }
-                startActivity(shieldIntent)
-                return
-            }
+            return
         }
 
         // De-bounce rapid consecutive events for the same blocked package (< 10.0s)
@@ -885,7 +939,7 @@ class TakeBackAccessibilityService : AccessibilityService() {
                         )
                     } else false
                     val freshExempt = if (freshEssentialActive) {
-                        TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(essentialState.selectedAdditionalPackage)
+                        getCachedEffectiveExemptPackages(essentialState.selectedAdditionalPackages, essentialState.customGoodLockModules)
                     } else emptySet()
 
                     val updatedSnapshot = baseSnapshot.copy(
@@ -985,6 +1039,310 @@ class TakeBackAccessibilityService : AccessibilityService() {
             putExtra("EXTRA_USED_MINS", usedMins)
         }
         startActivity(shieldIntent)
+
+        // Track & clear the restricted app from background once it moves behind BlockShieldActivity
+        val blockedTarget = decision.target
+        if (blockedTarget is BlockTarget.Application) {
+            recentlyBlockedApps[blockedTarget.packageName] = appName
+            scheduleBackgroundProcessCleanup(blockedTarget.packageName)
+        }
+    }
+
+    @Volatile
+    private var cachedExemptPackages: Set<String> = emptySet()
+    @Volatile
+    private var cachedExemptAdditional: List<String> = emptyList()
+    @Volatile
+    private var cachedExemptGoodLock: Set<String> = emptySet()
+    @Volatile
+    private var cachedExemptTimestampElapsed: Long = 0L
+
+    private fun getCachedEffectiveExemptPackages(
+        selectedAdditional: List<String>,
+        customGoodLock: Set<String>
+    ): Set<String> {
+        val elapsed = SystemClock.elapsedRealtime()
+        val existing = cachedExemptPackages
+        if (existing.isNotEmpty() &&
+            (elapsed - cachedExemptTimestampElapsed) < 30_000L &&
+            selectedAdditional == cachedExemptAdditional &&
+            customGoodLock == cachedExemptGoodLock
+        ) {
+            return existing
+        }
+        val computed = TakeBackApplication.essentialModeExemptionResolver.getEffectiveExemptPackages(selectedAdditional)
+        cachedExemptPackages = computed
+        cachedExemptAdditional = selectedAdditional
+        cachedExemptGoodLock = customGoodLock
+        cachedExemptTimestampElapsed = elapsed
+        return computed
+    }
+
+    private fun shouldBypassDuringInitialEnable(destination: SettingsDestination): Boolean {
+        if (!awaitingPostEnableSettingsExit) return false
+        val elapsedSinceConnect = SystemClock.elapsedRealtime() - serviceConnectedTimestamp
+        if (elapsedSinceConnect >= 5_000L) {
+            awaitingPostEnableSettingsExit = false
+            return false
+        }
+        return destination == SettingsDestination.ACCESSIBILITY_SETTINGS ||
+                destination == SettingsDestination.INSTALLED_ACCESSIBILITY_SERVICES ||
+                destination == SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS
+    }
+
+    private fun evaluateAndHandleSettingsProtection(
+        packageName: String,
+        event: AccessibilityEvent,
+        now: Long
+    ): Boolean {
+        val rootNode = rootInActiveWindow ?: event.source
+        val snapshot = if (rootNode != null) RealAccessibilityNodeSnapshot(rootNode) else null
+        val className = event.className?.toString()
+        val eventText = event.text?.joinToString(" ")
+
+        var decision = SettingsProtectionManager.evaluate(
+            packageName = packageName,
+            className = className,
+            rootNode = snapshot,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false,
+            eventText = eventText
+        )
+
+        val clsLower = (className ?: "").lowercase()
+        val isAppInfoSubscreen = clsLower.contains("installedappdetails") ||
+                clsLower.contains("appinfo") ||
+                clsLower.contains("appdetails") ||
+                clsLower.contains("installedappopenbydefault") ||
+                packageName.equals("com.oplus.appdetail", ignoreCase = true) ||
+                packageName.equals("com.coloros.appdetail", ignoreCase = true)
+
+        if (decision.destination == SettingsDestination.TAKEBACK_APP_INFO) {
+            isStickyTakeBackAppInfoActive = true
+        } else if (!isAppInfoSubscreen &&
+            decision.destination != SettingsDestination.TAKEBACK_PERMISSION_SETTINGS &&
+            decision.destination != SettingsDestination.UNKNOWN_OR_INACCESSIBLE
+        ) {
+            isStickyTakeBackAppInfoActive = false
+        }
+
+        // Prevent scroll-past-header bypass inside TakeBack's App Info on Samsung / Realme
+        if (!decision.isRestricted && isStickyTakeBackAppInfoActive && isAppInfoSubscreen) {
+            decision = ProtectionDecision(
+                isRestricted = true,
+                destination = SettingsDestination.TAKEBACK_APP_INFO,
+                targetLabel = "App Info Protection",
+                warningMessage = "TakeBack's App Info, Force Stop, Storage, and Uninstall settings are locked while Strict Mode is active."
+            )
+        }
+
+        if (!decision.isRestricted) {
+            return false
+        }
+
+        if (shouldBypassDuringInitialEnable(decision.destination)) {
+            return false
+        }
+
+        if (decision.destination == lastBlockedSettingsDestination && (now - lastBlockedSettingsTimestamp) < 650L) {
+            return true
+        }
+
+        Log.i(TAG, "Blocking restricted settings screen: pkg=$packageName cls=$className dest=${decision.destination}")
+        launchSettingsShield(decision, now)
+        return true
+    }
+
+    private fun launchSettingsShield(decision: ProtectionDecision, now: Long) {
+        lastBlockedSettingsDestination = decision.destination
+        lastBlockedSettingsTimestamp = now
+        hasTamperedSettingsInRecents = true
+
+        val shieldIntent = Intent(applicationContext, BlockShieldActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra("EXTRA_APP_NAME", "Android Settings")
+            putExtra("EXTRA_PROFILE_NAME", "Strict Mode")
+            putExtra("EXTRA_REASON", decision.warningMessage)
+            putExtra("EXTRA_IS_SETTINGS_SHIELD", true)
+            putExtra("EXTRA_DESTINATION", decision.destination.name)
+            putExtra("EXTRA_TARGET_LABEL", decision.targetLabel)
+        }
+        startActivity(shieldIntent)
+    }
+
+    private fun scheduleBackgroundProcessCleanup(packageName: String) {
+        if (packageName == applicationContext.packageName ||
+            packageName == "android" ||
+            SettingsProtectionManager.isProtectedSettingsPackage(packageName)
+        ) {
+            return
+        }
+        serviceScope.launch {
+            delay(350L)
+            try {
+                val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return@launch
+                am.killBackgroundProcesses(packageName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Unable to clear background process for $packageName", e)
+            }
+        }
+    }
+
+    private fun findRecentsRootNode(eventPackageName: String): AccessibilityNodeInfo? {
+        val activeRoot = rootInActiveWindow
+        if (activeRoot != null && RecentsTaskInspector.isLauncherOrRecentsPackage(activeRoot.packageName?.toString() ?: "")) {
+            return activeRoot
+        }
+        try {
+            for (window in windows) {
+                val root = window.root ?: continue
+                val pkg = root.packageName?.toString() ?: continue
+                if (RecentsTaskInspector.isLauncherOrRecentsPackage(pkg) && pkg == eventPackageName) {
+                    return root
+                }
+            }
+            for (window in windows) {
+                val root = window.root ?: continue
+                val pkg = root.packageName?.toString() ?: continue
+                if (RecentsTaskInspector.isLauncherOrRecentsPackage(pkg)) {
+                    return root
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return activeRoot
+    }
+
+    private fun handleRecentsOverview(
+        packageName: String,
+        className: String?,
+        now: Long,
+        activeProfiles: List<Profile>,
+        quickBlockPackages: Set<String>,
+        isQuickBlockActive: Boolean,
+        isSocialCooldownActive: Boolean,
+        isStrictLocked: Boolean
+    ) {
+        if ((now - lastRecentsDismissTimestamp) < 450L) {
+            return
+        }
+        val rootNode = findRecentsRootNode(packageName) ?: return
+        val recentsPkg = rootNode.packageName?.toString() ?: packageName
+        val recentsRoot = RealRecentsNodeSnapshot(rootNode)
+        if (!RecentsTaskInspector.isRecentsOverview(recentsPkg, className, recentsRoot)) {
+            return
+        }
+
+        val targetLabels = mutableSetOf<String>()
+        recentlyBlockedApps.forEach { (pkg, label) ->
+            targetLabels.add(label)
+            scheduleBackgroundProcessCleanup(pkg)
+        }
+        if (isQuickBlockActive) {
+            quickBlockPackages.forEach { pkg -> targetLabels.add(resolveAppLabel(pkg)) }
+        }
+        val localTime = LocalTime.now()
+        val dayOfWeek = LocalDate.now().dayOfWeek
+        activeProfiles.filter { it.isEnabled && engine.isProfileCurrentlyEnforcing(it, localTime, dayOfWeek) }
+            .flatMap { it.targetApps }
+            .filter { !it.isAllowlist }
+            .forEach { app ->
+                targetLabels.add(app.appName)
+                targetLabels.add(resolveAppLabel(app.packageName))
+            }
+        if (isSocialCooldownActive) {
+            SocialMediaResolver.KNOWN_SOCIAL_PACKAGES.forEach { pkg ->
+                targetLabels.add(resolveAppLabel(pkg))
+            }
+        }
+        if (isStrictLocked) {
+            targetLabels.add("Accessibility")
+            targetLabels.add("Downloaded apps")
+            targetLabels.add("Installed services")
+            targetLabels.add("Device administration settings")
+            targetLabels.add("Device administration")
+            targetLabels.add("Device admin")
+            targetLabels.add("Device admin apps")
+            targetLabels.add("Phone administrators")
+            targetLabels.add("App info")
+            if (hasTamperedSettingsInRecents) {
+                targetLabels.add("Settings")
+            }
+        }
+
+        if (targetLabels.isEmpty()) return
+
+        val displayMetrics = resources.displayMetrics
+        val match = RecentsTaskInspector.findRestrictedTaskCard(
+            rootNode = recentsRoot,
+            targetLabels = targetLabels,
+            screenWidth = displayMetrics.widthPixels,
+            screenHeight = displayMetrics.heightPixels
+        )
+        if (match == null) {
+            Log.d(
+                TAG,
+                "Recents overview open (pkg=$recentsPkg, isStrict=$isStrictLocked, tampered=$hasTamperedSettingsInRecents, targetCount=${targetLabels.size})"
+            )
+            return
+        }
+
+        lastRecentsDismissTimestamp = now
+        val dismissed = dismissRecentsCard(match)
+        Log.i(TAG, "Recents restricted card match=${match.matchedLabel} bounds=${match.cardBounds} dismissed=$dismissed")
+        if (dismissed) {
+            val lowerLabel = match.matchedLabel.lowercase()
+            if (lowerLabel.contains("settings") ||
+                lowerLabel.contains("app info") ||
+                lowerLabel.contains("accessibility") ||
+                lowerLabel.contains("device admin") ||
+                lowerLabel.contains("downloaded apps") ||
+                lowerLabel.contains("installed services")
+            ) {
+                hasTamperedSettingsInRecents = false
+            }
+        }
+    }
+
+    private fun dismissRecentsCard(match: RecentsCardMatch): Boolean {
+        val closeReal = (match.closeButtonNode as? RealRecentsNodeSnapshot)?.node
+        if (closeReal != null) {
+            try {
+                if (closeReal.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    return true
+                }
+            } catch (_: Exception) {}
+        }
+
+        val cardReal = (match.cardNode as? RealRecentsNodeSnapshot)?.node
+        if (cardReal != null) {
+            try {
+                if (cardReal.performAction(AccessibilityNodeInfo.ACTION_DISMISS)) {
+                    return true
+                }
+            } catch (_: Exception) {}
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && match.cardBounds.isValid) {
+            val screenWidth = resources.displayMetrics.widthPixels.coerceAtLeast(100)
+            val startX = match.cardBounds.centerX.coerceIn(40, screenWidth - 40).toFloat()
+            val startY = (match.cardBounds.bottom - (match.cardBounds.height * 0.25f)).coerceAtLeast(120f)
+            val endY = (match.cardBounds.top - 260).coerceAtLeast(40).toFloat()
+            val path = Path().apply {
+                moveTo(startX, startY)
+                lineTo(startX, endY)
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, 220L))
+                .build()
+            return try {
+                dispatchGesture(gesture, null, null)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed swipe dismiss gesture on Recents card ${match.matchedLabel}", e)
+                false
+            }
+        }
+        return false
     }
 
     private fun resolveAppLabel(packageName: String): String {

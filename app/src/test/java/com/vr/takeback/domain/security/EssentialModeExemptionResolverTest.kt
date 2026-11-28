@@ -176,16 +176,21 @@ class EssentialModeExemptionResolverTest {
         assertEquals(ExemptionCategory.NOT_EXEMPT, decision.category)
     }
 
-    // 15. User-selected additional app (ChatGPT) is exempt
+    // 15. User-selected additional apps (up to 2) are exempt
     @Test
     fun scenario15_userSelectedAdditionalApp_isExempt() {
-        val selectedApp = "com.openai.chatgpt"
-        val decision = resolver.resolveExemption(selectedApp, selectedAdditionalPackage = selectedApp)
+        val selectedApp1 = "notion.id"
+        val selectedApp2 = "md.obsidian"
+        val decision = resolver.resolveExemption(selectedApp1, selectedAdditionalPackage = selectedApp1)
         assertTrue("Configured additional app must be exempt", decision.isExempt)
         assertEquals(ExemptionCategory.USER_SELECTED_ADDITIONAL, decision.category)
+
+        val multi = listOf(selectedApp1, selectedApp2)
+        assertEquals(ExemptionCategory.USER_SELECTED_ADDITIONAL, resolver.resolveExemption(selectedApp1, multi).category)
+        assertEquals(ExemptionCategory.USER_SELECTED_ADDITIONAL, resolver.resolveExemption(selectedApp2, multi).category)
     }
 
-    // 16. Ineligible apps (games, social media, entertainment streaming) are rejected from selection
+    // 16. Ineligible apps (games, social media, entertainment streaming) and already-exempt AI chatbots are rejected from user-selected slots
     @Test
     fun scenario16_ineligibleApps_rejectedFromAdditionalSelection() {
         val games = listOf("com.king.candycrushsaga", "com.supercell.clashofclans")
@@ -202,9 +207,12 @@ class EssentialModeExemptionResolverTest {
             assertFalse("Streaming app $pkg must not be selectable as additional app", resolver.canSelectAsAdditionalApp(pkg))
         }
 
-        // Productivity app must be accepted
-        assertTrue("ChatGPT must be eligible", resolver.canSelectAsAdditionalApp("com.openai.chatgpt"))
+        // ChatGPT is already exempt by default as an AI assistant, so it shouldn't take a user slot
+        assertFalse("ChatGPT is already exempt by default and need not use a slot", resolver.canSelectAsAdditionalApp("com.openai.chatgpt"))
+
+        // Productivity apps must be accepted
         assertTrue("Notion must be eligible", resolver.canSelectAsAdditionalApp("notion.id"))
+        assertTrue("Obsidian must be eligible", resolver.canSelectAsAdditionalApp("md.obsidian"))
     }
 
     // 17. Custom registered Good Lock modules are exempt and survive sync
@@ -307,7 +315,6 @@ class EssentialModeExemptionResolverTest {
     @Test
     fun scenario23_verifiedProductivityTools_accepted() {
         val verifiedTools = listOf(
-            "com.openai.chatgpt",
             "notion.id",
             "md.obsidian",
             "com.todoist",
@@ -451,6 +458,46 @@ class EssentialModeExemptionResolverTest {
         assertTrue("Samsung Pay Framework must be exempt under Essential Mode", decision.isExempt)
         assertEquals("Must be categorized as CORE_PAYMENT", ExemptionCategory.CORE_PAYMENT, decision.category)
         assertTrue(resolver.isExempt(spayfw))
+    }
+
+    // 34. AI chatbots (ChatGPT, Gemini, Claude, Perplexity, Copilot, DeepSeek, Grok, Poe, Le Chat) are exempt by default
+    @Test
+    fun scenario34_aiChatbots_areExemptByDefaultInEssentialMode() {
+        val chatbots = listOf(
+            "com.openai.chatgpt",
+            "com.google.android.apps.bard",
+            "com.anthropic.claude",
+            "ai.perplexity.app.android",
+            "com.microsoft.copilot",
+            "com.deepseek.chat",
+            "ai.x.grok",
+            "com.poe.android",
+            "ai.mistral.chat"
+        )
+        fakeProvider.installed.addAll(chatbots)
+
+        val effectiveExempt = resolver.getEffectiveExemptPackages(emptyList())
+        chatbots.forEach { pkg ->
+            val decision = resolver.resolveExemption(pkg)
+            assertTrue("AI chatbot $pkg must be exempt by default", decision.isExempt)
+            assertEquals("Must be categorized as CORE_AI_ASSISTANT", ExemptionCategory.CORE_AI_ASSISTANT, decision.category)
+            assertTrue("Effective exempt set must contain $pkg", effectiveExempt.contains(pkg))
+            assertFalse("Default-exempt AI chatbot $pkg must not consume a user slot", resolver.canSelectAsAdditionalApp(pkg))
+        }
+    }
+
+    // 35. Up to 2 user-selected additional apps are exempt; extra items beyond 2 are ignored
+    @Test
+    fun scenario35_maxTwoUserSelectedApps_enforced() {
+        val selected = listOf("notion.id", "md.obsidian", "com.todoist")
+        assertTrue(resolver.isExempt("notion.id", selected))
+        assertTrue(resolver.isExempt("md.obsidian", selected))
+        assertFalse("Only up to 2 user-selected additional apps may be exempt", resolver.isExempt("com.todoist", selected))
+
+        val effective = resolver.getEffectiveExemptPackages(selected)
+        assertTrue(effective.contains("notion.id"))
+        assertTrue(effective.contains("md.obsidian"))
+        assertFalse(effective.contains("com.todoist"))
     }
 }
 

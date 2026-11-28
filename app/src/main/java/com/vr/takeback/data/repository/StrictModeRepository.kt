@@ -198,15 +198,36 @@ class StrictModeRepository(private val context: Context? = null, initialState: S
             return false
         }
 
+        val current = _protectionState.value
         val newState = StrictProtectionState(
             isGlobalStrictActive = true,
             isDeviceAdminActive = true,
             status = StrictProtectionStatus.ACTIVE,
             mechanism = StrictMechanism.TEXT_CHALLENGE,
+            saltBase64 = current.saltBase64,
+            passwordHash = current.passwordHash,
             temporaryUnlockUntilEpochMillis = 0L
         )
         _protectionState.value = newState
         persistState(newState)
+        return true
+    }
+
+    /**
+     * Stores or updates the persistent PIN/password credential without forcing Strict Mode armed.
+     * Used when recovering an Essential Mode exit credential if a previous version cleared it on disarm.
+     */
+    fun setCredential(pin: String): Boolean {
+        if (pin.length < 4) return false
+        val salt = StrictModeManager.generateSalt()
+        val hash = StrictModeManager.hashPin(pin, salt)
+        val saltBase64 = Base64.getEncoder().encodeToString(salt)
+        val updated = _protectionState.value.copy(
+            saltBase64 = saltBase64,
+            passwordHash = hash
+        )
+        _protectionState.value = updated
+        persistState(updated)
         return true
     }
 
@@ -295,7 +316,14 @@ class StrictModeRepository(private val context: Context? = null, initialState: S
         val newState = StrictProtectionState(
             isGlobalStrictActive = false,
             isDeviceAdminActive = isDeviceAdminActive(),
-            status = StrictProtectionStatus.DISABLED
+            status = StrictProtectionStatus.DISABLED,
+            mechanism = if (!current.saltBase64.isNullOrEmpty() && !current.passwordHash.isNullOrEmpty()) {
+                current.mechanism
+            } else {
+                StrictMechanism.TEXT_CHALLENGE
+            },
+            saltBase64 = current.saltBase64,
+            passwordHash = current.passwordHash
         )
         _protectionState.value = newState
         persistState(newState)

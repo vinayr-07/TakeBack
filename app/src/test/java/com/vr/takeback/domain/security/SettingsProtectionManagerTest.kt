@@ -40,9 +40,9 @@ class SettingsProtectionManagerTest {
         assertEquals(SettingsDestination.TAKEBACK_ACCESSIBILITY_DETAILS, decision.destination)
     }
 
-    // 2. Strict Mode on -> General Accessibility management list allowed (no nuisance block)
+    // 2. Strict Mode on -> Whole Accessibility management menu is BLOCKED
     @Test
-    fun test2_strictModeOn_accessibilityManagementListDetectedAndAllowed() {
+    fun test2_strictModeOn_accessibilityManagementListDetectedAndBlocked() {
         val root = mockNode(
             text = "Accessibility",
             children = listOf(
@@ -58,7 +58,7 @@ class SettingsProtectionManagerTest {
             isStrictLocked = true,
             isMaintenanceUnlocked = false
         )
-        assertFalse("General Accessibility list must be permitted to avoid nuisance blocks", decision.isRestricted)
+        assertTrue("Whole Accessibility page must be blocked under Strict Mode", decision.isRestricted)
         assertEquals(SettingsDestination.ACCESSIBILITY_SETTINGS, decision.destination)
     }
 
@@ -106,9 +106,9 @@ class SettingsProtectionManagerTest {
         assertEquals(SettingsDestination.TAKEBACK_DEVICE_ADMIN_DETAILS, decision.destination)
     }
 
-    // 5. Strict Mode on -> Device Admin list detected and allowed
+    // 5. Strict Mode on -> Whole Device Admin list detected and BLOCKED
     @Test
-    fun test5_strictModeOn_deviceAdminListDetectedAndAllowed() {
+    fun test5_strictModeOn_deviceAdminListDetectedAndBlocked() {
         val root = mockNode(
             text = "Device admin apps",
             children = listOf(
@@ -123,7 +123,7 @@ class SettingsProtectionManagerTest {
             isStrictLocked = true,
             isMaintenanceUnlocked = false
         )
-        assertFalse("General Device Admin list must be accessible", decision.isRestricted)
+        assertTrue("Whole Device Admin list must be blocked while Strict Mode is active", decision.isRestricted)
         assertEquals(SettingsDestination.DEVICE_ADMIN_SETTINGS, decision.destination)
     }
 
@@ -299,9 +299,9 @@ class SettingsProtectionManagerTest {
         assertEquals(SettingsDestination.UNRELATED_DEVICE_ADMIN_ACTIVATION, decision.destination)
     }
 
-    // 12b. Installed accessibility services list is allowed
+    // 12b. Installed/Downloaded accessibility services list is BLOCKED under Strict Mode
     @Test
-    fun test12b_installedAccessibilityServices_isAllowed() {
+    fun test12b_installedAccessibilityServices_isBlocked() {
         val root = mockNode(
             text = "Installed services",
             children = listOf(
@@ -316,7 +316,7 @@ class SettingsProtectionManagerTest {
             isStrictLocked = true,
             isMaintenanceUnlocked = false
         )
-        assertFalse("Installed services list must not be blocked", decision.isRestricted)
+        assertTrue("Installed services list must be blocked before reaching TakeBack toggle", decision.isRestricted)
         assertEquals(SettingsDestination.INSTALLED_ACCESSIBILITY_SERVICES, decision.destination)
     }
 
@@ -388,5 +388,119 @@ class SettingsProtectionManagerTest {
             temporarySettingsUnlockUntilEpochMillis = 0L // No maintenance window
         )
         assertTrue("Settings must remain locked after restart without maintenance", state.isSettingsLocked)
+    }
+
+    // 16. Realme UI Downloaded Accessibility Apps screen & SafeCenter Accessibility guide blocked immediately
+    @Test
+    fun test16_realmeAccessibilityScreens_blockedImmediatelyEvenBeforeChildrenInflate() {
+        val emptyContainerDuringTransition = mockNode(text = null, children = emptyList())
+
+        val downloadedDecision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.oplus.settings.OplusSettingsActivity\$OplusAccessibilityDownloadedSettingsActivity",
+            rootNode = emptyContainerDuringTransition,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false,
+            eventText = "Downloaded apps"
+        )
+        assertTrue("Realme Downloaded Accessibility screen must block immediately", downloadedDecision.isRestricted)
+        assertEquals(SettingsDestination.INSTALLED_ACCESSIBILITY_SERVICES, downloadedDecision.destination)
+
+        val safeCenterDecision = SettingsProtectionManager.evaluate(
+            packageName = "com.oplus.safecenter",
+            className = "com.oplus.safecenter.accessibility.AccessibilityGuideCloseActivity",
+            rootNode = emptyContainerDuringTransition,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertTrue("Realme SafeCenter accessibility close guide must block immediately", safeCenterDecision.isRestricted)
+        assertEquals(SettingsDestination.ACCESSIBILITY_SETTINGS, safeCenterDecision.destination)
+    }
+
+    // 17. Realme OplusDeviceAdminAdd & Samsung App Info deep tree (>10 levels) blocked
+    @Test
+    fun test17_realmeDeviceAdminAndDeepSamsungAppInfo_blocked() {
+        val adminRoot = mockNode(
+            text = "Device admin",
+            children = listOf(
+                mockNode(text = "TakeBack"),
+                mockNode(text = "Deactivate")
+            )
+        )
+        val adminDecision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.oplus.settings.feature.security.OplusDeviceAdminAdd",
+            rootNode = adminRoot,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertTrue(adminDecision.isRestricted)
+        assertEquals(SettingsDestination.TAKEBACK_DEVICE_ADMIN_DETAILS, adminDecision.destination)
+
+        // Build 12-level nested hierarchy typical of Samsung One UI / Realme UI Preference screens
+        var nested = mockNode(
+            text = "TakeBack",
+            children = listOf(mockNode(text = "Force stop"), mockNode(text = "Storage usage"))
+        )
+        repeat(11) {
+            nested = mockNode(children = listOf(nested))
+        }
+        val appInfoDecision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.android.settings.applications.InstalledAppDetailsTop",
+            rootNode = nested,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertTrue("Deeply nested App Info screen for TakeBack must be blocked", appInfoDecision.isRestricted)
+        assertEquals(SettingsDestination.TAKEBACK_APP_INFO, appInfoDecision.destination)
+    }
+
+    // 18. Settings Home screen with Accessibility item visible is NOT falsely blocked
+    @Test
+    fun test18_settingsHome_notBlocked() {
+        val homeRoot = mockNode(
+            text = "Settings",
+            children = listOf(
+                mockNode(text = "Search settings"),
+                mockNode(text = "Connections"),
+                mockNode(text = "Accessibility")
+            )
+        )
+        val decision = SettingsProtectionManager.evaluate(
+            packageName = "com.samsung.android.settings",
+            className = "com.android.settings.Settings",
+            rootNode = homeRoot,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertFalse("Top-level Settings Home must remain accessible", decision.isRestricted)
+        assertEquals(SettingsDestination.SETTINGS_HOME, decision.destination)
+    }
+
+    // 19. Realme UI "Activate Device admin apps?" verification dialog is blocked as DEVICE_ADMIN_SETTINGS
+    @Test
+    fun test19_realmeDeviceAdminVerificationDialog_blockedAsDeviceAdminSettings() {
+        val realmeAdminGate = mockNode(
+            text = "Activate Device admin apps?",
+            children = listOf(
+                mockNode(text = "This feature grants system permissions that expose you to greater security risks."),
+                mockNode(text = "Verification code"),
+                mockNode(text = "Cancel"),
+                mockNode(text = "Activate")
+            )
+        )
+        val decision = SettingsProtectionManager.evaluate(
+            packageName = "com.android.settings",
+            className = "com.android.settings.Settings\$DeviceAdminSettingsActivity",
+            rootNode = realmeAdminGate,
+            isStrictLocked = true,
+            isMaintenanceUnlocked = false
+        )
+        assertTrue(
+            "Realme Device Admin verification gate must be blocked under Strict Mode",
+            decision.isRestricted
+        )
+        assertEquals(SettingsDestination.DEVICE_ADMIN_SETTINGS, decision.destination)
     }
 }

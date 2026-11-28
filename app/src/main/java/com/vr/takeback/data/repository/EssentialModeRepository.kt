@@ -24,7 +24,7 @@ enum class EssentialModeStatus {
 data class EssentialModeState(
     val isEnabled: Boolean = false,
     val dailyAllowanceMinutes: Int = 360, // 6 hours default
-    val selectedAdditionalPackage: String? = "com.openai.chatgpt",
+    val selectedAdditionalPackages: List<String> = emptyList(),
     val status: EssentialModeStatus = EssentialModeStatus.DISABLED,
     val dailyCycleDate: String = "",
     val activationEpochMillis: Long = 0L,
@@ -46,11 +46,13 @@ class EssentialModeRepository(
 ) {
 
     companion object {
+        const val MAX_ADDITIONAL_PACKAGES = com.vr.takeback.domain.security.EssentialModeExemptionResolver.MAX_ADDITIONAL_PACKAGES
         private const val TAG = "EssentialModeRepo"
         private const val PREFS_NAME = "takeback_essential_prefs"
         private const val KEY_ENABLED = "is_enabled"
         private const val KEY_ALLOWANCE_MINS = "daily_allowance_minutes"
         private const val KEY_SELECTED_ADDITIONAL = "selected_additional_package"
+        private const val KEY_SELECTED_ADDITIONAL_LIST = "selected_additional_packages"
         private const val KEY_STATUS = "status"
         private const val KEY_CYCLE_DATE = "daily_cycle_date"
         private const val KEY_ACTIVATION_EPOCH = "activation_epoch_millis"
@@ -91,7 +93,23 @@ class EssentialModeRepository(
         }
         val isEnabled = prefs.getBoolean(KEY_ENABLED, false)
         val allowance = prefs.getInt(KEY_ALLOWANCE_MINS, 360)
-        val additional = prefs.getString(KEY_SELECTED_ADDITIONAL, "com.openai.chatgpt")
+        val savedListRaw = prefs.getString(KEY_SELECTED_ADDITIONAL_LIST, null)
+        val selectedPackages: List<String> = if (savedListRaw != null) {
+            savedListRaw.split(",")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+                .take(MAX_ADDITIONAL_PACKAGES)
+        } else {
+            val legacyAdditional = prefs.getString(KEY_SELECTED_ADDITIONAL, null)?.trim()
+            if (!legacyAdditional.isNullOrEmpty() &&
+                !com.vr.takeback.domain.security.EssentialModeExemptionResolver.isDefaultAiChatbot(legacyAdditional)
+            ) {
+                listOf(legacyAdditional)
+            } else {
+                emptyList()
+            }
+        }
         val statusStr = prefs.getString(KEY_STATUS, EssentialModeStatus.DISABLED.name) ?: EssentialModeStatus.DISABLED.name
         val status = try {
             EssentialModeStatus.valueOf(statusStr)
@@ -108,7 +126,7 @@ class EssentialModeRepository(
         return EssentialModeState(
             isEnabled = isEnabled,
             dailyAllowanceMinutes = allowance,
-            selectedAdditionalPackage = additional,
+            selectedAdditionalPackages = selectedPackages,
             status = status,
             dailyCycleDate = cycleDate,
             activationEpochMillis = activationEpoch,
@@ -124,7 +142,8 @@ class EssentialModeRepository(
         prefs?.edit()?.apply {
             putBoolean(KEY_ENABLED, newState.isEnabled)
             putInt(KEY_ALLOWANCE_MINS, newState.dailyAllowanceMinutes)
-            putString(KEY_SELECTED_ADDITIONAL, newState.selectedAdditionalPackage)
+            putString(KEY_SELECTED_ADDITIONAL_LIST, newState.selectedAdditionalPackages.joinToString(","))
+            putString(KEY_SELECTED_ADDITIONAL, newState.selectedAdditionalPackages.firstOrNull())
             putString(KEY_STATUS, newState.status.name)
             putString(KEY_CYCLE_DATE, newState.dailyCycleDate)
             putLong(KEY_ACTIVATION_EPOCH, newState.activationEpochMillis)
@@ -214,6 +233,14 @@ class EssentialModeRepository(
         val strictRepo = strictModeRepoProvider?.invoke() ?: runCatching { TakeBackApplication.strictModeRepository }.getOrNull()
         val strictState = strictRepo?.protectionState?.value
         return !strictState?.saltBase64.isNullOrEmpty() && !strictState?.passwordHash.isNullOrEmpty()
+    }
+
+    /**
+     * Returns true when Essential Mode is missing its saved password credential while Strict Mode
+     * is inactive (e.g., upgraded from a build where disarming Strict Mode cleared the saved hash).
+     */
+    fun canRecoverMissingPassword(): Boolean {
+        return !hasConfiguredPin() && !isStrictActive()
     }
 
     /**
@@ -312,25 +339,26 @@ class EssentialModeRepository(
         }
 
         if (isStrictActive()) {
-            if (!enabled) {
-                safeLogW("Cannot disable Essential Mode while Strict Mode is active")
-                return false
-            }
             val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
             if (!valid) {
-                safeLogW("Attempted to enable Essential Mode in Strict Mode without valid authorization token")
+                safeLogW("Attempted to toggle Essential Mode (enabled=$enabled) in Strict Mode without valid authorization token")
                 return false
             }
         }
 
-        val newStatus = if (enabled) {
-            if (current.status == EssentialModeStatus.ACTIVE) EssentialModeStatus.ACTIVE else EssentialModeStatus.MONITORING
-        } else {
-            EssentialModeStatus.DISABLED
+        val keepActiveLatch = enabled && current.status == EssentialModeStatus.ACTIVE
+        val newStatus = when {
+            keepActiveLatch -> EssentialModeStatus.ACTIVE
+            enabled -> EssentialModeStatus.MONITORING
+            else -> EssentialModeStatus.DISABLED
         }
         val updated = current.copy(
             isEnabled = enabled,
-            status = newStatus
+            status = newStatus,
+            isEmergencyExitActive = false,
+            emergencyExitEpochMillis = 0L,
+            activationEpochMillis = if (keepActiveLatch) current.activationEpochMillis else 0L,
+            usageAtActivationMinutes = if (keepActiveLatch) current.usageAtActivationMinutes else 0
         )
         _state.value = updated
         persistState(updated)
@@ -375,50 +403,64 @@ class EssentialModeRepository(
     }
 
     /**
-     * Updates the single user-selected additional allowed application.
+     * Updates up to [MAX_ADDITIONAL_PACKAGES] (2) user-selected additional allowed applications.
      * Protected by StrictMutationGate when Strict Mode is active.
      * Prevents modification while Essential Mode is actively restricting.
      */
-    fun setSelectedAdditionalPackage(packageName: String?, token: String? = null): Boolean {
+    fun setSelectedAdditionalPackages(packages: List<String>, token: String? = null): Boolean {
         val current = _state.value
         if (current.status == EssentialModeStatus.ACTIVE) {
-            safeLogW("Cannot change additional allowed application while Essential Mode is actively restricting")
+            safeLogW("Cannot change additional allowed applications while Essential Mode is actively restricting")
             return false
         }
 
         if (isStrictActive()) {
             val valid = StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)
             if (!valid) {
-                safeLogW("Attempted to modify additional application without valid Strict Mode authorization token")
+                safeLogW("Attempted to modify additional applications without valid Strict Mode authorization token")
                 return false
             }
         }
 
-        if (packageName != null) {
-            val trimmed = packageName.trim()
-            if (trimmed.isEmpty()) {
-                safeLogW("Cannot set empty package name as additional allowed application")
+        val normalized = packages.map { it.trim() }
+        if (normalized.any { it.isEmpty() }) {
+            safeLogW("Cannot set blank package name as additional allowed application")
+            return false
+        }
+
+        val distinct = normalized.distinct()
+        if (distinct.size > MAX_ADDITIONAL_PACKAGES) {
+            safeLogW("Cannot select more than $MAX_ADDITIONAL_PACKAGES additional allowed applications (attempted: ${distinct.size})")
+            return false
+        }
+
+        val resolver = exemptionResolverProvider?.invoke() ?: runCatching { TakeBackApplication.essentialModeExemptionResolver }.getOrNull()
+        for (pkg in distinct) {
+            if (resolver != null && !resolver.canSelectAsAdditionalApp(pkg)) {
+                safeLogW("Package $pkg is not eligible to be selected as additional allowed application")
                 return false
             }
-            val resolver = exemptionResolverProvider?.invoke() ?: runCatching { TakeBackApplication.essentialModeExemptionResolver }.getOrNull()
-            if (resolver != null && !resolver.canSelectAsAdditionalApp(trimmed)) {
-                safeLogW("Package $trimmed is not eligible to be selected as additional allowed application")
-                return false
-            }
-            val updated = current.copy(selectedAdditionalPackage = trimmed)
-            _state.value = updated
-            persistState(updated)
-            return true
+        }
+
+        val updated = current.copy(selectedAdditionalPackages = distinct)
+        _state.value = updated
+        persistState(updated)
+        return true
+    }
+
+    /**
+     * Convenience wrapper for updating a single additional application (or clearing when null).
+     */
+    fun setSelectedAdditionalPackage(packageName: String?, token: String? = null): Boolean {
+        return if (packageName == null) {
+            setSelectedAdditionalPackages(emptyList(), token)
         } else {
-            val updated = current.copy(selectedAdditionalPackage = null)
-            _state.value = updated
-            persistState(updated)
-            return true
+            setSelectedAdditionalPackages(listOf(packageName), token)
         }
     }
 
     /**
-     * Authenticates using the existing Strict Mode PIN/password and triggers Emergency Exit.
+     * Authenticates strictly using the configured Strict Mode password/PIN and triggers Emergency Exit.
      * Deactivates Essential Mode for the remainder of the current local daily cycle.
      * Does NOT modify recorded usage, reset allowance, disable Strict Mode, or disable Device Admin.
      * Protected against rapid brute-force attempts with escalating lockout backoff.
@@ -436,7 +478,6 @@ class EssentialModeRepository(
         val hash = strictState?.passwordHash
 
         if (salt.isNullOrEmpty() || hash.isNullOrEmpty()) {
-            recordFailedAttempt()
             safeLogW("Emergency Exit attempted but no Strict Mode credential exists")
             return false
         }
@@ -462,23 +503,30 @@ class EssentialModeRepository(
     }
 
     /**
-     * Authenticates Emergency Exit using a solved challenge token (supports both PIN and Random Text Challenge).
+     * Recovery path ONLY when Strict Mode is inactive and no password hash exists on disk.
+     * Saves the new password credential, clears any stale lockout, and pauses Essential Mode for today.
      */
-    fun authenticateAndTriggerEmergencyExitWithToken(token: String): Boolean {
-        if (StrictMutationGate.consumeToken(token, MutationType.UPDATE_ESSENTIAL_MODE)) {
-            resetFailedAttempts()
-            safeLogI("Emergency Exit authorized via challenge token. Deactivating Essential Mode until next daily reset.")
-            val current = _state.value
-            val updated = current.copy(
-                isEmergencyExitActive = true,
-                emergencyExitEpochMillis = System.currentTimeMillis(),
-                status = EssentialModeStatus.EMERGENCY_EXIT_ACTIVE
-            )
-            _state.value = updated
-            persistState(updated)
-            return true
+    fun setRecoveryPasswordAndEmergencyExit(newPassword: String): Boolean {
+        if (!canRecoverMissingPassword()) {
+            safeLogW("Rejected recovery Emergency Exit: credential already exists or Strict Mode is active")
+            return false
         }
-        return false
+        val strictRepo = strictModeRepoProvider?.invoke() ?: runCatching { TakeBackApplication.strictModeRepository }.getOrNull()
+            ?: return false
+        if (!strictRepo.setCredential(newPassword)) {
+            return false
+        }
+        resetFailedAttempts()
+        safeLogI("Saved recovery password and triggered Essential Mode Emergency Exit.")
+        val current = _state.value
+        val updated = current.copy(
+            isEmergencyExitActive = true,
+            emergencyExitEpochMillis = System.currentTimeMillis(),
+            status = EssentialModeStatus.EMERGENCY_EXIT_ACTIVE
+        )
+        _state.value = updated
+        persistState(updated)
+        return true
     }
 
     fun addCustomGoodLockModule(packageName: String, token: String? = null): Boolean {

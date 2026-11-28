@@ -96,12 +96,12 @@ fun StrictChallengeDialog(
                     OutlinedTextField(
                         value = pinInput,
                         onValueChange = {
-                            if (it.length <= 8) {
+                            if (it.length <= 32) {
                                 pinInput = it
                                 errorMessage = null
                             }
                         },
-                        label = { Text("Secure PIN") },
+                        label = { Text("Password / PIN") },
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()

@@ -1,6 +1,8 @@
 package com.vr.takeback.presentation.ui.screens
 
 import android.content.Intent
+import android.widget.Toast
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -26,11 +28,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.vr.takeback.data.repository.EssentialModeStatus
 import com.vr.takeback.data.repository.PermissionRepository
 import com.vr.takeback.data.repository.ProfileRepository
 import com.vr.takeback.data.repository.QuickBlockRepository
 import com.vr.takeback.data.repository.UsageStatsRepository
 import com.vr.takeback.domain.security.MutationType
+import com.vr.takeback.presentation.ui.components.EssentialModeExitDialog
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 import com.vr.takeback.presentation.viewmodel.HomeUiEvent
 import com.vr.takeback.presentation.viewmodel.HomeUiState
@@ -319,11 +323,18 @@ fun HomeScreenContent(
                                             "Quick Block active (${mins}m ${secs}s left) • Guarding distractions"
                                         }
                                         uiState.isEssentialModeEnforcing -> {
-                                            "Essential Mode active • Daily screen time limit enforced"
+                                            if (uiState.essentialState.status == EssentialModeStatus.ACTIVE) {
+                                                "Essential Mode active • Daily screen time limit enforced"
+                                            } else {
+                                                "Essential Mode monitoring • Enforces at ${uiState.essentialState.dailyAllowanceMinutes / 60}h ${uiState.essentialState.dailyAllowanceMinutes % 60}m"
+                                            }
                                         }
                                         uiState.activelyEnforcingProfiles.isNotEmpty() -> {
                                             val totalApps = uiState.activelyEnforcingProfiles.flatMap { it.targetApps }.distinctBy { it.packageName }.size
                                             "${uiState.activelyEnforcingProfiles.size} profile(s) actively blocking $totalApps app(s)"
+                                        }
+                                        uiState.essentialState.isEmergencyExitActive -> {
+                                            "Essential Mode exited until midnight • Blocker is idle unless you start a profile or Quick Block."
                                         }
                                         else -> {
                                             "No restrictions running. Blocker is idle. Enable a profile below or start Quick Block."
@@ -332,6 +343,23 @@ fun HomeScreenContent(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = subtitleColor
                                 )
+                            }
+                        }
+
+                        if (uiState.isEssentialModeEnforcing) {
+                            Spacer(modifier = Modifier.height(14.dp))
+                            OutlinedButton(
+                                onClick = { onEvent(HomeUiEvent.SetEssentialExitDialogVisible(true)) },
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    containerColor = Color.White.copy(alpha = 0.12f),
+                                    contentColor = Color.White
+                                ),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Filled.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Exit Essential Mode (Password)", fontWeight = FontWeight.Bold)
                             }
                         }
 
@@ -795,6 +823,19 @@ fun HomeScreenContent(
                 },
                 onDismissRequest = {
                     onEvent(HomeUiEvent.DismissCancelQuickBlockChallenge)
+                }
+            )
+        }
+
+        // Password-only Dialog to Exit Essential Mode
+        if (uiState.showEssentialExitDialog) {
+            EssentialModeExitDialog(
+                onExited = {
+                    onEvent(HomeUiEvent.SetEssentialExitDialogVisible(false))
+                    Toast.makeText(context, "Essential Mode exited until midnight reset", Toast.LENGTH_SHORT).show()
+                },
+                onDismissRequest = {
+                    onEvent(HomeUiEvent.SetEssentialExitDialogVisible(false))
                 }
             )
         }

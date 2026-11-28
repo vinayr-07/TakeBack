@@ -59,7 +59,7 @@ fun EssentialModeDiagnosticsScreen(
     }
 
     LaunchedEffect(state) {
-        diagnosticSummary = exemptionResolver.getDiagnosticSummary(state.selectedAdditionalPackage)
+        diagnosticSummary = exemptionResolver.getDiagnosticSummary(state.selectedAdditionalPackages)
     }
 
     Scaffold(
@@ -268,7 +268,64 @@ fun EssentialModeDiagnosticsScreen(
                 }
             }
 
-            // User-Selected Additional App
+            // AI Chatbots & Assistants
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.AutoAwesome, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "AI Chatbots & Assistants (Default Exempt)",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "All supported AI chatbots (ChatGPT, Gemini, Claude, Perplexity, Copilot, DeepSeek, Grok, Poe, Le Chat) remain exempt by default.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        summary?.aiAssistants?.forEach { (label, isInstalled) ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 3.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (isInstalled) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                                ) {
+                                    Text(
+                                        text = if (isInstalled) "EXEMPT" else "READY",
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isInstalled) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // User-Selected Additional Apps (Up to 2)
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -281,17 +338,27 @@ fun EssentialModeDiagnosticsScreen(
                             Icon(Icons.Filled.Star, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Selected Additional Application",
+                                text = "Selected Additional Apps (${state.selectedAdditionalPackages.size}/2)",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Package: ${state.selectedAdditionalPackage ?: "None configured"}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        if (state.selectedAdditionalPackages.isEmpty()) {
+                            Text(
+                                text = "None configured (up to 2 productivity apps can be selected in Settings)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            state.selectedAdditionalPackages.forEachIndexed { idx, pkg ->
+                                Text(
+                                    text = "${idx + 1}. $pkg",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = "Eligibility verified. Games, social media, and entertainment streaming are rejected.",
@@ -436,7 +503,7 @@ fun EssentialModeDiagnosticsScreen(
                                                 val ok = essentialRepo.removeCustomGoodLockModule(customPkg, token)
                                                 if (ok) {
                                                     exemptionResolver.synchronizeCustomGoodLockModules(essentialRepo.state.value.customGoodLockModules)
-                                                    diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackage)
+                                                    diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackages)
                                                     Toast.makeText(context, "Module removed", Toast.LENGTH_SHORT).show()
                                                 } else {
                                                     Toast.makeText(context, "Action failed or blocked by Strict Mode", Toast.LENGTH_SHORT).show()
@@ -586,7 +653,7 @@ fun EssentialModeDiagnosticsScreen(
                                 val ok = essentialRepo.addCustomGoodLockModule(pkg, token)
                                 if (ok) {
                                     exemptionResolver.synchronizeCustomGoodLockModules(essentialRepo.state.value.customGoodLockModules)
-                                    diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackage)
+                                    diagnosticSummary = exemptionResolver.getDiagnosticSummary(essentialRepo.state.value.selectedAdditionalPackages)
                                     Toast.makeText(context, "Module registered as exempt", Toast.LENGTH_SHORT).show()
                                     customPackageInput = ""
                                     customPackageError = null

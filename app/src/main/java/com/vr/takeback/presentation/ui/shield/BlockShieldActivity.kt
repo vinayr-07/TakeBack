@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vr.takeback.TakeBackApplication
 import com.vr.takeback.data.repository.ValidatedUsageSnapshot
+import com.vr.takeback.presentation.ui.components.EssentialModeExitDialog
 import com.vr.takeback.presentation.ui.components.StrictChallengeDialog
 import com.vr.takeback.ui.theme.TakeBackTheme
 import kotlinx.coroutines.Dispatchers
@@ -106,17 +107,7 @@ class BlockShieldActivity : ComponentActivity() {
                     } ?: if (rawUsedMins > 0) rawUsedMins else essentialState.usageAtActivationMinutes
 
                     var showAuthDialog by remember { mutableStateOf(false) }
-                    var showEmergencyExitPinDialog by remember { mutableStateOf(false) }
-                    var showEmergencyExitChallengeDialog by remember { mutableStateOf(false) }
-                    var rateLimitTick by remember { mutableStateOf(0) }
-
-                    // Lockout countdown tick
-                    LaunchedEffect(showEmergencyExitPinDialog, rateLimitTick) {
-                        if (essentialRepo.isRateLimited()) {
-                            kotlinx.coroutines.delay(1000L)
-                            rateLimitTick++
-                        }
-                    }
+                    var showEmergencyExitDialog by remember { mutableStateOf(false) }
 
                     BlockShieldContent(
                         appName = appName,
@@ -132,7 +123,7 @@ class BlockShieldActivity : ComponentActivity() {
                         usedMinutes = liveScreenTimeMinutes,
                         usageAtActivationMinutes = essentialState.usageAtActivationMinutes,
                         liveSnapshot = liveSnapshot,
-                        selectedAdditionalPackage = essentialState.selectedAdditionalPackage,
+                        selectedAdditionalPackages = essentialState.selectedAdditionalPackages,
                         isRateLimited = essentialRepo.isRateLimited(),
                         lockoutRemainingSeconds = essentialRepo.getLockoutRemainingSeconds(),
                         onGoHomeClick = {
@@ -147,99 +138,18 @@ class BlockShieldActivity : ComponentActivity() {
                             showAuthDialog = true
                         },
                         onEmergencyExitClick = {
-                            if (strictState.mechanism == com.vr.takeback.domain.model.StrictMechanism.TEXT_CHALLENGE) {
-                                showEmergencyExitChallengeDialog = true
-                            } else {
-                                showEmergencyExitPinDialog = true
-                            }
+                            showEmergencyExitDialog = true
                         }
                     )
 
-                    if (showEmergencyExitPinDialog) {
-                        var enteredPin by remember { mutableStateOf("") }
-                        var pinError by remember { mutableStateOf<String?>(null) }
-                        val isLockedOut = essentialRepo.isRateLimited()
-                        val lockoutRemaining = essentialRepo.getLockoutRemainingSeconds()
-
-                        AlertDialog(
-                            onDismissRequest = { showEmergencyExitPinDialog = false },
-                            icon = { Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                            title = { Text("Emergency Exit", fontWeight = FontWeight.Bold) },
-                            text = {
-                                Column {
-                                    Text(
-                                        "Authenticate with your Strict Mode PIN to pause Essential Mode for the remainder of today. " +
-                                                "Restrictions will automatically resume at tomorrow's daily reset.",
-                                        style = MaterialTheme.typography.bodyMedium
-                                    )
-                                    Spacer(modifier = Modifier.height(16.dp))
-
-                                    if (isLockedOut) {
-                                        Text(
-                                            "Too many failed attempts. Locked out for $lockoutRemaining seconds.",
-                                            color = MaterialTheme.colorScheme.error,
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.bodyMedium
-                                        )
-                                    } else {
-                                        OutlinedTextField(
-                                            value = enteredPin,
-                                            onValueChange = { enteredPin = it; pinError = null },
-                                            label = { Text("Strict Mode PIN") },
-                                            isError = pinError != null,
-                                            supportingText = pinError?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
-                                            visualTransformation = PasswordVisualTransformation(),
-                                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                                            singleLine = true,
-                                            modifier = Modifier.fillMaxWidth()
-                                        )
-                                    }
-                                }
+                    if (showEmergencyExitDialog) {
+                        EssentialModeExitDialog(
+                            essentialRepository = essentialRepo,
+                            onExited = {
+                                showEmergencyExitDialog = false
+                                finish()
                             },
-                            confirmButton = {
-                                Button(
-                                    onClick = {
-                                        if (isLockedOut) return@Button
-                                        val success = essentialRepo.authenticateAndTriggerEmergencyExit(enteredPin)
-                                        if (success) {
-                                            showEmergencyExitPinDialog = false
-                                            finish()
-                                        } else {
-                                            pinError = if (essentialRepo.isRateLimited()) {
-                                                "Too many failed attempts. Locked out for ${essentialRepo.getLockoutRemainingSeconds()}s."
-                                            } else {
-                                                "Incorrect Strict Mode PIN."
-                                            }
-                                        }
-                                    },
-                                    enabled = !isLockedOut && enteredPin.isNotBlank(),
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                                ) {
-                                    Text("Authorize Exit")
-                                }
-                            },
-                            dismissButton = {
-                                TextButton(onClick = { showEmergencyExitPinDialog = false }) {
-                                    Text("Cancel")
-                                }
-                            }
-                        )
-                    }
-
-                    if (showEmergencyExitChallengeDialog) {
-                        StrictChallengeDialog(
-                            mechanism = strictState.mechanism,
-                            saltBase64 = strictState.saltBase64,
-                            expectedHash = strictState.passwordHash,
-                            mutationType = com.vr.takeback.domain.security.MutationType.UPDATE_ESSENTIAL_MODE,
-                            onTokenIssued = { token ->
-                                val success = essentialRepo.authenticateAndTriggerEmergencyExitWithToken(token)
-                                if (success) {
-                                    showEmergencyExitChallengeDialog = false
-                                    finish()
-                                }
-                            },
-                            onDismissRequest = { showEmergencyExitChallengeDialog = false }
+                            onDismissRequest = { showEmergencyExitDialog = false }
                         )
                     }
 
@@ -285,7 +195,7 @@ fun BlockShieldContent(
     usedMinutes: Int = 0,
     usageAtActivationMinutes: Int = 0,
     liveSnapshot: ValidatedUsageSnapshot? = null,
-    selectedAdditionalPackage: String? = null,
+    selectedAdditionalPackages: List<String> = emptyList(),
     isRateLimited: Boolean = false,
     lockoutRemainingSeconds: Int = 0,
     onGoHomeClick: () -> Unit,
@@ -492,11 +402,13 @@ fun BlockShieldContent(
                             }
                         }
                     }
-                    if (!selectedAdditionalPackage.isNullOrEmpty()) {
+                    if (selectedAdditionalPackages.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(6.dp))
-                        val cleanAppName = selectedAdditionalPackage.substringAfterLast('.').replaceFirstChar { it.uppercase() }
+                        val formattedApps = selectedAdditionalPackages.joinToString(", ") { pkg ->
+                            pkg.substringAfterLast('.').replaceFirstChar { it.uppercase() }
+                        }
                         Text(
-                            text = "+ User-Selected App: $cleanAppName ($selectedAdditionalPackage)",
+                            text = "+ User-Selected Apps (${selectedAdditionalPackages.size}/2): $formattedApps",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.secondary,
                             fontWeight = FontWeight.SemiBold
@@ -505,7 +417,7 @@ fun BlockShieldContent(
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Samsung One Hand Operation+ gestures and Good Lock modules remain operational.",
+                        text = "AI chatbots (ChatGPT, Gemini, Claude, etc.), payment apps, Samsung One Hand Operation+, and Good Lock remain operational.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -589,7 +501,7 @@ fun BlockShieldContent(
                 Icon(Icons.Filled.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (isRateLimited) "Emergency Exit Locked (${lockoutRemainingSeconds}s)" else "Emergency Exit",
+                    text = if (isRateLimited) "Exit Locked (${lockoutRemainingSeconds}s)" else "Exit Essential Mode (Password)",
                     fontWeight = FontWeight.Bold,
                     fontSize = 15.sp
                 )

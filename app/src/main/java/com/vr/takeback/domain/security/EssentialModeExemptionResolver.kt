@@ -25,6 +25,7 @@ interface PackageInfoProvider {
 enum class ExemptionCategory {
     CORE_COMMUNICATION,
     CORE_PAYMENT,
+    CORE_AI_ASSISTANT,
     USER_SELECTED_ADDITIONAL,
     SAMSUNG_ONE_HAND_OPERATION,
     SAMSUNG_GOOD_LOCK,
@@ -52,7 +53,8 @@ data class AppEligibility(
  */
 data class ExemptionDiagnosticSummary(
     val coreApplications: Map<String, Boolean>,
-    val selectedAdditionalPackage: String?,
+    val aiAssistants: Map<String, Boolean> = emptyMap(),
+    val selectedAdditionalPackages: List<String> = emptyList(),
     val isSelectedAdditionalExempt: Boolean,
     val isOneHandOperationPlusInstalled: Boolean,
     val isOneHandOperationPlusExempt: Boolean,
@@ -86,8 +88,9 @@ data class GoodLockModuleDiagnostic(
  * 2. Samsung One Hand Operation+ (com.samsung.android.sidegesturepad) is ALWAYS exempt.
  * 3. Samsung Good Lock hub and all detected installed Good Lock modules are exempt.
  * 4. All Android system applications (FLAG_SYSTEM and FLAG_UPDATED_SYSTEM_APP) are exempt.
- * 5. Exactly ONE user-selected eligible additional application is exempt.
- * 6. Core communication and utility applications (Dialer, SMS, Camera, WhatsApp) are exempt.
+ * 5. Up to two (2) user-selected eligible additional applications are exempt.
+ * 6. Core communication, utility, payment, and AI chatbot applications (Dialer, SMS, Camera, WhatsApp,
+ *    Samsung Wallet, PhonePe, ChatGPT, Gemini, Claude, etc.) are exempt by default.
  *    WhatsApp Business (com.whatsapp.w4b) is strictly NOT treated as core WhatsApp.
  * 7. Unrelated Samsung applications are NOT exempt merely because their developer is Samsung.
  */
@@ -96,10 +99,27 @@ class EssentialModeExemptionResolver(
 ) {
 
     companion object {
+        const val MAX_ADDITIONAL_PACKAGES = 2
         const val ONE_HAND_OPERATION_PACKAGE = "com.samsung.android.sidegesturepad"
         const val GOOD_LOCK_HUB_PACKAGE = "com.samsung.android.goodlock"
         const val WHATSAPP_PACKAGE = "com.whatsapp"
-        const val DEFAULT_ADDITIONAL_PACKAGE = "com.openai.chatgpt"
+
+        // AI Chatbot & Assistant packages exempt by default during Essential Mode
+        val ESSENTIAL_AI_CHATBOT_PACKAGES = mapOf(
+            "com.openai.chatgpt" to "ChatGPT",
+            "com.google.android.apps.bard" to "Google Gemini",
+            "com.anthropic.claude" to "Claude",
+            "ai.perplexity.app.android" to "Perplexity",
+            "com.microsoft.copilot" to "Microsoft Copilot",
+            "com.deepseek.chat" to "DeepSeek",
+            "ai.x.grok" to "Grok",
+            "com.poe.android" to "Poe",
+            "ai.mistral.chat" to "Le Chat (Mistral)"
+        )
+
+        fun isDefaultAiChatbot(packageName: String): Boolean {
+            return ESSENTIAL_AI_CHATBOT_PACKAGES.containsKey(packageName.trim().lowercase())
+        }
 
         // Verified registry of official Samsung Good Lock modules
         val KNOWN_GOOD_LOCK_MODULES = mapOf(
@@ -210,7 +230,7 @@ class EssentialModeExemptionResolver(
      */
     fun resolveExemption(
         packageName: String,
-        selectedAdditionalPackage: String? = null
+        selectedAdditionalPackages: List<String> = emptyList()
     ): ExemptionDecision {
         val pkg = packageName.trim()
 
@@ -255,8 +275,25 @@ class EssentialModeExemptionResolver(
             )
         }
 
-        // 4. User-selected additional application (exactly one)
-        if (selectedAdditionalPackage != null && pkg == selectedAdditionalPackage) {
+        // 3c. Essential AI chatbot & assistant applications (ChatGPT, Gemini, Claude, etc.)
+        if (isAiChatbotPackage(pkg)) {
+            val botName = ESSENTIAL_AI_CHATBOT_PACKAGES[pkg.lowercase()] ?: "AI Assistant"
+            return ExemptionDecision(
+                packageName = pkg,
+                isExempt = true,
+                category = ExemptionCategory.CORE_AI_ASSISTANT,
+                reason = "$botName AI assistant is exempt by default."
+            )
+        }
+
+        // 4. User-selected additional applications (up to MAX_ADDITIONAL_PACKAGES = 2)
+        val effectiveSelected = selectedAdditionalPackages.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(MAX_ADDITIONAL_PACKAGES)
+            .toSet()
+        if (effectiveSelected.contains(pkg)) {
             return ExemptionDecision(
                 packageName = pkg,
                 isExempt = true,
@@ -284,8 +321,29 @@ class EssentialModeExemptionResolver(
         )
     }
 
-    fun isExempt(packageName: String, selectedAdditionalPackage: String? = null): Boolean {
-        return resolveExemption(packageName, selectedAdditionalPackage).isExempt
+    fun resolveExemption(
+        packageName: String,
+        selectedAdditionalPackage: String?
+    ): ExemptionDecision {
+        return resolveExemption(
+            packageName = packageName,
+            selectedAdditionalPackages = listOfNotNull(selectedAdditionalPackage)
+        )
+    }
+
+    fun isExempt(packageName: String, selectedAdditionalPackages: List<String> = emptyList()): Boolean {
+        return resolveExemption(packageName, selectedAdditionalPackages).isExempt
+    }
+
+    fun isExempt(packageName: String, selectedAdditionalPackage: String?): Boolean {
+        return resolveExemption(packageName, listOfNotNull(selectedAdditionalPackage)).isExempt
+    }
+
+    /**
+     * Returns true if package is one of the default exempt AI chatbot / assistant applications.
+     */
+    fun isAiChatbotPackage(packageName: String): Boolean {
+        return isDefaultAiChatbot(packageName)
     }
 
     /**
@@ -351,10 +409,22 @@ class EssentialModeExemptionResolver(
      * and browsers that may have FLAG_SYSTEM set on OEM ROMs (e.g. Samsung OneUI).
      */
     fun isSystemApplication(packageName: String): Boolean {
+        return isSystemApplicationInternal(
+            packageName = packageName,
+            launchers = packageInfoProvider.getHomeLauncherPackages(),
+            imes = packageInfoProvider.getInputMethodPackages()
+        )
+    }
+
+    private fun isSystemApplicationInternal(
+        packageName: String,
+        launchers: Set<String>,
+        imes: Set<String>
+    ): Boolean {
         val trimmed = packageName.trim()
         if (ESSENTIAL_ANDROID_SYSTEM_PACKAGES.contains(trimmed)) return true
-        if (packageInfoProvider.getHomeLauncherPackages().contains(trimmed)) return true
-        if (packageInfoProvider.getInputMethodPackages().contains(trimmed)) return true
+        if (launchers.contains(trimmed)) return true
+        if (imes.contains(trimmed)) return true
 
         val isSys = packageInfoProvider.isSystemApp(trimmed) || packageInfoProvider.isUpdatedSystemApp(trimmed)
         if (!isSys) return false
@@ -394,9 +464,15 @@ class EssentialModeExemptionResolver(
             return AppEligibility(false, "Application is not installed on this device")
         }
 
-        // Core and system apps don't need to be selected as additional app
+        // Core, AI assistant, Good Lock, and system apps don't need to be selected as additional app
         if (isCoreEssentialPackage(pkg)) {
             return AppEligibility(false, "Already exempt as a core essential application")
+        }
+        if (isPaymentPackage(pkg)) {
+            return AppEligibility(false, "Already exempt as a core payment application")
+        }
+        if (isAiChatbotPackage(pkg)) {
+            return AppEligibility(false, "Already exempt by default as an AI assistant application")
         }
         if (isSystemApplication(pkg)) {
             return AppEligibility(false, "Already exempt as an Android system application")
@@ -456,8 +532,8 @@ class EssentialModeExemptionResolver(
             return false
         }
 
-        // 2. Reject core essential apps or general system apps
-        if (isCoreEssentialPackage(pkg) || isSystemApplication(pkg)) {
+        // 2. Reject core essential apps, AI chatbots, or general system apps
+        if (isCoreEssentialPackage(pkg) || isAiChatbotPackage(pkg) || isSystemApplication(pkg)) {
             return false
         }
 
@@ -489,7 +565,7 @@ class EssentialModeExemptionResolver(
     /**
      * Returns the full set of currently effective exempt packages for snapshot evaluation.
      */
-    fun getEffectiveExemptPackages(selectedAdditionalPackage: String?): Set<String> {
+    fun getEffectiveExemptPackages(selectedAdditionalPackages: List<String> = emptyList()): Set<String> {
         val exempt = HashSet<String>()
 
         // 1. One Hand Operation+
@@ -517,18 +593,26 @@ class EssentialModeExemptionResolver(
         // 3b. Essential Payment packages
         exempt.addAll(ESSENTIAL_PAYMENT_PACKAGES)
 
-        // 4. User-selected additional
-        if (selectedAdditionalPackage != null) {
-            exempt.add(selectedAdditionalPackage)
-        }
+        // 3c. Essential AI chatbot & assistant packages
+        exempt.addAll(ESSENTIAL_AI_CHATBOT_PACKAGES.keys)
 
-        // 5. System apps and components
+        // 4. User-selected additional (up to MAX_ADDITIONAL_PACKAGES)
+        selectedAdditionalPackages.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(MAX_ADDITIONAL_PACKAGES)
+            .forEach { exempt.add(it) }
+
+        // 5. System apps and components (hoist launcher & IME sets once to avoid O(N) IPC repeats)
+        val launchers = packageInfoProvider.getHomeLauncherPackages()
+        val imes = packageInfoProvider.getInputMethodPackages()
         exempt.addAll(ESSENTIAL_ANDROID_SYSTEM_PACKAGES)
-        exempt.addAll(packageInfoProvider.getHomeLauncherPackages())
-        exempt.addAll(packageInfoProvider.getInputMethodPackages())
+        exempt.addAll(launchers)
+        exempt.addAll(imes)
 
         for (pkg in installed) {
-            if (isSystemApplication(pkg)) {
+            if (isSystemApplicationInternal(pkg, launchers, imes)) {
                 exempt.add(pkg)
             }
         }
@@ -536,10 +620,14 @@ class EssentialModeExemptionResolver(
         return exempt
     }
 
+    fun getEffectiveExemptPackages(selectedAdditionalPackage: String?): Set<String> {
+        return getEffectiveExemptPackages(listOfNotNull(selectedAdditionalPackage))
+    }
+
     /**
      * Generates a transparent diagnostic summary for the diagnostic UI.
      */
-    fun getDiagnosticSummary(selectedAdditionalPackage: String? = null): ExemptionDiagnosticSummary {
+    fun getDiagnosticSummary(selectedAdditionalPackages: List<String> = emptyList()): ExemptionDiagnosticSummary {
         val installed = packageInfoProvider.getInstalledPackages()
 
         val coreStatus = mapOf(
@@ -549,8 +637,19 @@ class EssentialModeExemptionResolver(
             "WhatsApp ($WHATSAPP_PACKAGE)" to installed.contains(WHATSAPP_PACKAGE)
         )
 
-        val isAdditionalExempt = selectedAdditionalPackage != null &&
-                resolveExemption(selectedAdditionalPackage, selectedAdditionalPackage).isExempt
+        val aiStatus = ESSENTIAL_AI_CHATBOT_PACKAGES.entries.associate { (pkg, label) ->
+            "$label ($pkg)" to installed.contains(pkg)
+        }
+
+        val normalizedSelected = selectedAdditionalPackages.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(MAX_ADDITIONAL_PACKAGES)
+            .toList()
+
+        val isAdditionalExempt = normalizedSelected.isNotEmpty() &&
+                normalizedSelected.all { resolveExemption(it, normalizedSelected).isExempt }
 
         val ohoInstalled = installed.contains(ONE_HAND_OPERATION_PACKAGE)
         val goodLockInstalled = installed.contains(GOOD_LOCK_HUB_PACKAGE)
@@ -599,7 +698,8 @@ class EssentialModeExemptionResolver(
 
         return ExemptionDiagnosticSummary(
             coreApplications = coreStatus,
-            selectedAdditionalPackage = selectedAdditionalPackage,
+            aiAssistants = aiStatus,
+            selectedAdditionalPackages = normalizedSelected,
             isSelectedAdditionalExempt = isAdditionalExempt,
             isOneHandOperationPlusInstalled = ohoInstalled,
             isOneHandOperationPlusExempt = true,
@@ -613,6 +713,10 @@ class EssentialModeExemptionResolver(
             backgroundExecutionGuaranteed = true,
             unverifiedPackages = emptyList()
         )
+    }
+
+    fun getDiagnosticSummary(selectedAdditionalPackage: String?): ExemptionDiagnosticSummary {
+        return getDiagnosticSummary(listOfNotNull(selectedAdditionalPackage))
     }
 
     fun addConfirmedGoodLockModule(packageName: String) {

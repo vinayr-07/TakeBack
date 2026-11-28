@@ -29,6 +29,7 @@ data class HomeUiState(
     val pendingToggleProfileId: String? = null,
     val isPendingCancelQuickBlock: Boolean = false,
     val showAllowanceDialog: Boolean = false,
+    val showEssentialExitDialog: Boolean = false,
     val evaluationTime: LocalTime = LocalTime.now(),
     val evaluationDay: DayOfWeek = LocalDate.now().dayOfWeek
 ) {
@@ -63,6 +64,7 @@ sealed interface HomeUiEvent {
     data class ConfirmToggleProfileWithToken(val profileId: String, val token: String) : HomeUiEvent
     object DismissToggleChallenge : HomeUiEvent
     data class SetAllowanceDialogVisible(val visible: Boolean) : HomeUiEvent
+    data class SetEssentialExitDialogVisible(val visible: Boolean) : HomeUiEvent
 }
 
 /**
@@ -86,6 +88,7 @@ class HomeViewModel(
     private val _pendingToggleProfileId = MutableStateFlow<String?>(null)
     private val _isPendingCancelQuickBlock = MutableStateFlow(false)
     private val _showAllowanceDialog = MutableStateFlow(false)
+    private val _showEssentialExitDialog = MutableStateFlow(false)
     private val _evaluationTime = MutableStateFlow(LocalTime.now())
     private val _evaluationDay = MutableStateFlow(LocalDate.now().dayOfWeek)
 
@@ -111,11 +114,12 @@ class HomeViewModel(
         combine(
             _evaluationTime,
             _evaluationDay,
-            _isPendingCancelQuickBlock
-        ) { time, day, pendingCancel ->
-            Triple(time, day, pendingCancel)
+            _isPendingCancelQuickBlock,
+            _showEssentialExitDialog
+        ) { time, day, pendingCancel, showEssentialExit ->
+            Tuple4(time, day, pendingCancel, showEssentialExit)
         }
-    ) { (profiles, quickBlock, perms, strict, essential), (summary, loading, allowance, pendingToggle, showDialog), (time, day, pendingCancel) ->
+    ) { (profiles, quickBlock, perms, strict, essential), (summary, loading, allowance, pendingToggle, showDialog), (time, day, pendingCancel, showEssentialExit) ->
         HomeUiState(
             profiles = profiles,
             quickBlockState = quickBlock,
@@ -128,6 +132,7 @@ class HomeViewModel(
             pendingToggleProfileId = pendingToggle,
             isPendingCancelQuickBlock = pendingCancel,
             showAllowanceDialog = showDialog,
+            showEssentialExitDialog = showEssentialExit,
             evaluationTime = time,
             evaluationDay = day
         )
@@ -197,6 +202,9 @@ class HomeViewModel(
             }
             is HomeUiEvent.SetAllowanceDialogVisible -> {
                 _showAllowanceDialog.value = event.visible
+            }
+            is HomeUiEvent.SetEssentialExitDialogVisible -> {
+                _showEssentialExitDialog.value = event.visible
             }
         }
     }
